@@ -41,6 +41,8 @@ typedef struct {
 	uint8_t *PROM; int prom_size;
 	uint8_t *CROM; int crom_size;
 	uint8_t *SROM; int srom_size;
+	uint8_t *VROM; int vrom_size;   // YM2610 ADPCM-A/B sample ROM (flat)
+	uint8_t *MROM; int mrom_size;   // Z80 sound program (flat)
 } Game;
 
 typedef struct {
@@ -344,12 +346,14 @@ void load_game(const char *fn, Game *game) {
 
 	if (!mz_zip_reader_init_file(&zip, fn, 0)) panic("%s\n", mz_zip_get_error_string(mz_zip_get_last_error(&zip)));
 
-	Romset P, C, S, X;
+	Romset P, C, S, X, V, M;
 
 	memset(&P, 0, sizeof(Romset));
 	memset(&C, 0, sizeof(Romset));
 	memset(&S, 0, sizeof(Romset));
 	memset(&X, 0, sizeof(Romset));
+	memset(&V, 0, sizeof(Romset));
+	memset(&M, 0, sizeof(Romset));
 
 	for (int index = 0;;index++) {
 		mz_zip_archive_file_stat stat;
@@ -365,6 +369,8 @@ void load_game(const char *fn, Game *game) {
 		if ((idx = romtype(fn, 'g'))) romset_add(&P, idx, &stat); // some PROMs are called pg1/pg2
 		if ((idx = romtype(fn, 's'))) romset_add(&S, idx, &stat);
 		if ((idx = romtype(fn, 'c'))) romset_add(&C, idx, &stat);
+		if ((idx = romtype(fn, 'v'))) romset_add(&V, idx, &stat); // YM2610 ADPCM (v1..vN)
+		if ((idx = romtype(fn, 'm'))) romset_add(&M, idx, &stat); // Z80 program (m1)
 		if (strstr(fn, "sma")) romset_add(&X, 1, &stat);
 	}
 
@@ -431,6 +437,18 @@ void load_game(const char *fn, Game *game) {
 		cmc_decrypt(game);
 	}
 
+	// Load V (YM2610 ADPCM-A/B) and M (Z80 program) ROMs.
+	// Both are flat byte streams concatenated in index order: no interleave and
+	// no byteswap (unlike the big-endian 68k PROM). They feed the sound subsystem.
+	if (romset_count(&V)) {
+		game->VROM = romset_load(&V, &zip, 0);
+		game->vrom_size = V.total_size;
+	}
+	if (romset_count(&M)) {
+		game->MROM = romset_load(&M, &zip, 0);
+		game->mrom_size = M.total_size;
+	}
+
 	// Compact CROM
 	while (memcmp(game->CROM+game->crom_size-256, game->CROM+game->crom_size-128, 128) == 0)
 		game->crom_size -= 128;
@@ -493,6 +511,15 @@ int main(int argc, char *argv[]) {
 
 	outfn[off] = 's';
 	saveto(game.SROM, game.srom_size, outfn);
+
+	if (game.vrom_size) {
+		outfn[off] = 'v';
+		saveto(game.VROM, game.vrom_size, outfn);
+	}
+	if (game.mrom_size) {
+		outfn[off] = 'm';
+		saveto(game.MROM, game.mrom_size, outfn);
+	}
 
 	strcpy(outfn+off, "?.bios");
 
