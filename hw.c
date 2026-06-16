@@ -11,6 +11,7 @@
 #include "m68k.h"
 #endif
 #include "platform.h"
+#include "sound.h"
 
 // Typedefs for unaligned memory accesses
 typedef uint16_t u_uint16_t __attribute__((aligned(1)));
@@ -122,7 +123,7 @@ uint32_t read_hwio(uint32_t addr, int sz)  {
 		case 0x01: assert(sz==1); return 0xFF ^ DIPSW_FREEPLAY; // dipswitches
 
 	} else if ((addr>>16) == 0x32) switch (addr&0xFFFF) {
-		case 0x00: assert(sz==1); debugf("[HWIO] Read Z80 command\n"); return 1;
+		case 0x00: assert(sz==1); return sound_read_status();  // Z80 -> 68k reply latch
 		case 0x01: assert(sz==1); return input_status_a_r();
 
 	} else if ((addr>>16) == 0x38) switch (addr&0xFFFF) {
@@ -154,7 +155,7 @@ void write_hwio(uint32_t addr, uint32_t val, int sz)  {
 		case 0x01: watchdog_kick(); return;
 
 	} else if ((addr>>16) == 0x32) switch (addr&0xFFFF) {
-		case 0x00: assert(sz==1); debugf("[HWIO] Send Z80 command: %02x\n", (unsigned int)val); return;
+		case 0x00: assert(sz==1); sound_write_command(val); return;  // 68k -> Z80 command latch
 
 	} else if ((addr>>16) == 0x38) switch (addr&0xFFFF) {
 		case 0x51: rtc_data_w(val&1); rtc_clock_w(val&2); rtc_stb_w(val&4); return;
@@ -315,6 +316,7 @@ void hw_init(void) {
 
 	rtc_init_();
 	watchdog_init();
+	sound_init();
 }
 
 void hw_vblank(void) {
