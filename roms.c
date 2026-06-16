@@ -21,6 +21,14 @@ uint8_t *P_ROM;
 uint8_t *PB_ROM;
 #define PB_ROM_CACHE_SIZE  (1024*1024)
 
+// M-ROM (Z80 sound program) is small (128KB for samsho2) and loaded fully
+// resident in RDRAM. V-ROM (YM2610 ADPCM samples, up to 7MB) cannot fit in
+// RDRAM and is streamed from cart on demand (see vrom_read). Consumed by the
+// sound subsystem (WS2/WS3).
+uint8_t *M_ROM;
+unsigned int m_rom_size;
+unsigned int v_rom_size;
+
 // Address to trigger idle-skipping
 unsigned int rom_pc_idle_skip = 0;
 extern uint32_t profile_dma_load;
@@ -36,10 +44,12 @@ static int srom_bank = -1;
 static int crom_file = -1;
 static int srom_file = -1;
 static int pbrom_file = -1;
+static int vrom_file = -1;
 #else
 static FILE *crom_file = NULL;
 static FILE *srom_file = NULL;
 static FILE *pbrom_file = NULL;
+static FILE *vrom_file = NULL;
 #endif
 
 static unsigned int crom_mask;
@@ -384,6 +394,66 @@ void rom_next_frame(void) {
 	sprite_cache_tick(&crom_cache);
 }
 
+// M-ROM (Z80 sound program): small, loaded fully resident in RDRAM.
+// Tolerant of absence (older builds / soundless games): just disables sound.
+void rom_load_mrom(const char *dir) {
+	char fullname[1024];
+	strlcpy(fullname, dir, sizeof(fullname));
+	strlcat(fullname, "m.rom", sizeof(fullname));
+
+	FILE *f = fopen(fullname, "rb");
+	if (!f) {
+		debugf("[ROM] no m.rom found (sound disabled)\n");
+		M_ROM = NULL; m_rom_size = 0;
+		return;
+	}
+	fseek(f, 0, SEEK_END);
+	m_rom_size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	M_ROM = malloc(m_rom_size);
+	assertf(M_ROM, "cannot allocate M_ROM (%u bytes)", m_rom_size);
+	int rd = fread(M_ROM, 1, m_rom_size, f);
+	fclose(f);
+	assertf(rd == (int)m_rom_size, "short read on m.rom: %d/%u", rd, m_rom_size);
+	debugf("[ROM] loaded m.rom: %u bytes\n", m_rom_size);
+}
+
+// V-ROM (YM2610 ADPCM-A/B samples, up to 7MB): too big for RDRAM, streamed
+// from cart on demand. Mirrors the crom streaming idiom (dfs DMA + cache flush).
+void vrom_open(const char *fn) {
+	#ifdef N64
+	if (vrom_file >= 0) dfs_close(vrom_file);
+	vrom_file = dfs_open(fn);
+	if (vrom_file < 0) { debugf("[ROM] no v.rom found\n"); v_rom_size = 0; return; }
+	v_rom_size = dfs_size(vrom_file);
+	#else
+	if (vrom_file) fclose(vrom_file);
+	vrom_file = fopen(fn, "rb");
+	if (!vrom_file) { debugf("[ROM] no v.rom found\n"); v_rom_size = 0; return; }
+	fseek(vrom_file, 0, SEEK_END);
+	v_rom_size = ftell(vrom_file);
+	fseek(vrom_file, 0, SEEK_SET);
+	#endif
+	debugf("[ROM] opened v.rom: %u bytes (streamed)\n", v_rom_size);
+}
+
+// Read `len` bytes of ADPCM source data from V-ROM at byte `offset` into `buf`.
+// Used by the YM2610 ADPCM engine (WS3). Zero-fills if V-ROM is absent.
+void vrom_read(uint32_t offset, uint8_t *buf, int len) {
+	#ifdef N64
+	if (vrom_file < 0) { memset(buf, 0, len); return; }
+	profile_dma_load -= TICKS_READ();
+	dfs_seek(vrom_file, offset, SEEK_SET);
+	dfs_read(buf, 1, len, vrom_file);
+	data_cache_hit_writeback_invalidate(buf, len);  // FIXME: should not be required
+	profile_dma_load += TICKS_READ();
+	#else
+	if (!vrom_file) { memset(buf, 0, len); return; }
+	fseek(vrom_file, offset, SEEK_SET);
+	fread(buf, 1, len, vrom_file);
+	#endif
+}
+
 void rom_load_prom(const char *dir) {
 	if (!P_ROM) P_ROM = memalign(256*1024, 1024*1024);
 	assertf(P_ROM, "cannot allocate P_ROM buffer");
@@ -393,6 +463,7 @@ void rom_load_prom(const char *dir) {
 void rom_load(const char *dir) {
 	rom_load_prom(dir);
 	rom(dir, "p.bios", 0, 0, BIOS, sizeof(BIOS), false);
+	rom_load_mrom(dir);  // Z80 program (resident); loaded while dir is still "rom:/" on N64
 
 	char ini[1024];
 	strcpy(ini, dir);
@@ -421,4 +492,5 @@ void rom_load(const char *dir) {
 	srom_set_bank(0);  // Set SFIX as current
 	crom_set_bank(0);
 	pbrom_init(strcatalloc(dir, "b.rom"));
+	vrom_open(strcatalloc(dir, "v.rom"));  // ADPCM samples (streamed)
 }
