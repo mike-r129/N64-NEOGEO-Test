@@ -23,7 +23,7 @@
 	((BIT(val,B31) << 31) | (BIT(val,B30) << 30) | (BIT(val,B29) << 29) | (BIT(val,B28) << 28) | (BIT(val,B27) << 27) | (BIT(val,B26) << 26) | (BIT(val,B25) << 25) | (BIT(val,B24) << 24) | (BIT(val,B23) << 23) | (BIT(val,B22) << 22) | (BIT(val,B21) << 21) | (BIT(val,B20) << 20) | (BIT(val,B19) << 19) | (BIT(val,B18) << 18) | (BIT(val,B17) << 17) | (BIT(val,B16) << 16) | (BIT(val,B15) << 15) | (BIT(val,B14) << 14) | (BIT(val,B13) << 13) | (BIT(val,B12) << 12) | (BIT(val,B11) << 11) | (BIT(val,B10) << 10) | (BIT(val, B9) <<  9) | (BIT(val, B8) <<  8) | (BIT(val, B7) <<  7) | (BIT(val, B6) <<  6) | (BIT(val, B5) <<  5) | (BIT(val, B4) <<  4) | (BIT(val, B3) <<  3) | (BIT(val, B2) <<  2) | (BIT(val, B1) <<  1) | (BIT(val, B0) <<  0))
 
 enum GameId {
-	GAME_MSLUG = 0x0201, GAME_SAMSHO = 0x0045, GAME_SENGOKU3 = 0x0261,
+	GAME_MSLUG = 0x0201, GAME_SAMSHO = 0x0045, GAME_SAMSHO2 = 0x0063, GAME_SENGOKU3 = 0x0261,
 	GAME_S1945P = 0x0254, GAME_AOF = 0x0044, GAME_AOF3 = 0x0096,
 	GAME_PBOBBLEN = 0x0083
 };
@@ -513,6 +513,7 @@ int main(int argc, char *argv[]) {
 const char* game_ini[65536] = {
 	[GAME_MSLUG]    = "idle_skip=0x1FE2\n",
 	[GAME_SAMSHO]   = "idle_skip=0xF7E\n",
+	// [GAME_SAMSHO2] = "idle_skip=0x????\n",  // TODO: set after profiling samsho2's idle loop (PLAN.md WS6-T4)
 	[GAME_AOF]      = "idle_skip=0x6790\n",
 	[GAME_AOF3]     = "idle_skip=0x15D2\n",
 	[GAME_PBOBBLEN] = "idle_skip=0xE76\n",
