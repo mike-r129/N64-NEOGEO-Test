@@ -1,0 +1,20 @@
+# Repo-local pre-commit config. The user's global hook (~/.git-hooks/pre-commit)
+# prefers this file over ~/.pre-commit-config.yaml when present.
+#
+# It mirrors the global hygiene hooks, but excludes the vendored Musashi
+# generated core (m68kops.c, ~2.2 MB) from the large-file check: that file is
+# required by the PC/SDL reference build (Makefile.pctests) and cannot be
+# regenerated locally (the generator is not vendored). All real ROM/BIOS data
+# is kept out of the repo via .gitignore instead.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        exclude: '^m68kops\.c$'
+      - id: detect-private-key
+      - id: check-yaml
+      - id: check-json
