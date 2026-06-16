@@ -1,0 +1,56 @@
+ifndef BIOS
+$(error NeoGeo BIOS not specified: use make mvs64 BIOS=<bios.bin>)
+endif
+ifndef ROM
+$(error NeoGeo game ROM not specified: use make mvs64 ROM=<rom.zip>)
+endif
+
+BUILD_DIR = build/mvs64
+
+include $(N64_INST)/include/n64.mk
+
+src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c lib/rdl.c m64k/m64k.c m64k/tlb.c $(wildcard hle_*.c)
+rsp = rsp_video.S
+asm = hw_n64.S m64k/m64k_asm.S
+obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
+
+src_makerom = mvsmakerom.c miniz.c
+obj_makerom = $(src_makerom:%.c=$(BUILD_DIR)/%.o)
+
+CFLAGS += -Wno-unused-function
+
+ROMNAME=$(notdir $(basename $(ROM)))
+ROMDIR=$(ROM:%.zip=%.n64)
+
+all: mvsmakerom mvs64-${ROMNAME}.z64
+
+test:
+	make -f Makefile.tests all
+
+$(BUILD_DIR)/mvs64-${ROMNAME}.dfs: $(ROM) mvsmakerom
+	@echo "    [MVS] ${ROMDIR}"
+	./mvsmakerom $(BIOS) $(ROM)
+	@echo "    [DFS] $@"
+	$(N64_MKDFS) $@ $(ROMDIR) >/dev/null
+
+mvs64-${ROMNAME}.z64: $(BUILD_DIR)/mvs64-${ROMNAME}.dfs
+mvs64-${ROMNAME}.z64: N64_ROM_TITLE="MVS64: ${ROMNAME}"
+$(BUILD_DIR)/mvs64-${ROMNAME}.elf: $(obj)
+
+mvsmakerom: $(obj_makerom)
+	@echo "    [LD] $@"
+	$(CC) $(LDFLAGS) -o $@ $^
+
+clean:
+	rm -f $(obj)
+	rm -f $(obj_makerom)
+	rm -f $(asm:%.S=$(BUILD_DIR)/%.o)
+	rm -f $(rsp:%.S=$(BUILD_DIR)/%.rsp)
+	rm -f $(src:%.c=$(BUILD_DIR)/%.d) $(asm:%.S=$(BUILD_DIR)/%.d)
+	rm -f mvs64-*.elf
+	rm -f mvs64-*.dfs
+	rm -f mvs64-*.z64
+
+-include $(src:%.c=$(BUILD_DIR)/%.d) $(asm:%.S=$(BUILD_DIR)/%.d) $(src_makerom:%.c=$(BUILD_DIR)/%.d)
+
+.PHONY: clean test
