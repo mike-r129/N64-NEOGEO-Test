@@ -1,0 +1,9 @@
+# The build runs under WSL/Linux, where CRLF line endings in Makefiles and .S
+# assembly can break the build. Force LF for all text files on checkout so a
+# fresh clone (incl. on Windows) is build-clean. After adding this, run
+# `git add --renormalize .` once if a working tree already has CRLF.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending munged.
+*.png  binary
+*.jpg  binary
