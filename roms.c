@@ -250,7 +250,7 @@ void pbrom_init(const char *fn) {
 
 	if (len > pbrom_avail) {
 		// The available memory isn't sufficient for PBROM. Switch to cache mode.
-		debugf("[PBROM] swapping activated, performance will be impacted (%s %d, req:%d avail:%d)\n", fn, pbrom_file, len, pbrom_avail);
+		debugf("[PBROM] swapping activated, performance will be impacted (%s, req:%d avail:%d)\n", fn, len, pbrom_avail);
 		pbrom_is_linear = false;
 		pbrom_cache_init();
 		return;
