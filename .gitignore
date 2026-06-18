@@ -35,6 +35,9 @@ sfix.sfix
 .DS_Store
 *~
 
-# debug dumps
+# debug dumps / headless test artifacts
 screen.bmp
 vram.dump
+shot_*.bmp
+*.png
+*.bmp

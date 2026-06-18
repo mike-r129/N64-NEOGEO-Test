@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#ifndef N64
+#include <stdlib.h>
+#endif
 #include "emu.h"
 #ifdef N64
 #include "m64k/m64k.h"
@@ -253,7 +256,20 @@ int main(int argc, char *argv[]) {
 	#endif
 
 	plat_init(44100, FPS);
+
+	#ifndef N64
+	// Headless test harness: when MVS64_FRAMES=N is set, run N frames with no
+	// SDL window (use SDL_VIDEODRIVER=dummy / SDL_AUDIODRIVER=dummy), dumping a
+	// screenshot every MVS64_SHOT frames and the 68K PC each second, then exit.
+	// Lets us validate boot progression with the human out of the loop.
+	const char *hl_env = getenv("MVS64_FRAMES");
+	int headless = hl_env ? atoi(hl_env) : 0;
+	const char *shot_env = getenv("MVS64_SHOT");
+	int shot_interval = shot_env ? atoi(shot_env) : 0;
+	plat_enable_video(headless ? false : true);
+	#else
 	plat_enable_video(true);
+	#endif
 
 	#ifdef N64
 	rom_load("rom:/");
@@ -295,6 +311,20 @@ int main(int argc, char *argv[]) {
 		#endif
 		emu_run_frame();
 		if (!plat_poll()) break;
+
+		#ifndef N64
+		if (headless) {
+			if (shot_interval && (g_frame % shot_interval) == 0) {
+				char fn[64];
+				sprintf(fn, "shot_%05d.bmp", g_frame);
+				plat_save_screenshot(fn);
+			}
+			if ((g_frame % 60) == 0)
+				fprintf(stderr, "[HEADLESS] frame %d  PC=%06x\n",
+					g_frame, (uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
+			if (g_frame >= headless) break;
+		}
+		#endif
 
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());
