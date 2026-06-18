@@ -10,6 +10,14 @@ uint8_t keystate[256];
 
 extern char end __attribute__((section (".data")));
 
+// Audio (libdragon AI) state — see plat_endaudio below.
+static int     audio_enabled = 0;
+static int     audio_spf = 735;           // stereo frames produced per video frame
+static int16_t audio_scratch[2048 * 2];   // one video-frame of stereo samples
+#define AFIFO_FRAMES 8192
+static int16_t afifo[AFIFO_FRAMES * 2];
+static int afifo_w = 0, afifo_r = 0;
+
 static void vblank_handler(void) {
     N64_FRAME++;
 }
@@ -37,6 +45,51 @@ void plat_init(int audiofreq, int fps) {
 
     // Register our custom RSP overlay into the RSP queue engine
     RSP_OVL_ID = rspq_overlay_register(&rsp_video);
+
+    audio_init(audiofreq, 4);
+    audio_spf = audiofreq / fps;          // stereo frames produced per video frame
+}
+
+// --- Audio (libdragon Audio Interface) -------------------------------------
+// The emulator produces ~audio_spf stereo frames per video frame, but the AI
+// consumes fixed-length buffers, so we FIFO between the two.
+void plat_enable_audio(int enable) {
+    audio_enabled = enable;
+}
+
+void plat_beginaudio(int16_t **buf, int *nsamples) {
+    *buf = audio_scratch;
+    *nsamples = audio_spf;
+}
+
+void plat_endaudio(void) {
+    if (!audio_enabled) return;
+
+    // Enqueue this frame's samples.
+    for (int i = 0; i < audio_spf; i++) {
+        int nw = (afifo_w + 1) % AFIFO_FRAMES;
+        if (nw == afifo_r) break;         // FIFO full: drop (overrun)
+        afifo[afifo_w * 2 + 0] = audio_scratch[i * 2 + 0];
+        afifo[afifo_w * 2 + 1] = audio_scratch[i * 2 + 1];
+        afifo_w = nw;
+    }
+
+    // Drain into any free AI buffers (pad with silence on underrun).
+    while (audio_can_write()) {
+        short *out = audio_write_begin();
+        int n = audio_get_buffer_length();
+        for (int i = 0; i < n; i++) {
+            if (afifo_r != afifo_w) {
+                out[i * 2 + 0] = afifo[afifo_r * 2 + 0];
+                out[i * 2 + 1] = afifo[afifo_r * 2 + 1];
+                afifo_r = (afifo_r + 1) % AFIFO_FRAMES;
+            } else {
+                out[i * 2 + 0] = 0;
+                out[i * 2 + 1] = 0;
+            }
+        }
+        audio_write_end();
+    }
 }
 
 int plat_poll(void) {

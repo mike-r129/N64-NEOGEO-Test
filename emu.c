@@ -374,6 +374,7 @@ int main(int argc, char *argv[]) {
 	plat_enable_video(headless ? false : true);
 	#else
 	plat_enable_video(true);
+	plat_enable_audio(1);
 	#endif
 
 	#ifdef N64
@@ -427,6 +428,16 @@ int main(int argc, char *argv[]) {
 			int n = sound_gen_samples(audio_frame, spf);
 			wav_write(audio_frame, n);
 		} else {
+			int16_t *abuf; int an;
+			plat_beginaudio(&abuf, &an);
+			sound_gen_samples(abuf, an);
+			plat_endaudio();
+		}
+		#endif
+
+		#ifdef N64
+		// Produce + push one video-frame of audio to the AI.
+		{
 			int16_t *abuf; int an;
 			plat_beginaudio(&abuf, &an);
 			sound_gen_samples(abuf, an);
