@@ -41,3 +41,4 @@ vram.dump
 shot_*.bmp
 *.png
 *.bmp
+*.wav

@@ -14,6 +14,7 @@
 #include "video.h"
 #include "roms.h"
 #include "platform.h"
+#include "sound.h"
 
 static int cpu_trace_count = 0;
 void cpu_trace(unsigned int pc) {
@@ -112,6 +113,46 @@ static void hl_apply_input(int frame) {
 		if (frame >= hl_script[i].f0 && frame <= hl_script[i].f1)
 			hl_keys[hl_script[i].sc] = 1;
 }
+
+// --- Headless WAV capture (16-bit signed stereo, little-endian host) ---------
+// Lets me validate generated audio (RMS/FFT on the .wav) with no speakers and
+// no human in the loop. Enabled by env MVS64_WAV=<path>.
+static FILE *wav_fp;
+static uint32_t wav_data_bytes;
+static int wav_freq;
+
+static void wav_open(const char *path, int freq) {
+	wav_fp = fopen(path, "wb");
+	if (!wav_fp) { fprintf(stderr, "[WAV] cannot open %s\n", path); return; }
+	wav_freq = freq;
+	wav_data_bytes = 0;
+	uint8_t hdr[44] = {0};
+	fwrite(hdr, 1, sizeof(hdr), wav_fp);   // placeholder, patched in wav_close()
+	fprintf(stderr, "[WAV] capturing to %s (%d Hz, 16-bit stereo)\n", path, freq);
+}
+
+static void wav_write(const int16_t *stereo, int nframes) {
+	if (!wav_fp) return;
+	fwrite(stereo, sizeof(int16_t) * 2, (size_t)nframes, wav_fp);
+	wav_data_bytes += (uint32_t)nframes * 2 * sizeof(int16_t);
+}
+
+static void wav_close(void) {
+	if (!wav_fp) return;
+	uint32_t riff = 36 + wav_data_bytes, fmtlen = 16, byterate = (uint32_t)wav_freq * 4;
+	uint16_t fmt = 1, ch = 2, bits = 16, blockalign = 4;
+	uint32_t freq = (uint32_t)wav_freq;
+	fseek(wav_fp, 0, SEEK_SET);
+	fwrite("RIFF", 1, 4, wav_fp); fwrite(&riff, 4, 1, wav_fp); fwrite("WAVE", 1, 4, wav_fp);
+	fwrite("fmt ", 1, 4, wav_fp); fwrite(&fmtlen, 4, 1, wav_fp);
+	fwrite(&fmt, 2, 1, wav_fp); fwrite(&ch, 2, 1, wav_fp); fwrite(&freq, 4, 1, wav_fp);
+	fwrite(&byterate, 4, 1, wav_fp); fwrite(&blockalign, 2, 1, wav_fp); fwrite(&bits, 2, 1, wav_fp);
+	fwrite("data", 1, 4, wav_fp); fwrite(&wav_data_bytes, 4, 1, wav_fp);
+	fclose(wav_fp); wav_fp = NULL;
+}
+
+#define AUDIO_FREQ 44100
+static int16_t audio_frame[(AUDIO_FREQ / FPS + 16) * 2];
 #endif
 #ifdef N64
 m64k_t m64k;
@@ -320,10 +361,15 @@ int main(int argc, char *argv[]) {
 	int headless = hl_env ? atoi(hl_env) : 0;
 	const char *shot_env = getenv("MVS64_SHOT");
 	int shot_interval = shot_env ? atoi(shot_env) : 0;
+	const int spf = AUDIO_FREQ / FPS;       // stereo frames produced per video frame
 	if (headless) {
 		keystate = hl_keys;                 // drive input from our scripted buffer
 		const char *script = getenv("MVS64_INPUT");
 		if (script) hl_load_script(script);
+		const char *wav = getenv("MVS64_WAV");
+		if (wav) wav_open(wav, AUDIO_FREQ);
+	} else {
+		plat_enable_audio(1);               // start SDL playback for interactive use
 	}
 	plat_enable_video(headless ? false : true);
 	#else
@@ -376,6 +422,19 @@ int main(int argc, char *argv[]) {
 		if (!plat_poll()) break;
 
 		#ifndef N64
+		// Produce one video-frame's worth of audio through the sound seam.
+		if (headless) {
+			int n = sound_gen_samples(audio_frame, spf);
+			wav_write(audio_frame, n);
+		} else {
+			int16_t *abuf; int an;
+			plat_beginaudio(&abuf, &an);
+			sound_gen_samples(abuf, an);
+			plat_endaudio();
+		}
+		#endif
+
+		#ifndef N64
 		if (headless) {
 			if (shot_interval && (g_frame % shot_interval) == 0) {
 				char fn[64];
@@ -420,6 +479,7 @@ int main(int argc, char *argv[]) {
 	m68k_exec(g_clock+100);
 
 	#ifndef N64
+	wav_close();
 	FILE *f = fopen("vram.dump", "wb");
 	fwrite(VIDEO_RAM, 1, sizeof(VIDEO_RAM), f);
 	fclose(f);
