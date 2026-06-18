@@ -162,7 +162,7 @@ int cpu_irqack(void *ctx, int level)
 uint32_t emu_vblank_start(void* arg) {
 	emu_cpu_irq(1, true);
 	hw_vblank();
-	debugf("[EMU] VBlank - clock:%lld clock_frame:%lld\n", emu_clock(), emu_clock_frame());
+	debugf("[EMU] VBlank - clock:%lld clock_frame:%lld\n", (long long)emu_clock(), (long long)emu_clock_frame());
 	return FRAME_CLOCK;
 }
 
@@ -237,7 +237,7 @@ void emu_run_frame(void) {
     	g_clock = m68k_exec(vsync);
 
     // Frame completed
-	debugf("[EMU] Frame completed: %d (vsync: %llu)\n", g_frame, vsync);
+	debugf("[EMU] Frame completed: %d (vsync: %llu)\n", g_frame, (unsigned long long)vsync);
     g_frame++;
 	g_clock_framebegin += FRAME_CLOCK;
 }
