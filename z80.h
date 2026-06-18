@@ -11,8 +11,11 @@ typedef struct z80 z80;
 struct z80 {
   uint8_t (*read_byte)(void*, uint16_t);
   void (*write_byte)(void*, uint16_t, uint8_t);
-  uint8_t (*port_in)(z80*, uint8_t);
-  void (*port_out)(z80*, uint8_t, uint8_t);
+  // MVS64: widened port to 16-bit so the full I/O address (high byte = B for
+  // IN/OUT (C), or A for IN/OUT (n)) reaches the handler. NeoGeo Z80 bank
+  // switching encodes the bank number in the high byte of the port address.
+  uint8_t (*port_in)(z80*, uint16_t);
+  void (*port_out)(z80*, uint16_t, uint8_t);
   void* userdata;
 
   unsigned long cyc; // cycle count (t-states)

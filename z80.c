@@ -565,7 +565,7 @@ static inline void cpd(z80* const z) {
 }
 
 static void in_r_c(z80* const z, uint8_t* r) {
-  *r = z->port_in(z, z->c);
+  *r = z->port_in(z, (z->b << 8) | z->c);  // MVS64: full 16-bit port
   z->zf = *r == 0;
   z->sf = *r >> 7;
   z->pf = parity(*r);
@@ -574,7 +574,7 @@ static void in_r_c(z80* const z, uint8_t* r) {
 }
 
 static void ini(z80* const z) {
-  uint8_t val = z->port_in(z, z->c);
+  uint8_t val = z->port_in(z, (z->b << 8) | z->c);  // MVS64: full 16-bit port
   wb(z, get_hl(z), val);
   set_hl(z, get_hl(z) + 1);
   z->b -= 1;
@@ -590,7 +590,7 @@ static void ind(z80* const z) {
 }
 
 static void outi(z80* const z) {
-  z->port_out(z, z->c, rb(z, get_hl(z)));
+  z->port_out(z, (z->b << 8) | z->c, rb(z, get_hl(z)));  // MVS64: full 16-bit port
   set_hl(z, get_hl(z) + 1);
   z->b -= 1;
   z->zf = z->b == 0;
@@ -1200,13 +1200,13 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0xDB: {
     const uint8_t port = nextb(z);
     const uint8_t a = z->a;
-    z->a = z->port_in(z, port);
+    z->a = z->port_in(z, (a << 8) | port);  // MVS64: full 16-bit port (high=A)
     z->mem_ptr = (a << 8) | (z->a + 1);
   } break; // in a,(n)
 
   case 0xD3: {
     const uint8_t port = nextb(z);
-    z->port_out(z, port, z->a);
+    z->port_out(z, (z->a << 8) | port, z->a);  // MVS64: full 16-bit port (high=A)
     z->mem_ptr = (port + 1) | (z->a << 8);
   } break; // out (n), a
 
@@ -1635,15 +1635,16 @@ void exec_opcode_ed(z80* const z, uint8_t opcode) {
     }
     break; // indr
 
-  case 0x41: z->port_out(z, z->c, z->b); break; // out (c), b
-  case 0x49: z->port_out(z, z->c, z->c); break; // out (c), c
-  case 0x51: z->port_out(z, z->c, z->d); break; // out (c), d
-  case 0x59: z->port_out(z, z->c, z->e); break; // out (c), e
-  case 0x61: z->port_out(z, z->c, z->h); break; // out (c), h
-  case 0x69: z->port_out(z, z->c, z->l); break; // out (c), l
-  case 0x71: z->port_out(z, z->c, 0); break; // out (c), 0
+  // MVS64: out (c),r — full 16-bit port (high byte = B)
+  case 0x41: z->port_out(z, (z->b << 8) | z->c, z->b); break; // out (c), b
+  case 0x49: z->port_out(z, (z->b << 8) | z->c, z->c); break; // out (c), c
+  case 0x51: z->port_out(z, (z->b << 8) | z->c, z->d); break; // out (c), d
+  case 0x59: z->port_out(z, (z->b << 8) | z->c, z->e); break; // out (c), e
+  case 0x61: z->port_out(z, (z->b << 8) | z->c, z->h); break; // out (c), h
+  case 0x69: z->port_out(z, (z->b << 8) | z->c, z->l); break; // out (c), l
+  case 0x71: z->port_out(z, (z->b << 8) | z->c, 0); break; // out (c), 0
   case 0x79:
-    z->port_out(z, z->c, z->a);
+    z->port_out(z, (z->b << 8) | z->c, z->a);
     z->mem_ptr = get_bc(z) + 1;
     break; // out (c), a
 
