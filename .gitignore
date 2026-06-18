@@ -34,3 +34,7 @@ sfix.sfix
 .vscode/
 .DS_Store
 *~
+
+# debug dumps
+screen.bmp
+vram.dump
