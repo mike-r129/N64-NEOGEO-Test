@@ -19,7 +19,7 @@ all: emu
 
 emu: $(emu_obj)
 	@echo "    [LD] $@"
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 clean:
 	@rm -f $(emu_obj) $(emu_src:%.c=$(BUILD_DIR)/%.d)
