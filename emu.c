@@ -59,6 +59,60 @@ void cpu_start_trace(int cnt) {
 }
 
 static int g_frame;
+
+#ifndef N64
+// --- Headless scripted input ---------------------------------------------
+// Lets the PC emu drive menus/gameplay with the human out of the loop. The
+// script is a text file (env MVS64_INPUT) of lines: "<f0> <f1> <key>", meaning
+// hold <key> from frame f0 to f1 inclusive. <key> is one of:
+//   coin start select a b c d up down left right
+// keystate is reassigned to point at hl_keys so input.c reads our buffer.
+extern const uint8_t *keystate;
+static uint8_t hl_keys[512];
+#define HL_MAX_EVENTS 256
+static struct { int f0, f1, sc; } hl_script[HL_MAX_EVENTS];
+static int hl_nevents;
+
+static int hl_keyname_to_sc(const char *n) {
+	if (!strcmp(n, "coin"))   return PLAT_KEY_COIN_1;
+	if (!strcmp(n, "start"))  return PLAT_KEY_P1_START;
+	if (!strcmp(n, "select")) return PLAT_KEY_P1_SELECT;
+	if (!strcmp(n, "a"))      return PLAT_KEY_P1_A;
+	if (!strcmp(n, "b"))      return PLAT_KEY_P1_B;
+	if (!strcmp(n, "c"))      return PLAT_KEY_P1_C;
+	if (!strcmp(n, "d"))      return PLAT_KEY_P1_D;
+	if (!strcmp(n, "up"))     return PLAT_KEY_P1_UP;
+	if (!strcmp(n, "down"))   return PLAT_KEY_P1_DOWN;
+	if (!strcmp(n, "left"))   return PLAT_KEY_P1_LEFT;
+	if (!strcmp(n, "right"))  return PLAT_KEY_P1_RIGHT;
+	return -1;
+}
+
+static void hl_load_script(const char *path) {
+	FILE *f = fopen(path, "r");
+	if (!f) { fprintf(stderr, "[INPUT] cannot open %s\n", path); return; }
+	char line[128], key[32];
+	int f0, f1;
+	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == '#' || line[0] == '\n') continue;
+		if (sscanf(line, "%d %d %31s", &f0, &f1, key) == 3) {
+			int sc = hl_keyname_to_sc(key);
+			if (sc < 0) { fprintf(stderr, "[INPUT] bad key '%s'\n", key); continue; }
+			if (hl_nevents < HL_MAX_EVENTS)
+				hl_script[hl_nevents++] = (typeof(hl_script[0])){ f0, f1, sc };
+		}
+	}
+	fclose(f);
+	fprintf(stderr, "[INPUT] loaded %d events from %s\n", hl_nevents, path);
+}
+
+static void hl_apply_input(int frame) {
+	memset(hl_keys, 0, sizeof(hl_keys));
+	for (int i = 0; i < hl_nevents; i++)
+		if (frame >= hl_script[i].f0 && frame <= hl_script[i].f1)
+			hl_keys[hl_script[i].sc] = 1;
+}
+#endif
 #ifdef N64
 m64k_t m64k;
 #endif
@@ -266,6 +320,11 @@ int main(int argc, char *argv[]) {
 	int headless = hl_env ? atoi(hl_env) : 0;
 	const char *shot_env = getenv("MVS64_SHOT");
 	int shot_interval = shot_env ? atoi(shot_env) : 0;
+	if (headless) {
+		keystate = hl_keys;                 // drive input from our scripted buffer
+		const char *script = getenv("MVS64_INPUT");
+		if (script) hl_load_script(script);
+	}
 	plat_enable_video(headless ? false : true);
 	#else
 	plat_enable_video(true);
@@ -309,6 +368,10 @@ int main(int argc, char *argv[]) {
 		#ifdef N64
 		uint32_t t0 = TICKS_READ();
 		#endif
+		#ifndef N64
+		if (headless) hl_apply_input(g_frame);
+		#endif
+
 		emu_run_frame();
 		if (!plat_poll()) break;
 
