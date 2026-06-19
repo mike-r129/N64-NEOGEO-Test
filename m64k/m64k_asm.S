@@ -34,6 +34,16 @@
 
      .section .sdata
 pc_diff:      .long 0
+#ifdef MVS64_IDLEPROBE
+# Idle-spin probe: detects a branch/jump target hit many times CONSECUTIVELY
+# (a true wait-for-IRQ spin) vs a bounded backward loop (memcpy/DBRA). The PC
+# that spins past the threshold is recorded in idle_probe_found for the C side
+# to print. Gated by -DMVS64_IDLEPROBE; zero cost in normal builds.
+idle_probe_last:  .long 0
+idle_probe_cnt:   .long 0
+     .globl idle_probe_found
+idle_probe_found: .long 0
+#endif
 
 optable:
     .long   op_tbl0,  op_moveb, op_movel, op_movew, op_tbl4,  op_addq,  op_bcc,   op_moveq
@@ -2549,8 +2559,29 @@ jmp_exec:
     subu t0, eaptr32, m_pc             # save new pc_diff
     sw t0, pc_diff
     check_addr_error eaptr32, pc_address_error
-    beq m_pc, 0xFF001FE2, idle_skip
-    beq m_pc, 0xFFC18714, idle_skip
+#ifdef MVS64_IDLEPROBE
+    lw t0, idle_probe_last
+    beq t0, m_pc, 1f                   # same branch target as last time?
+    sw m_pc, idle_probe_last           # no: new target, reset run length
+    sw zero, idle_probe_cnt
+    j 2f
+1:  lw t0, idle_probe_cnt
+    addiu t0, 1
+    sw t0, idle_probe_cnt
+    li t1, 4000                        # 4000 consecutive = a real wait-for-IRQ spin
+    bne t0, t1, 2f                     #   (a bounded DBRA/memcpy loop never reaches this)
+    sw m_pc, idle_probe_found          # record the spinning PC for the C side to print
+2:
+#endif
+    beq m_pc, 0xFF001FE2, idle_skip   # mslug
+    beq m_pc, 0xFFC18714, idle_skip   # Universe BIOS vblank wait
+    # samsho2 vblank-wait spins: "clr.b $100A30; <here>: tst.b $100A30; beq <here>"
+    # — pure side-effect-free polls of a flag the game's VBlank IRQ sets. Verified
+    # via the in-match idle probe (0x00142C is the dominant in-game spin). Skipping
+    # them fast-forwards the dead wait to the next scheduled IRQ. (See PLAN-OPTIMIZATION.md
+    # rank 1/2; the general fix is a data-driven per-game table.)
+    beq m_pc, 0xFF00142C, idle_skip   # samsho2 main vblank wait
+    beq m_pc, 0xFF00FC02, idle_skip   # samsho2 secondary vblank wait
     j main_loop
 idle_skip:
     li m_cycles, 0
