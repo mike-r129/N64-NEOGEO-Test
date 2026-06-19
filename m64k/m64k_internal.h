@@ -6,6 +6,8 @@
 #define M64K_PENDINGEXC_PRIVERR   3
 #define M64K_PENDINGEXC_DIVBYZERO 4
 #define M64K_PENDINGEXC_IRQ       5
+#define M64K_PENDINGEXC_ILLEGAL   6
+#define M64K_PENDINGEXC_CHK       7
 
 #define M64K_OFF_DREGS        0
 #define M64K_OFF_AREGS        (M64K_OFF_DREGS      + 8 * 4)
