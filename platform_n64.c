@@ -107,6 +107,28 @@ int plat_poll(void) {
     if (ckeys.c[0].C_down)  { keystate[PLAT_KEY_P1_C] = 1; }
     if (ckeys.c[0].C_right) { keystate[PLAT_KEY_P1_D] = 1; }
     if (ckeys.c[0].start)   { keystate[PLAT_KEY_P1_START] = 1; }
+    // Z inserts a coin/credit (the MVS has no coin without this); C-up = select.
+    if (ckeys.c[0].Z)       { keystate[PLAT_KEY_COIN_1] = 1; }
+    if (ckeys.c[0].C_up)    { keystate[PLAT_KEY_P1_SELECT] = 1; }
+
+#ifdef MVS64_AUTOINPUT
+    // Headless validation: deterministically drive coin -> start -> select ->
+    // a match off the emulated frame counter (no human/controller needed), so
+    // playable input + combat can be confirmed agentically. Enable with
+    // EXTRA_DEFINES=-DMVS64_AUTOINPUT.
+    {
+        static int af = 0;
+        int f = af++;
+        #define AW(a,b)   (f >= (a) && f < (b))
+        #define AD(p,on)  (((f) % (p)) < (on))
+        if (AW( 500, 2600) && AD(40, 6))            keystate[PLAT_KEY_COIN_1]  = 1; // hammer coins
+        if (AW(1400, 3600) && AD(70, 6) && !AD(40,6)) keystate[PLAT_KEY_P1_START] = 1; // start
+        if (AW(2200, 4200) && AD(55, 6))            keystate[PLAT_KEY_P1_A]     = 1; // confirm/select
+        if (AW(3200, 100000000) && AD(64, 30))      keystate[PLAT_KEY_P1_RIGHT] = 1; // approach
+        if (AW(3200, 100000000) && AD(48, 10))      keystate[PLAT_KEY_P1_C]     = 1; // attack
+        if ((f % 120) == 0) debugf("[AUTOINPUT] frame=%d\n", f);
+    }
+#endif
 
     return 1;
 }
