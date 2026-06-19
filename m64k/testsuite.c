@@ -5,7 +5,7 @@
 #include "tlb.h"
 
 m64k_t m64k;
-uint8_t ram_pages[16][8192] alignas(8192);
+uint8_t ram_pages[16][8192] __attribute__((aligned(8192)));
 uint32_t ram_address[16];
 
 static void m68k_ram_init(void) {
@@ -79,7 +79,7 @@ int total_cycle_diff = 0;
 void run_testsuite(const char *fn)
 {
     debugf("Running testsuite: %s\n", fn);
-    FILE *f = asset_fopen(fn);
+    FILE *f = asset_fopen(fn, NULL);
 
     bool asl_test = strstr(fn, "ASL.b.") != NULL;
     bool asr_test = strstr(fn, "ASR.") != NULL;
@@ -100,6 +100,7 @@ void run_testsuite(const char *fn)
 
     int cycle_total = 0;
     int cycle_diff = 0;
+    int file_fails = 0;
     for (int t=0; t<num_tests; t++) {
         fread(id, 1, 4, f);
         assert(id[0] == 'T' && id[1] == 'E' && id[2] == 'S' && id[3] == 'T');
@@ -197,7 +198,13 @@ void run_testsuite(const char *fn)
 
         if (failed) {
             if (address_error) debugf("(this test is designed to trigger an address error)\n");
-            abort();
+            // Don't abort: tally and move on so one run surfaces every broken
+            // opcode. Stop a file after a few failures to keep the log readable.
+            if (++file_fails >= 3) {
+                debugf("(stopping %s after %d failures)\n", fn, file_fails);
+                break;
+            }
+            continue;
         }
 
         // Check cycle count difference
@@ -218,11 +225,15 @@ void run_testsuite(const char *fn)
         }
     }
 
-    if (M64K_CONFIG_TIMING_ACCURACY >= 0 && approx_timing) {
+    if (M64K_CONFIG_TIMING_ACCURACY >= 0 && approx_timing && cycle_total) {
         total_cycle_total += cycle_total;
         total_cycle_diff += cycle_diff;
         debugf("Cycle count difference: %.2f%%\n", (double)cycle_diff * 100.0 / cycle_total);
     }
+
+    // One-line verdict per opcode file, easy to grep from the ISViewer log.
+    if (file_fails) debugf(">>> FAIL %s (%d failing tests)\n", fn, file_fails);
+    else            debugf(">>> PASS %s\n", fn);
 
     fclose(f);
 }
@@ -247,7 +258,9 @@ int main()
         debugf("Make sure to compile M64K with M64K_CONFIG_ADDRERR=1\n\n");
     }
 
-#if 0
+#if 1
+    // Auto-discover every .btest in the DFS so the test set is whatever was
+    // dropped into assets/ at build time (no need to edit the list below).
     char* testfns[256];
     int num_tests = 0;
 
@@ -261,6 +274,7 @@ int main()
             }
 		} while (dfs_dir_findnext(sbuf+5) == FLAGS_FILE);
 	}
+    debugf("Discovered %d .btest files\n", num_tests);
 #else
     static const char *testfns[] = {
         "rom:/MOVEP.w.btest",

@@ -7,8 +7,21 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 )
+
+// Per-file test cap so the generated .z64 stays small enough to run in an
+// emulator. Override with env MKTEST_CAP (0 = no cap). Most opcode bugs show
+// up well within the first few hundred randomized tests.
+func testCap() int {
+	if v := os.Getenv("MKTEST_CAP"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil {
+			return n
+		}
+	}
+	return 300
+}
 
 type M68kState struct {
 	D0, D1, D2, D3, D4, D5, D6, D7 uint32
@@ -110,12 +123,16 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	cap := testCap()
 	var wg sync.WaitGroup
 	for _, fn := range files {
 		wg.Add(1)
 		go func(fn string) {
 			defer wg.Done()
 			tests := readTests(fn)
+			if cap > 0 && len(tests) > cap {
+				tests = tests[:cap]
+			}
 			fn = fn[:len(fn)-len(".json.gz")] + ".btest"
 			writeTests(fn, tests)
 		}(fn)
