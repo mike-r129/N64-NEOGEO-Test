@@ -9,10 +9,12 @@
 > hardware by forking **mvs64** (at `<workspace>\mvs64`,
 > pushed to github.com/mike-r129/N64-NEOGEO-Test). Read `RESUME.md`, `PLAN.md`,
 > and your memory. The native libdragon toolchain is already built in WSL at
-> `/root/n64inst` and `make mvs64` produces a valid `.z64`. **Status:** waiting
-> on a real NeoGeo BIOS + `sfix.sfix` in `…\N64-NEOGEO\bios\`. If I've added
-> them, build the real ROM and boot-test; otherwise continue per the plan.
-> Commit work individually; never commit ROMs/BIOS.
+> `/root/n64inst` and `make mvs64` produces a valid `.z64`. **Status (2026-06-18):**
+> real BIOS is in (`bios/uni-bios_4_0.rom`+`sfix.sfix`); samsho2 boots in-game on
+> the PC core; **sound works** (Z80+YM2610, validated via headless WAV). The N64
+> AI audio backend is wired but unvalidated on hardware. Next: validate the
+> `.z64` audio/video on real N64 or BizHawk MCP (`av_dump_type="wave"`). Work is
+> on branch `samsho2-bringup`. Commit individually; never commit ROMs/BIOS.
 
 ## Where we are
 
@@ -30,9 +32,16 @@ from scratch — decided & validated; see `PLAN.md §2`).
 - ✅ Native toolchain built (WSL `/root/n64inst`, gcc 14.2 + libdragon) and **`mvs64-samsho2.z64` builds** (26.7 MB, valid magic `80371240`) — with a *placeholder* BIOS, so it validates the pipeline but won't boot a game.
 - ✅ `.gitattributes`, `BUILDING.md`.
 
-**THE BLOCKER:** a real **NeoGeo BIOS + `sfix.sfix`** (SNK copyright — must be user‑supplied: UniBIOS from unibios.free.fr + an `sfix.sfix`, or a hardware dump). Without it the ROM can't boot a game.
+**SINCE THEN (branch `samsho2-bringup`, 2026-06-18):**
+- ✅ BIOS blocker cleared (`bios/uni-bios_4_0.rom` + `sfix.sfix`); real `.z64` builds & is verified to bake the real BIOS.
+- ✅ Headless PC test harness (`MVS64_FRAMES`/`MVS64_SHOT`/`MVS64_INPUT`/`MVS64_WAV`/`MVS64_SNDDBG`); driver scripts in parent dir (`wsl-headless.sh`, `wsl-sndtest.sh`).
+- ✅ samsho2 validated **in-game** on the PC core (BIOS → title → coin/start → demo, all rendering correctly).
+- ✅ **Sound:** Z80 (superzazu, MIT, `z80.c`) + YM2610 (gngeo/MAME, `ym2610/`) transplanted; real music+SFX validated via WAV (RMS + autocorrelation). See memory `sound-implementation`.
+- ✅ N64 AI audio backend (`platform_n64.c` FIFO→AI) — compiles, **not yet validated on hardware**.
 
-**Running:** a background watcher (`wsl-bios-watch.sh`) auto‑builds the real ROM when a BIOS lands in `…\N64-NEOGEO\bios\` (may have timed out — just rebuild manually, see below).
+**LICENSE NOTE:** the YM2610 core is **MAME-licensed (non-commercial)** — see `ym2610/LICENSE.mame`; the combined sound build is non-commercial.
+
+**REMAINING:** validate the `.z64` on real N64 / BizHawk (audio: `launch ... av_dump_type="wave"` then analyze the WAV). On a 4MB N64, ADPCM's 7MB resident `v.rom` won't fit → FM/SSG-only; full ADPCM likely needs the 8MB Expansion Pak or a streaming ADPCM read.
 
 ## To resume → get to a playable ROM
 

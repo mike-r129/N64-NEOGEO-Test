@@ -2,13 +2,14 @@ BUILD_DIR = build/pctests
 
 include $(N64_INST)/include/n64.mk
 
-emu_src = emu.c roms.c hw.c video.c m68kcpu.c m68kops.c m68kdasm.c platform_sdl.c sprite_cache.c sound_noop.c $(wildcard hle_*.c)
+emu_src = emu.c roms.c hw.c video.c m68kcpu.c m68kops.c m68kdasm.c platform_sdl.c sprite_cache.c sound_neogeo.c z80.c ym2610/ym2610.c $(wildcard hle_*.c)
 emu_obj = $(emu_src:%.c=$(BUILD_DIR)/%.o)
 
 CFLAGS += -O2 -Wall -Werror -Wno-unused-function
 
 CFLAGS += $(shell pkg-config --cflags sdl2)
 LDFLAGS += $(shell pkg-config --libs sdl2)
+LDFLAGS += -lm   # YM2610 core uses log()
 
 ifeq ($(D),1)
 CFLAGS += -fsanitize=address -fsanitize=undefined
@@ -19,7 +20,7 @@ all: emu
 
 emu: $(emu_obj)
 	@echo "    [LD] $@"
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 clean:
 	@rm -f $(emu_obj) $(emu_src:%.c=$(BUILD_DIR)/%.d)
