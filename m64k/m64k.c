@@ -100,6 +100,25 @@ void m64k_exception_divbyzero(m64k_t *m64k)
     m64k->cycles += __m64k_exception_cycle_table[0x5];
 }
 
+// Generic group-2 exception (short-format frame: push PC then old SR).
+// Used for illegal instruction (vec 4), CHK (vec 6) and privilege
+// violation (vec 8). The asm side sets m64k->pc to the value the 68000
+// stacks for that exception (faulting instruction for illegal/privilege,
+// next instruction for CHK).
+void m64k_exception_group2(m64k_t *m64k, int vector)
+{
+    uint32_t oldsr = m64k->sr;
+
+    m64k->sr &= ~(SR_T0 | SR_T1);
+    m64k->sr |= SR_S;
+
+    exc_push32(m64k, m64k->pc);
+    exc_push16(m64k, oldsr);
+
+    m64k->pc = RM32(m64k->vbr + vector*4);
+    m64k->cycles += __m64k_exception_cycle_table[vector];
+}
+
 void m64k_exception_interrupt(m64k_t *m64k, int level)
 {
     if (m64k->hook_irqack) {
@@ -152,6 +171,19 @@ int64_t m64k_run(m64k_t *m64k, int64_t until)
                 break;
             case M64K_PENDINGEXC_IRQ:
                 m64k_exception_interrupt(m64k, m64k->pending_exc[1]);
+                break;
+            case M64K_PENDINGEXC_ILLEGAL:
+                logexcf("[m64k] ILLEGAL instruction %04x @ pc=%06lx\n",
+                        (unsigned)m64k->pending_exc[1], (unsigned long)(m64k->pc & 0xFFFFFF));
+                m64k_exception_group2(m64k, 4);
+                break;
+            case M64K_PENDINGEXC_CHK:
+                logexcf("[m64k] CHK trap @ pc=%06lx\n", (unsigned long)(m64k->pc & 0xFFFFFF));
+                m64k_exception_group2(m64k, 6);
+                break;
+            case M64K_PENDINGEXC_PRIVERR:
+                logexcf("[m64k] PRIVERR @ pc=%06lx\n", (unsigned long)(m64k->pc & 0xFFFFFF));
+                m64k_exception_group2(m64k, 8);
                 break;
             default:
                 assertf(0, "Unhandled pending exception: %ld", m64k->pending_exc[0]);

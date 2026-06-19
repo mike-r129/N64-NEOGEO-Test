@@ -846,7 +846,8 @@ check_supervisor:
     bnez $1, 1f
 
     li $1, M64K_PENDINGEXC_PRIVERR
-    sw_ctx t0, M64K_OFF_PENDINGEXC
+    sw_ctx $1, M64K_OFF_PENDINGEXC     # (was storing t0 by mistake)
+    addi m_pc, -2                      # 68000 stacks PC of the privileged instruction
     j main_loop_exit
 1:  jr ra
     .set at
@@ -2305,7 +2306,8 @@ movem_rm_impl_32:
 
 OP(mvfsr):
     use_cycles_opmask 6<<3, 0, -2
-    check_supervisor
+    # MOVE from SR is NON-privileged on the 68000 (privilege was added in the
+    # 68010). NeoGeo is a plain 68000, so do not check supervisor here.
     li opsize, 2
     jal decode_ea
     check_addr_error eaptr32, read_address_error
@@ -2817,18 +2819,27 @@ op_bits_dreg:
     li bitidx_mask, 31           # EA is Dn: 32-bit operation
     li opsize, 4
     jal_and_j decode_ea, rmw32_eadst
+    .sdata
+    # Address table of the 4 bit-op handlers, indexed by opcode bits 6-7.
+    # (Was previously indexed as bittable+bitop*8, but the handlers assemble to
+    # 12 bytes each in reorder mode -- the jr/j delay slots get a nop -- so the
+    # fixed *8 stride landed BCLR/BSET on the wrong instructions. An explicit
+    # pointer table is immune to handler size.)
+bittable_ptrs:
+    .long op_btst_e, op_bchg_e, op_bclr_e, op_bset_e
+    .text
 bits_impl:  # First part is common to all bit operations
     use_cycles 8
-    lax rmw_op, bittable         # load bittable pointer
-    srl t2, opcode, 3            # extract bitop from opcode, multiplied by 8
-    andi t2, 3<<3                # (0=btst, 8=bchg, 16=bclr, 24=bset)
-    add rmw_op, t2               # calculate bitop pointer
+    srl t2, opcode, 6            # extract bitop type (opcode bits 6-7)
+    andi t2, 3                   # 0=btst, 1=bchg, 2=bclr, 3=bset
+    sll t3, t2, 2               # *4 to index the .long pointer table
+    lw rmw_op, bittable_ptrs(t3) # rmw_op = address of the selected handler
     dsrl flag_zc, 32             # isolate C flag (clear bits of Z)
     dsll flag_zc, 32
     and t0, bitidx_mask          # mask bit index (either 0..7 o 0..31)
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     .set noreorder
-    beqz t2, 1f                  # do nothing if opcode is btst
+    beqz t2, 1f                  # do nothing if opcode is btst (t2==0)
      li t2, 1
     beq opsize, t2, 1f           # do nothing if opsize is 8-bit (aka: EA access)
      li t2, 16
@@ -2841,13 +2852,16 @@ bits_impl:  # First part is common to all bit operations
     and t3, t2, t1               # t3 = value & (1 << bitindex)
     or flag_zc, t3               # set Z flag with current bit value
     jr rmw_op                    # jump to bitop function
-bittable:
+op_btst_e:
     use_cycles -4                # btst: no writeback necessary
     j main_loop
+op_bchg_e:
     xor result, t1, t2           # bchg: result = value ^ (1 << bitindex)
     jr ra
+op_bclr_e:
     xor result, t1, t3           # bclr: result = value ^ (value & (1 << bitindex))
     jr ra
+op_bset_e:
     or result, t1, t2            # bset: result = value | (1 << bitindex)
     jr ra
     #undef bitmask
@@ -2929,9 +2943,56 @@ OP(nop):
     j main_loop
 
 
+# CHK.W <ea>,Dn: compare signed Dn.w against the range [0, <ea>.w]. If Dn is
+# out of range, raise a CHK exception (vector 6); the common in-range case just
+# falls through to the next instruction. Reached from OP(lea) when opcode bit 6
+# is 0. Previously CHK was aliased into the illegal-opcode block below and hard
+# aborted, which is what crashed samsho2 at the BIOS->cart handoff.
+op_chk:
+    li opsize, 2
+    jal decode_ea                       # eaptr -> bound operand (consumes EA ext words)
+    check_addr_error eaptr32, read_address_error  # odd word EA -> 68k address error
+    lh_m68k t0, eaptr                   # t0 = bound (sign-extended .w); must be t0
+    move t2, t0                          # save bound across the Dn decode
+    srl t1, opcode, 7                    # extract Dn (opcode bits 9-11) -> reg*4
+    andi t1, 0x7<<2
+    addu t1, ctx
+    lh t1, M64K_OFF_DREGS+2(t1)         # t1 = src = Dn.w (sign-extended)
+    use_cycles 10
+    # CHK updates the CCR on every path (X preserved): Z=(src.w==0), V=0, C=0,
+    # N=(src<0). Then trap if src<0 or src>bound; otherwise fall through.
+    andi flag_zc, t1, 0xFFFF             # Z from src low word, C=0
+    bltz t1, op_chk_neg                  # src < 0 -> N=1, always traps
+    li flag_nv, 0                        # src >= 0: N=0, V=0
+    bgt  t1, t2, op_chk_trap             # src > bound -> trap
+    j main_loop                          # in range: continue (PC already at next insn)
+op_chk_neg:
+    dli flag_nv, 0x8000000080000000      # src < 0: N=1, V=0
+op_chk_trap:
+    li t0, M64K_PENDINGEXC_CHK
+    sw_ctx t0, M64K_OFF_PENDINGEXC       # 68000 stacks PC of the *next* instruction
+    j main_loop_exit
+
+
+# STOP #<imm>: privileged. Loads the immediate word into SR (which is what sets
+# the interrupt mask the following idle/VBlank-wait loop relies on) and then
+# continues. A real 68000 halts here until an interrupt, but NeoGeo idle loops
+# are of the form "STOP #imm ; <poll a vblank flag> ; bra back", so continuing
+# (the loop busy-polls until the VBlank IRQ fires) boots correctly. Previously
+# STOP was aliased into the illegal-opcode block, which made the post-eyecatch
+# wait loop spin forever taking the illegal vector.
+op_stop:
+    check_supervisor                     # STOP is privileged
+    jal flush_sr                         # sync live flags / A7 into SR before overwrite
+    lhu t0, 0(m_pc)                      # immediate (new SR), sits right after the opcode
+    addi m_pc, 2                         # advance past the immediate word
+    and t0, SR_MASK
+    sw_ctx t0, M64K_OFF_SR
+    use_cycles 4
+    jal_and_j reload_sr, main_loop       # reload flags/stack from new SR, then continue
+
+
 op_unk:
-# 68000+ instructions
-op_stop: op_chk:
 # 68010+ instructions
 op_movec: op_bkpt: op_mvfccr: op_moves: op_rtd:
 # 68020+ instructions
@@ -2939,6 +3000,12 @@ op_bftst: op_bfextu: op_bfchg: op_bfexts: op_bfclr: op_bfffo: op_bfset: op_bfins
 op_callm: op_cas: op_cas2: op_chk2: op_cmp2: op_cpbcc: op_cpdbcc: op_cpgen:
 op_cprestore: op_cpsave: op_cpscc: op_cptrapcc: op_divul: op_divsl: op_extb:
 op_pack: op_rtm: op_trapcc: op_unpk:
-    move a0, opcode
-    jal __m64k_assert_invalid_opcode
-    addiu a1, m_pc, -2
+    # No illegal/unimplemented-instruction path existed here: every such opcode
+    # hard-aborted via assertf(). A real 68000 instead raises an illegal-
+    # instruction exception (vector 4) and keeps running, which the BIOS->cart
+    # handoff depends on. Vector through it instead of asserting.
+    sw_ctx opcode, M64K_OFF_PENDINGEXC+4   # stash opcode for logging
+    li t0, M64K_PENDINGEXC_ILLEGAL
+    sw_ctx t0, M64K_OFF_PENDINGEXC+0
+    addi m_pc, -2                          # 68000 stacks PC of the faulting opcode
+    j main_loop_exit

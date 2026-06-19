@@ -140,6 +140,14 @@ void sound_init(void) {
 	// separate ADPCM-B ROM, so A and B share the same data (as on real NeoGeo).
 	// If the alloc fails (e.g. tight N64 RAM), ADPCM is disabled but FM/SSG run.
 	if (v_rom_size) {
+#ifdef N64
+		// mvs64 streams v.rom from cart. Pulling the ~7MB ADPCM sample ROM fully
+		// resident overruns the N64 heap into the stack region and corrupts return
+		// addresses (intermittent wild-jump crash ~9s into boot). Leave it
+		// non-resident: ADPCM disabled (vrom_resident NULL), FM/SSG still play.
+		// ADPCM via streaming is future work.
+		debugf("[SND] N64: v.rom not pulled resident (%u bytes); ADPCM disabled\n", v_rom_size);
+#else
 		vrom_resident = malloc(v_rom_size);
 		if (vrom_resident) {
 			vrom_read(0, vrom_resident, v_rom_size);
@@ -147,6 +155,7 @@ void sound_init(void) {
 		} else {
 			debugf("[SND] v.rom alloc failed; ADPCM disabled\n");
 		}
+#endif
 	}
 	YM2610Init(YM_CLOCK, AUDIO_RATE,
 		vrom_resident, vrom_resident ? v_rom_size : 0,   // ADPCM-A
@@ -179,8 +188,25 @@ void sound_write_command(uint8_t cmd) {
 	sound_code = cmd;
 	pending_command = 1;
 	if (!z80_active) return;
+#ifdef N64
+	// This runs inside the TLB/MMIO exception handler, which clears SR.CU1
+	// (FPU disabled) in hw_n64.S. The Z80 driver writes the YM2610, which uses
+	// FP math -> a Coprocessor-Unusable fault here nests into a wild jump. The
+	// NeoGeo BIOS polls for the sound reply in a bounded loop at boot, so the run
+	// MUST be synchronous (deferring it to the next frame mis-sequences the
+	// handshake -> the BIOS jumps wild ~frame 537). Fix: re-enable the FPU (CU1,
+	// status bit 29) just around the run, then restore it. Safe because the
+	// interrupted m64k 68k interpreter is integer-only and holds no live FP state.
+	uint32_t sr;
+	__asm__ volatile("mfc0 %0, $12" : "=r"(sr));
+	__asm__ volatile("mtc0 %0, $12" :: "r"(sr | (1u << 29)));  // set CU1
+	z80_gen_nmi(&cpu);
+	z80_run(300);
+	__asm__ volatile("mtc0 %0, $12" :: "r"(sr));               // restore CU1
+#else
 	z80_gen_nmi(&cpu);    // command latch raises Z80 NMI...
 	z80_run(300);         // ...and the driver replies within the 68k busy-wait
+#endif
 }
 
 uint8_t sound_read_status(void) {
@@ -234,5 +260,22 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		debugf("[SND] z80 pc=%04x code=%02x result=%02x timers=%d%d s0=%d\n",
 			cpu.pc, sound_code, result_code, ym_timer_on[0], ym_timer_on[1],
 			(int)play_buffer[0]);
+
+#ifdef MVS64_AUTOINPUT
+	// Audio-activity probe: report the RMS amplitude of the generated frame so
+	// "is sound actually being produced" is verifiable headless (non-zero,
+	// varying RMS = the Z80 music driver is feeding the YM2610).
+	{
+		static int sc = 0;
+		uint64_t acc = 0; int pk = 0;
+		for (int i = 0; i < nsamples * 2; i++) {
+			int v = out[i]; if (v < 0) v = -v;
+			acc += (uint64_t)v * v; if (v > pk) pk = v;
+		}
+		int rms = 0; if (nsamples) { uint64_t m = acc / (nsamples * 2); while ((uint64_t)(rms+1)*(rms+1) <= m) rms++; }
+		if ((sc++ % 60) == 0)
+			debugf("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x\n", rms, pk, cpu.pc, sound_code);
+	}
+#endif
 	return nsamples;
 }
