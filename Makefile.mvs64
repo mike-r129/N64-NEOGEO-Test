@@ -9,15 +9,31 @@ BUILD_DIR = build/mvs64
 
 include $(N64_INST)/include/n64.mk
 
-src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80.c ym2610/ym2610.c lib/rdl.c m64k/m64k.c m64k/tlb.c $(wildcard hle_*.c)
+core_src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80.c ym2610/ym2610.c lib/rdl.c $(wildcard hle_*.c)
 rsp = rsp_video.S
+ifdef MUSASHI
+# Fallback 68k core: portable Musashi (proven on the PC build). Slower than m64k
+# but known-good — use while m64k opcode bugs are investigated. No m64k TLB asm;
+# memory goes through the banks[] callbacks in hw.c.
+src = $(core_src) m68kcpu.c m68kops.c m68kdasm.c
+asm =
+else
+# Default: fast m64k MIPS-asm 68k interpreter (0xFF000000 TLB window + hw_n64.S).
+src = $(core_src) m64k/m64k.c m64k/tlb.c
 asm = hw_n64.S m64k/m64k_asm.S
+CFLAGS += -DUSE_M64K
+endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 
 src_makerom = mvsmakerom.c miniz.c
 obj_makerom = $(src_makerom:%.c=$(BUILD_DIR)/%.o)
 
 CFLAGS += -Wno-unused-function
+CFLAGS += $(EXTRA_DEFINES)
+# Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
+# (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
+ASFLAGS += $(EXTRA_DEFINES)
+N64_ASFLAGS += $(EXTRA_DEFINES)
 
 ROMNAME=$(notdir $(basename $(ROM)))
 ROMDIR=$(ROM:%.zip=%.n64)

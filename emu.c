@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #endif
 #include "emu.h"
-#ifdef N64
+#ifdef USE_M64K
 #include "m64k/m64k.h"
 #else
 #include "m68k.h"
@@ -154,7 +154,7 @@ static void wav_close(void) {
 #define AUDIO_FREQ 44100
 static int16_t audio_frame[(AUDIO_FREQ / FPS + 16) * 2];
 #endif
-#ifdef N64
+#ifdef USE_M64K
 m64k_t m64k;
 #endif
 static uint64_t g_clock, g_clock_framebegin;
@@ -166,8 +166,7 @@ uint32_t profile_dma_load;
 static uint64_t m68k_exec(uint64_t clock) {
 	clock /= M68K_CLOCK_DIV;
 	if (clock > m68k_clock) {
-		#ifdef N64
-		debugf("m68k_exec: %d\n", (int)(clock - m68k_clock));
+		#ifdef USE_M64K
 		m68k_clock = m64k_run(&m64k, clock);
 		#else
 		m68k_clock += m68k_execute(clock - m68k_clock);
@@ -202,7 +201,7 @@ int emu_add_event(int64_t clock, EmuEventCb cb, void *cbarg) {
 void emu_change_event(int event_id, int64_t newclock) {
 	events[event_id].clock = newclock;
 	if (events[event_id].current) {
-		#ifdef N64
+		#ifdef USE_M64K
 		m64k_run_stop(&m64k);
 		#else
 		m68k_end_timeslice();
@@ -211,7 +210,7 @@ void emu_change_event(int event_id, int64_t newclock) {
 }
 
 int64_t emu_clock(void) {
-	#ifdef N64
+	#ifdef USE_M64K
 	return m64k_get_clock(&m64k) * M68K_CLOCK_DIV;
 	#else
 	return g_clock + m68k_cycles_run() * M68K_CLOCK_DIV;
@@ -223,7 +222,7 @@ int64_t emu_clock_frame(void) {
 }
 
 void emu_cpu_reset(void) {
-	#ifdef N64
+	#ifdef USE_M64K
 	m64k_pulse_reset(&m64k);
 	#else
 	m68k_pulse_reset();
@@ -231,7 +230,7 @@ void emu_cpu_reset(void) {
 }
 
 uint32_t emu_pc(void) {
-	#ifdef N64
+	#ifdef USE_M64K
 	return m64k_get_pc(&m64k) & 0xFFFFFF;
 	#else
 	return m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF;
@@ -239,14 +238,14 @@ uint32_t emu_pc(void) {
 }
 
 void emu_cpu_irq(int irq, bool on) {
-	#ifdef N64
+	#ifdef USE_M64K
 	m64k_set_virq(&m64k, irq, on);
 	#else
 	m68k_set_virq(irq, on);
 	#endif
 }
 
-#ifdef N64
+#ifdef USE_M64K
 int cpu_irqack(void *ctx, int level)
 {
 	// On NeoGeo hardware, interrupts must be manually acknowledged via a write
@@ -383,7 +382,7 @@ int main(int argc, char *argv[]) {
 	rom_load(argv[1]);
 	#endif
 
-	#ifdef N64
+	#ifdef USE_M64K
 	m64k_init(&m64k);
 	m64k_set_hook_irqack(&m64k, cpu_irqack, NULL);
 	#else
@@ -393,7 +392,7 @@ int main(int argc, char *argv[]) {
 	hw_init();
 	g_clock = 0;
 
-	#ifdef N64
+	#ifdef USE_M64K
 	m64k_pulse_reset(&m64k);
 	#else
 	m68k_set_cpu_type(M68K_CPU_TYPE_68000);
@@ -467,14 +466,26 @@ int main(int argc, char *argv[]) {
 			(float)profile_hw_io * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)render_time * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)profile_dma_load * 100.f / (float)(TICKS_PER_SECOND / 60),
-			#ifdef N64
+			#ifdef USE_M64K
 			m64k_get_pc(&m64k));
 			#else
 			(uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
 			#endif
+		#ifdef MVS64_IDLEPROBE
+		{
+			extern uint32_t idle_probe_found;
+			if (idle_probe_found) {
+				debugf("[IDLEPROBE] long spin at 68k pc=%06lx\n",
+					(unsigned long)(idle_probe_found & 0xFFFFFF));
+				idle_probe_found = 0;
+			}
+		}
+		#endif
 		#endif
 
-		rom_next_frame();
+		// NOTE: rom_next_frame() is already called once per frame inside
+		// emu_render() (after the frame is drawn); calling it again here ran it
+		// twice/frame, halving the sprite-cache LRU retention window. Removed.
 		#ifdef N64
 		uint32_t curtime = TICKS_READ();
 		if (TICKS_DISTANCE(fps_time, curtime) > TICKS_FROM_MS(1000)) {
