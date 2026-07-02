@@ -41,7 +41,50 @@ extern char end __attribute__((section (".data")));
 
 // Audio (libdragon AI) state — see plat_audio_pump below.
 static int audio_enabled = 0;
-#define AI_NUM_BUFFERS 4          // AI back buffers; also bounds plat_audio_pump
+#define AI_NUM_BUFFERS 4          // AI back buffers handed to audio_init
+
+// --- Interrupt-fed staging ring ---------------------------------------------
+// The N64 AI hardware replays its last DMA buffer forever when its queue runs
+// dry (there is no silence-on-underrun mode), and libdragon's AI interrupt
+// fires on buffer LATCH, not on a timer: once the queue fully drains there is
+// nothing left to latch, the interrupt chain dies, and nothing plays new data
+// until the main loop's next audio_write_end() restarts it. A main-loop pump
+// therefore cannot prevent replay: one sound_gen_samples() call can take
+// 100-300ms when the Z80 is busy (the boot jingle), the queue holds ~160ms,
+// and during the call nothing refills or even pushes queued buffers to the
+// hardware. That drain-replay was the stuck high-pitch tone at boot/start.
+//
+// The fix is pull-based delivery: audio_set_buffer_callback() makes libdragon
+// invoke audio_ring_cb() in AI-interrupt context every time the hardware
+// needs a buffer. The callback drains this staging ring; if the ring is empty
+// it pads clean silence. In callback mode libdragon refills the queue on
+// every latch interrupt, so the chain is self-sustaining and the queue can
+// never run dry — a stale-buffer replay is physically impossible. The main
+// loop's only job is topping the ring up (plat_audio_pump below).
+#define ARING_FRAMES 8192              // power of two; ~0.74s @11025Hz stereo
+static int16_t aring[ARING_FRAMES * 2];        // stereo frames, cached memory
+static volatile uint32_t aring_wr;             // frames produced (main loop)
+static volatile uint32_t aring_rd;             // frames consumed (AI IRQ)
+static volatile uint32_t aring_pad;            // frames the IRQ padded with silence
+
+// Runs in AI-interrupt context. `buffer` is an uncached libdragon AI buffer
+// (malloc_uncached) — write it with packed 32-bit stores (one stereo frame
+// per store), same trick sound_neogeo.c's emit() uses, since 16-bit stores
+// to uncached RDRAM are twice the transactions.
+static void audio_ring_cb(short *buffer, size_t numsamples) {
+    uint32_t *dst = (uint32_t *)buffer;
+    uint32_t rd = aring_rd;
+    uint32_t avail = aring_wr - rd;         // unsigned wraparound-safe
+    uint32_t take = avail < (uint32_t)numsamples ? avail : (uint32_t)numsamples;
+    for (uint32_t i = 0; i < take; i++) {
+        uint32_t s = (rd + i) & (ARING_FRAMES - 1);
+        dst[i] = ((uint32_t)(uint16_t)aring[s * 2 + 0] << 16) | (uint16_t)aring[s * 2 + 1];
+    }
+    for (uint32_t i = take; i < (uint32_t)numsamples; i++)
+        dst[i] = 0;
+    aring_rd = rd + take;
+    aring_pad += (uint32_t)numsamples - take;
+}
 
 static void vblank_handler(void) {
     N64_FRAME++;
@@ -103,158 +146,156 @@ void plat_init(int audiofreq, int fps) {
     RSP_OVL_ID = rspq_overlay_register(&rsp_video);
 
     audio_init(audiofreq, AI_NUM_BUFFERS);
+    // ORDER MATTERS: register the callback BEFORE the priming write. The AI
+    // raises its interrupt when it LATCHES a buffer (start of DMA); whoever
+    // services that interrupt must queue the next buffer right then or the
+    // chain dies and the interrupt never fires again. The primer's own latch
+    // IRQ can arrive within microseconds of audio_write_end(), so if the
+    // callback isn't installed yet, that IRQ finds nothing to queue and the
+    // whole audio path is dead from boot (total silence — this exact bug).
+    audio_set_buffer_callback(audio_ring_cb);
+    // One write kick-starts the chain: audio_write_end() runs libdragon's
+    // audio_callback synchronously, which (in callback mode) immediately
+    // pulls two buffers through audio_ring_cb — the ring is empty so they
+    // are clean silence — and hands them to the AI. Every latch IRQ after
+    // that refills through the callback: self-sustaining forever.
+    audio_write_begin();
+    audio_write_end();
     (void)fps;
 }
 
 // --- Audio (libdragon Audio Interface) -------------------------------------
-// The AI DMA is the real-time clock master: it drains 44100 Hz continuously no
-// matter how fast the (slow, ~22fps in-match) 68k frame loop runs. So we
-// generate audio ON DEMAND — once per main-loop pass we fill EVERY currently
-// free AI buffer, rendering exactly buffer-length samples straight into the AI
-// buffer. sound_gen_samples() is rate-agnostic (N samples == N/44100 s of
+// Delivery is handled entirely by audio_ring_cb() in AI-interrupt context —
+// see the ring comment block above. plat_audio_pump() only keeps the ring
+// topped up; it never touches the AI queue, so a slow sound_gen_samples()
+// call can no longer let the hardware run dry and replay a stale buffer.
+// sound_gen_samples() is rate-agnostic (N samples == N/AUDIO_RATE seconds of
 // Z80+YM2610 time), so music plays at correct pitch AND tempo regardless of
-// video fps, and there is never a mid-buffer silence splice — the old hand-
-// rolled FIFO's zero-padding on underrun was the source of the periodic
-// click/buzz. When the Z80 is inactive sound_gen_samples() writes a whole
-// buffer of clean silence, so no special-casing is needed here.
+// video fps. When the Z80 is inactive it writes clean silence.
 void plat_enable_audio(int enable) {
     audio_enabled = enable;
 }
 
-// Audio generation is locked to the GUEST CLOCK, not to AI buffer availability:
-// each pass we owe the DAC exactly (elapsed guest time) x (real AI frequency)
-// samples, delivered in whole AI buffers. On real hardware the AI frees buffers
-// at precisely the rate the debt accrues, so this behaves exactly like the old
-// "fill every free buffer" pump. But it stays correct when the AI is emulated
-// with wrong timing (BizHawk-Mupen): if the AI never frees a buffer, we still
-// advance the Z80/YM in guest time (into a discard buffer) so 68k<->Z80
-// handshakes keep completing — with an AI-availability-driven pump, the boot
-// jingle's handshake starves and wedges the whole machine at ~frame 537; if the
-// emulated AI drains too fast, we simply never generate more than guest time
-// allows instead of spinning on audio_can_write(). Using audio_get_frequency()
-// (the exact post-quantization DAC rate) keeps generation and drain in the same
-// clock domain, so the debt has no long-term drift on real hardware.
 void plat_audio_pump(void) {
     if (!audio_enabled) return;
 #ifdef SND_HEALTH
     uint32_t _t0 = TICKS_READ();
 #endif
     const int buflen = audio_get_buffer_length();
-    static uint32_t last_t;
-    static uint64_t acc;            // fractional sample debt (ticks x Hz)
-    static int due;                 // whole samples owed to the DAC
-    static int underrun_streak;
-    uint32_t now = TICKS_READ();
-    if (last_t == 0) last_t = now;  // first pass: start the clock, owe nothing
-    acc += (uint64_t)TICKS_DISTANCE(last_t, now) * (uint32_t)audio_get_frequency();
-    last_t = now;
-    due += acc / TICKS_PER_SECOND;
-    acc %= TICKS_PER_SECOND;
+    const int n = buflen <= 2048 ? buflen : 2048;
+    // Ring headroom kept staged ahead of the ISR. Two buffers (~80ms @11kHz)
+    // rides out main-loop scheduling jitter at 28-30fps; combined with the
+    // <=2 buffers libdragon keeps latched in the AI pipeline, total latency
+    // matches the old push design (~160ms).
+    const uint32_t TARGET_LEAD = 2u * (uint32_t)n;
 
-    // Sustained-underrun detection: owing more than the whole AI buffer set
-    // means we can't generate real-time audio fast enough (the boot voice/jingle
-    // is Z80-CPU-bound on N64). Drop the debt to ONE buffer and tell
-    // sound_gen_samples to emit silence. Dropping to one buffer (not the full
-    // set) matters: while overloaded the governor below processes only one
-    // buffer per pass, so a 4-buffer debt could never be repaid below ~25fps and
-    // a single stall (e.g. character-select loading hitch) trapped the pump in
-    // silent+starved mode permanently — audible as a stuck replay tone. The Z80
-    // still advances (handshake/timers intact). sound_silent is set from the
-    // PREVIOUS pass's streak so a single slow frame isn't muted.
+    // Overload detection is read straight from the ring's silence-pad counter:
+    // audio_ring_cb() only increments it when it truly had nothing to hand the
+    // AI, so this is ground truth for "generation fell behind real time" —
+    // unlike the old guest-clock debt heuristic, it also sees drains that
+    // happen in the middle of one long sound_gen_samples() call. sound_silent
+    // is set from the PREVIOUS pass's streak so one slow frame isn't muted.
+    static uint32_t last_pad;
+    static int underrun_streak;
+    uint32_t pad_now = aring_pad;
+    uint32_t starved = pad_now - last_pad;
+    last_pad = pad_now;
     sound_silent = (underrun_streak >= 1);
-    if (due > AI_NUM_BUFFERS * buflen) {
-        due = buflen;
+    if (starved > 0) {
         if (underrun_streak < 1000) underrun_streak++;
     } else {
         underrun_streak = 0;
     }
 
-    // Overload governor: in sustained underrun (sound_silent set), generation
-    // is slower than real time and the output is zeros anyway, so wall-locking
-    // the Z80 only burns the frame budget stepping it — the boot jingle's
-    // Z80-bound phase dropped the whole machine to ~4fps this way. Process at
-    // most ONE buffer per pass while overloaded (the debt clamp above drops the
-    // rest); the machine then slows uniformly instead of audio starving video.
+    // Overload governor: in sustained starvation, generation is slower than
+    // real time and the output is zeros anyway (sound_silent), so grinding
+    // through more Z80/YM work per pass only steals frame budget from video —
+    // the boot jingle's Z80-bound phase dropped the machine to ~4fps this way.
+    // Process at most ONE buffer per pass while overloaded; the machine slows
+    // uniformly instead of audio starving video. (The starved frames are never
+    // "repaid": the ISR already padded that time with silence, so we just
+    // resume generating from now.)
     int pass_budget = (underrun_streak >= 1) ? 1 : AI_NUM_BUFFERS;
 
-    int filled = 0, discarded = 0, silfill = 0;
+    int filled = 0, discarded = 0;
+    static int16_t stage[2048 * 2];
 
-    // ANTI-REPLAY, part 1 (pre-flood): while overloaded, generating even one
-    // buffer can take 100-200ms (the Z80-bound jingle), during which the AI
-    // drains the whole queue and the hardware starts REPLAYING its last buffer
-    // (the stuck-tone bug). Top up every free slot but one with pure silence
-    // BEFORE generating, so the ~160ms queue cushion covers the generation time
-    // itself. The one slot left free receives this pass's generated buffer.
-    if (underrun_streak >= 1) {
-        for (int k = 0; k < AI_NUM_BUFFERS - 1 && audio_can_write(); k++) {
-            uint32_t *o = (uint32_t *)audio_write_begin();
-            for (int i = 0; i < buflen; i++)
-                o[i] = 0;
-            audio_write_end();
-            silfill++;
+    // Top the ring up toward TARGET_LEAD. The ISR consumes exactly n frames
+    // per callback, so lead is always a multiple of n.
+    while (filled < pass_budget) {
+        uint32_t lead = aring_wr - aring_rd;
+        if (lead + (uint32_t)n > TARGET_LEAD) break;   // topped up
+        sound_gen_samples(stage, n);
+        uint32_t wr = aring_wr;
+        for (int i = 0; i < n; i++) {
+            uint32_t s = (wr + i) & (ARING_FRAMES - 1);
+            aring[s * 2 + 0] = stage[i * 2 + 0];
+            aring[s * 2 + 1] = stage[i * 2 + 1];
         }
-    }
-    while (due >= buflen && filled < pass_budget && audio_can_write()) {
-        short *out = audio_write_begin();
-        sound_gen_samples((int16_t *)out, buflen);
-        audio_write_end();
-        due -= buflen;
+        MEMORY_BARRIER();      // publish samples before advancing the index
+        aring_wr = wr + n;
         filled++;
     }
-    // AI accepting nothing while we are >=2 buffers behind guest time: the AI is
-    // stalled/mis-emulated. Advance the sound machine into a discard buffer so
-    // the 68k<->Z80 handshake cannot starve. Never triggers on real hardware
-    // (there the AI frees buffers at exactly the debt rate); the 2-buffer slack
-    // absorbs scheduling jitter so a legit briefly-full queue is left alone.
-    if (due >= 2 * buflen && filled < pass_budget) {
-        static int16_t discard[2048 * 2];
-        int n = buflen <= 2048 ? buflen : 2048;
-        sound_gen_samples(discard, n);
-        due -= n;
-        discarded++;
-    }
 
-    // ANTI-REPLAY, part 2 (post-flood): after generating, top up any remaining
-    // free AI buffer with pure silence so the queue leaves this pass FULL — the
-    // hardware must never run dry and replay a stale buffer (the "stuck
-    // high-pitch tone"). Generated audio in this state is zeros anyway
-    // (sound_silent), so the stream stays seamless; once the overload ends,
-    // real audio resumes behind at most ~160ms of clean silence.
-    if (underrun_streak >= 1) {
-        while (audio_can_write()) {
-            uint32_t *out = (uint32_t *)audio_write_begin();
-            for (int i = 0; i < buflen; i++)
-                out[i] = 0;
-            audio_write_end();
-            silfill++;
+    // Safety valve for a broken emulated AI (BizHawk-Mupen class): if the ring
+    // reader (the AI interrupt) stops advancing while the ring sits full, the
+    // fill loop above never runs again and the 68k<->Z80 handshake starves —
+    // the old frame-537 wedge. Detect it with a wall-clock accumulator that
+    // resets whenever the reader moves; on real hardware and ares the reader
+    // is IRQ-driven and always advances, so this is inert there. When it
+    // trips, advance the sound machine into a discard buffer (handshake and
+    // timers stay alive; the audio is lost, but so is the platform's AI).
+    {
+        static uint32_t last_t, last_rd;
+        static uint64_t wall_acc;
+        static int wall_due;
+        uint32_t now = TICKS_READ();
+        if (last_t == 0) last_t = now;
+        uint32_t rd_now = aring_rd;
+        if (rd_now != last_rd) {
+            wall_due = 0;
+            wall_acc = 0;
+        } else {
+            wall_acc += (uint64_t)TICKS_DISTANCE(last_t, now) * (uint32_t)audio_get_frequency();
+            wall_due += wall_acc / TICKS_PER_SECOND;
+            wall_acc %= TICKS_PER_SECOND;
+            if (wall_due > 4 * n) wall_due = 4 * n;
+        }
+        last_t = now;
+        last_rd = rd_now;
+        if (filled == 0 && wall_due >= 2 * n) {
+            sound_gen_samples(stage, n);
+            wall_due -= n;
+            discarded++;
         }
     }
+
 #ifdef SND_HEALTH
-    // Delivery-health probe (USB/ISViewer). buffers/60 ~= real-time delivery
-    // rate; discard>0 = the AI is not draining (broken emulator AI — never on
-    // real HW); underruns = passes where the guest-clock debt overflowed the
-    // whole buffer set (generation can't keep up -> silence).
-    //   sndms  = avg wall-clock ms spent synthesising audio per pump. If this
-    //            approaches/exceeds the 16.7ms video-frame budget, real-time YM
-    //            synthesis alone can't keep up -> the fundamental perf wall.
+    // Delivery-health probe (USB/ISViewer).
+    //   buffers/60 = ring fills per 60 passes; ~= real-time rate at speed.
+    //   starved = frames the ISR padded with silence this window. Boot-jingle
+    //             and load-hitch windows may show bursts (audible as brief
+    //             silence — never a stuck tone); must be ~0 in steady state.
+    //   discard>0 = the AI interrupt stopped consuming (broken emulator AI —
+    //             never on real HW or ares). If this fires, delivery is dead.
+    //   lead    = ring fill in frames at print time (expect n..2n).
+    //   sndms   = avg wall-clock ms synthesising audio per pump; >=16.7ms
+    //             means real-time synthesis can't keep up (the perf wall).
     {
         static int pumps = 0, total = 0, deep = 0, maxf = 0, disc = 0;
-        static int sil = 0, dry = 0;
+        static uint32_t starvedsum = 0;
         static uint32_t tacc = 0;
         tacc += TICKS_DISTANCE(_t0, TICKS_READ());
         total += filled; if (filled > maxf) maxf = filled;
         disc += discarded;
-        sil += silfill;
-        // dry: the whole queue was free at pass start = the AI had fully
-        // drained = the hardware was replaying its last buffer. Must stay 0
-        // (except the very first pass) or a stuck tone was audible.
-        if (filled + silfill >= AI_NUM_BUFFERS && pumps > 0) dry++;
+        starvedsum += starved;
         if (underrun_streak) deep++;
         if ((pumps++ % 60) == 0) {
-            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d sil=%d dry=%d due=%d sndms=%.2f silent=%d\n",
-                     pumps, total, maxf, deep, disc, sil, dry, due,
+            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d starved=%u lead=%u sndms=%.2f silent=%d\n",
+                     pumps, total, maxf, deep, disc, starvedsum,
+                     (uint32_t)(aring_wr - aring_rd),
                      (float)tacc * 1000.f / (float)TICKS_PER_SECOND / 60.f, sound_silent);
-            total = 0; maxf = 0; tacc = 0; disc = 0; deep = 0; sil = 0; dry = 0;
+            total = 0; maxf = 0; tacc = 0; disc = 0; deep = 0; starvedsum = 0;
             // Commit the SD log to the card so it survives a power-off. FatFs only
             // writes the directory entry (file size) on close, so we close+reopen
             // in append mode here; until this runs the file can appear empty on a
