@@ -177,11 +177,20 @@ uint32_t ym_prof[5];
  *   TL_RES_LEN - sinus resolution (X axis)
  */
 #define TL_TAB_LEN (13*2*TL_RES_LEN)
-/* MVS64: narrowed from signed int — max magnitude is 13 bits (see
- * OPNInitTable), and the VR4300's 8KB dcache is the synthesis bottleneck:
- * tl_tab+sin_tab at 32-bit were 30KB of hot lookup tables. 16-bit halves
- * the footprint/miss traffic with identical values. */
-static s16 ALIGN_DATA tl_tab[TL_TAB_LEN];
+/* MVS64: tl_tab (13*2*256 entries, 26KB as int) is mathematically
+ * redundant: entry [x*2+s + i*2*256] == (s? -1:1) * (base[x] >> i). The
+ * VR4300's dcache is 8KB direct-mapped, so the scattered 13-26KB table was
+ * the synthesis loop's dominant miss source; a 512-byte base table stays
+ * cache-resident and the >>/negate cost ~4 cycles vs ~50+ for a miss.
+ * Values are bit-identical (base[x] is positive, so the arithmetic shift
+ * and the sign applied after the shift reproduce the old entries exactly —
+ * that is precisely how OPNInitTable built them). */
+static s16 ALIGN_DATA tl_tab_base[TL_RES_LEN];
+
+INLINE signed int tl_tab_lookup(unsigned int p) {
+	int v = tl_tab_base[(p >> 1) & (TL_RES_LEN - 1)] >> (p >> 9);
+	return (p & 1) ? -v : v;
+}
 
 #define ENV_QUIET		(TL_TAB_LEN>>3)
 
@@ -1052,7 +1061,7 @@ INLINE signed int op_calc(u32 phase, unsigned int env, signed int pm) {
 
 	if (p >= TL_TAB_LEN)
 		return 0;
-	return tl_tab[p];
+	return tl_tab_lookup(p);
 }
 
 INLINE signed int op_calc1(u32 phase, unsigned int env, signed int pm) {
@@ -1064,7 +1073,7 @@ INLINE signed int op_calc1(u32 phase, unsigned int env, signed int pm) {
 
 	if (p >= TL_TAB_LEN)
 		return 0;
-	return tl_tab[p];
+	return tl_tab_lookup(p);
 }
 
 /* advance LFO to next sample */INLINE void advance_lfo(FM_OPN *OPN) {
@@ -1478,21 +1487,9 @@ static void OPNInitTable(void) {
 			n = n >> 1;
 		/* 11 bits here (rounded) */
 		n <<= 2; /* 13 bits here (as in real chip) */
-		tl_tab[x * 2 + 0] = n;
-		tl_tab[x * 2 + 1] = -tl_tab[x * 2 + 0];
-
-		for (i = 1; i < 13; i++) {
-			tl_tab[x * 2 + 0 + i * 2 * TL_RES_LEN] = tl_tab[x * 2 + 0] >> i;
-			tl_tab[x * 2 + 1 + i * 2 * TL_RES_LEN] = -tl_tab[x * 2 + 0
-					+ i * 2 * TL_RES_LEN];
-		}
-#if 0
-		logerror("tl %04i", x);
-		for (i=0; i<13; i++)
-		logerror(", [%02i] %4x", i*2, tl_tab[ x*2 /*+1*/+ i*2*TL_RES_LEN ]);
-		logerror("\n");
-	}
-#endif
+		/* MVS64: only the octave-0 positive value is stored; sign and the
+		 * >>octave live in tl_tab_lookup() (bit-identical, see above). */
+		tl_tab_base[x] = n;
 	}
 	/*logerror("FM.C: TL_TAB_LEN = %i elements (%i bytes)\n",TL_TAB_LEN, (int)sizeof(tl_tab));*/
 
