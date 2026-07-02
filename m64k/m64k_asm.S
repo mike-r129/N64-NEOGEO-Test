@@ -2696,7 +2696,179 @@ OP(dbcc):
     #endif
     lh t3, -2(m_pc)
     addiu t3, -2
+#ifdef M64K_BLOCKOPS
+    # Fused block-op fast path for single-instruction DBF copy/fill loops.
+    # samsho2 spends several % of every frame in "move.w (As)+,(Ad)" uploads
+    # to the LSPC VRAM data port (one TLB exception per word on N64) and in
+    # "move.w/l Dn,(Ad)+" RAM fills, all shaped as 2-word DBRA self-loops.
+    # Execute up to count-1 iterations natively with identical cycle charges;
+    # the final (expiring) iteration and any budget tail always run through
+    # the normal interpreter, so flags, PC and register state at every
+    # observable boundary are bit-exact. Restricted to DBF (cc can never
+    # become true mid-loop; other DBcc react to flags the body changes).
+    bne t3, -4, dbcc_no_blockop        # only a 2-word self-loop qualifies
+    andi t2, opcode, 0x0F00
+    bne t2, 0x0100, dbcc_no_blockop    # DBF only
+    addi t2, t0, -1                    # fast-loopable iterations (keep last)
+    blez t2, dbcc_no_blockop
+    lhu t9, -4(m_pc)                   # body opcode
+    andi t1, t9, 0xF1F8
+    beq t1, 0x3098, blockop_movew_port # move.w (As)+,(Ad)
+    beq t1, 0x30C0, blockop_fill_w     # move.w Dn,(Ad)+
+    beq t1, 0x20C0, blockop_fill_l     # move.l Dn,(Ad)+
+dbcc_no_blockop:
+#endif
     j branch_exec
+
+#ifdef M64K_BLOCKOPS
+blockop_movew_port:
+    # Destination (An) must be the LSPC VRAM data port (0x3C0002): the only
+    # (An)-fixed-destination copy the game runs hot, and the expensive one.
+    srl t1, t9, 7
+    andi t1, 7<<2
+    lw_ctx t1, M64K_OFF_AREGS,t1       # Ad
+    sll t1, 8
+    srl t1, 8                          # 24-bit address
+    li result, 0x003C0002
+    bne t1, result, dbcc_no_blockop
+    # Budget: K = min(count-1, (m_cycles-11)/22); keeps m_cycles > 0 so the
+    # interpreter always resumes at the loop body. 22 = move.w (An)+,(An)
+    # [12] + taken dbra [10], matching the interpreter's own charges.
+    addi result, m_cycles, -11
+    blez result, dbcc_no_blockop
+    li t8, 22
+    divu zero, result, t8
+    mflo result
+    beqz result, dbcc_no_blockop
+    ble t2, result, 1f
+    move t2, result
+1:  # Source (As)+ span must stay inside the always-mapped P-ROM + work-RAM
+    # window (< 0x110000): a native lhu there can never TLB-fault.
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t9, M64K_OFF_AREGS,t1       # &As
+    lw t8, 0(t9)                       # As (full register value)
+    sll t1, t8, 8
+    srl t1, 8                          # 24-bit source address
+    sll result, t2, 1                  # 2K bytes
+    addu result, t1
+    li eaptr32, 0x00110000
+    bgt result, eaptr32, dbcc_no_blockop
+    # ---- commit ----
+    sll result, t2, 1                  # As += 2K
+    addu t8, result
+    sw t8, 0(t9)
+    sub t8, t0, t2                     # counter = (old-1) - K
+    addi t8, -1
+    sh t8, 2(dptr)
+    li t8, 22                          # m_cycles -= 10 + 22K
+    multu t2, t8
+    mflo t8
+    sub m_cycles, t8
+    addi m_cycles, -10
+    addi m_pc, -4                      # resume at the loop body
+    map_m68k t1                        # t1 = mapped src, t2 = count
+    jal mvs64_blockop_vram_copy_w
+    j main_loop
+
+blockop_fill_w:
+    # value = Dn.w
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t1, M64K_OFF_DREGS,t1
+    lhu result, 2(t1)
+    # Budget: 18 = move.w Dn,(An)+ [8] + taken dbra [10]
+    addi t1, m_cycles, -11
+    blez t1, dbcc_no_blockop
+    li t8, 18
+    divu zero, t1, t8
+    mflo t1
+    beqz t1, dbcc_no_blockop
+    ble t2, t1, 1f
+    move t2, t1
+1:  # Destination (Ad)+ span must stay inside work RAM [0x100000,0x110000)
+    srl t1, t9, 7
+    andi t1, 7<<2
+    la_ctx t9, M64K_OFF_AREGS,t1       # &Ad
+    lw t8, 0(t9)                       # Ad (full register value)
+    sll t1, t8, 8
+    srl t1, 8                          # 24-bit dest address
+    li eaptr32, 0x00100000
+    blt t1, eaptr32, dbcc_no_blockop
+    sll t7, t2, 1
+    addu t7, t1
+    li eaptr32, 0x00110000
+    bgt t7, eaptr32, dbcc_no_blockop
+    # ---- commit ----
+    sll t7, t2, 1                      # Ad += 2K
+    addu t8, t7
+    sw t8, 0(t9)
+    sub t7, t0, t2                     # counter = (old-1) - K
+    addi t7, -1
+    sh t7, 2(dptr)
+    li t7, 18                          # m_cycles -= 10 + 18K
+    multu t2, t7
+    mflo t7
+    sub m_cycles, t7
+    addi m_cycles, -10
+    addi m_pc, -4                      # resume at the loop body
+    map_m68k t1                        # native fill (work RAM: mapped RW)
+1:  sh result, 0(t1)
+    addiu t1, 2
+    addiu t2, -1
+    bnez t2, 1b
+    j main_loop
+
+blockop_fill_l:
+    # value = Dn (32-bit)
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t1, M64K_OFF_DREGS,t1
+    lw result, 0(t1)
+    # Budget: 26 = move.l Dn,(An)+ as m64k charges it [16] + taken dbra [10]
+    addi t1, m_cycles, -11
+    blez t1, dbcc_no_blockop
+    li t8, 26
+    divu zero, t1, t8
+    mflo t1
+    beqz t1, dbcc_no_blockop
+    ble t2, t1, 1f
+    move t2, t1
+1:  # Destination (Ad)+ span must stay inside work RAM [0x100000,0x110000)
+    srl t1, t9, 7
+    andi t1, 7<<2
+    la_ctx t9, M64K_OFF_AREGS,t1       # &Ad
+    lw t8, 0(t9)                       # Ad (full register value)
+    sll t1, t8, 8
+    srl t1, 8                          # 24-bit dest address
+    li eaptr32, 0x00100000
+    blt t1, eaptr32, dbcc_no_blockop
+    sll t7, t2, 2
+    addu t7, t1
+    li eaptr32, 0x00110000
+    bgt t7, eaptr32, dbcc_no_blockop
+    # ---- commit ----
+    sll t7, t2, 2                      # Ad += 4K
+    addu t8, t7
+    sw t8, 0(t9)
+    sub t7, t0, t2                     # counter = (old-1) - K
+    addi t7, -1
+    sh t7, 2(dptr)
+    li t7, 26                          # m_cycles -= 10 + 26K
+    multu t2, t7
+    mflo t7
+    sub m_cycles, t7
+    addi m_cycles, -10
+    addi m_pc, -4                      # resume at the loop body
+    map_m68k t1
+    srl t3, result, 16                 # high word first (68k byte order;
+1:  sh t3, 0(t1)                       #  2-byte stores keep any even address
+    sh result, 2(t1)                   #  legal, matching the 68000 bus)
+    addiu t1, 4
+    addiu t2, -1
+    bnez t2, 1b
+    j main_loop
+#endif
 
 OP(scc):
     andi t0, opcode, 0b111000

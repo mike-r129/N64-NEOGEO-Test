@@ -22,6 +22,12 @@ else
 src = $(core_src) m64k/m64k.c m64k/tlb.c
 asm = hw_n64.S m64k/m64k_asm.S
 CFLAGS += -DUSE_M64K
+# DBF block-op fast path (fused copy/fill loops; VRAM-port helper lives in
+# hw_n64.S, so only game builds enable it — the standalone testsuite link
+# has no hw_n64.S and must not reference its symbols).
+CFLAGS += -DM64K_BLOCKOPS
+ASFLAGS += -DM64K_BLOCKOPS
+N64_ASFLAGS += -DM64K_BLOCKOPS
 endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 
