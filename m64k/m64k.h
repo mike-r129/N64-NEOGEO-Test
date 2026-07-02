@@ -21,6 +21,14 @@ typedef struct {
     uint8_t ipl;
     uint8_t nmi_pending;
     uint8_t check_interrupts;
+    // Set (from C, within an MMIO handler) to request that the current
+    // timeslice ends at the next MMIO boundary. Consumed by the TLB handler.
+    uint8_t slice_break;
+    // Cycles clamped out of the live cycle counter by a forced slice exit
+    // (slice_break or an SR reload that unmasked a pending IRQ). m64k_run
+    // adds this back to the value returned by the asm core so the guest
+    // clock stays exact.
+    int32_t forced_remaining;
 
     uint8_t virq;
     int (*hook_irqack)(void *ctx, int level);

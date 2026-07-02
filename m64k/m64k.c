@@ -27,6 +27,11 @@
 
 extern int _m64k_asmrun(m64k_t *m64k, int ncycles);
 
+// Live context pointer for the application's TLB/MMIO exception handler
+// (hw_n64.S), which maintains ts_cur and implements forced slice exits now
+// that the interpreter's main loop no longer polls per-instruction.
+m64k_t *__m64k_live;
+
 void __m64k_assert_invalid_opcode(uint16_t opcode, uint32_t pc) {
     assertf(0, "Invalid opcode: %04x @ %08lx", opcode, pc);
 }
@@ -149,9 +154,16 @@ void m64k_exception_interrupt(m64k_t *m64k, int level)
 
 int64_t m64k_run(m64k_t *m64k, int64_t until)
 {
+    __m64k_live = m64k;
     while (until > m64k->cycles) {
         int timeslice = until - m64k->cycles;
         int remaining = _m64k_asmrun(m64k, timeslice);
+        if (__builtin_expect(m64k->forced_remaining != 0, 0)) {
+            // A forced slice exit (slice_break / reload_sr clamp) banked the
+            // cycle counter here; add it back so the guest clock stays exact.
+            remaining += m64k->forced_remaining;
+            m64k->forced_remaining = 0;
+        }
         m64k->cycles += timeslice - remaining;
 
         if (__builtin_expect(m64k->pending_exc[0] != 0, 0)) {
@@ -201,7 +213,7 @@ void m64k_set_irq(m64k_t *m64k, int level)
         m64k->nmi_pending = 1;
     }
     m64k->ipl = level;
-    m64k->check_interrupts = 1;
+    m64k->slice_break = 1;
 }
 
 void m64k_set_virq(m64k_t *m64k, int irq, bool on)
@@ -235,7 +247,7 @@ int64_t m64k_get_clock(m64k_t *m64k)
 
 void m64k_run_stop(m64k_t *m64k)
 {
-    m64k->check_interrupts = 2;
+    m64k->slice_break = 1;
 }
 
 void m64k_set_hook_irqack(m64k_t *m64k, int (*hook)(void *ctx, int level), void *ctx)

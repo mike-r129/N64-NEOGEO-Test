@@ -1,5 +1,6 @@
 
 #include "regs.S"
+#include "m64k/m64k_internal.h"
 
 #define C0_BADVADDR	       $8
 #define C0_CAUSE_TLBSTORE   3
@@ -223,6 +224,28 @@ tlbcallhandler_standard:
 #undef k0
 #undef k1
 
+	# m64k slice bookkeeping: keep ctx->ts_cur fresh so mid-slice
+	# emu_clock() reads (from the C MMIO handlers we are about to call)
+	# stay exact, now that the interpreter no longer stores it
+	# per-instruction. Only valid when the fault came from inside the
+	# interpreter's text (then saved a1 == live m_cycles): nested faults
+	# from C handlers and faults from outside m64k are skipped, as is a
+	# slice that was already clamped (forced_remaining!=0 -> ts_cur is
+	# frozen at the clamp value).
+	lw t0, __m64k_live
+	beqz t0, 8f
+	 ld t1, 22*8(sp)                  # faulting EPC (BD-corrected)
+	la t2, _m64k_asmrun
+	sltu t3, t1, t2
+	bnez t3, 8f                       # EPC below interpreter text
+	 la t2, __m64k_asm_end
+	sltu t3, t1, t2
+	beqz t3, 8f                       # EPC above interpreter text
+	 lw t2, M64K_OFF_FORCED_REMAINING(t0)
+	bnez t2, 8f
+	 ld t3, 8*8(sp)                   # saved a1 = live m_cycles
+	sw t3, M64K_OFF_TS_CUR(t0)
+8:
 	# Decode faulting instruction at EPC. We get the memory address in C0_BADVADDR,
 	# but we need to decode the RS register because it contains the actual value
 	# being read/written. Also, the opcode itself encodes the access width (eg:
@@ -367,6 +390,35 @@ tlb_writehwio_palette:
 	##########################################
 
 tlb_restore:
+	# If a C handler requested a slice break (m64k_set_irq / m64k_run_stop),
+	# bank the live cycle counter into forced_remaining and clamp the saved
+	# a1 (m_cycles) to 0: the faulting instruction completes and the
+	# interpreter exits at the next instruction boundary. m64k_run adds
+	# forced_remaining back, so guest-clock accounting stays exact.
+	# Gated on the faulting EPC being inside the interpreter text: in a
+	# nested fault (C handler touching 0xFF.. space) the saved a1 is NOT
+	# m_cycles, so the break request is left set and consumed by the
+	# outermost (interpreter-level) restore instead.
+	lw t0, __m64k_live
+	beqz t0, 9f
+	 ld t1, 22*8(sp)                  # faulting EPC (BD-corrected)
+	la t2, _m64k_asmrun
+	sltu t3, t1, t2
+	bnez t3, 9f                       # EPC below interpreter text
+	 la t2, __m64k_asm_end
+	sltu t3, t1, t2
+	beqz t3, 9f                       # EPC above interpreter text
+	 lbu t1, M64K_OFF_SLICE_BREAK(t0)
+	beqz t1, 9f
+	 nop
+	sb zero, M64K_OFF_SLICE_BREAK(t0)
+	ld t2, 8*8(sp)                    # saved a1 = live m_cycles
+	lw t3, M64K_OFF_FORCED_REMAINING(t0)
+	addu t3, t2
+	sw t3, M64K_OFF_FORCED_REMAINING(t0)
+	sw t2, M64K_OFF_TS_CUR(t0)
+	sd zero, 8*8(sp)                  # clamp m_cycles -> exit after this insn
+9:
 	# Restore the stack frame
 	ld t0, 23*8(sp)
 	ld t1, 22*8(sp)

@@ -24,6 +24,8 @@
 #define M64K_OFF_IPL          (M64K_OFF_TS_CUR     + 1 * 4)
 #define M64K_OFF_NMI_PENDING  (M64K_OFF_IPL        + 1 * 1)
 #define M64K_OFF_CHECK_INTERRUPTS  (M64K_OFF_NMI_PENDING + 1 * 1)
+#define M64K_OFF_SLICE_BREAK       (M64K_OFF_CHECK_INTERRUPTS + 1 * 1)
+#define M64K_OFF_FORCED_REMAINING  (M64K_OFF_SLICE_BREAK + 1 * 1)
 
 
 #ifndef __ASSEMBLER__
@@ -35,6 +37,8 @@ _Static_assert(offsetof(m64k_t, sr)     == M64K_OFF_SR, "dregs offset is wrong")
 _Static_assert(offsetof(m64k_t, cycles) == M64K_OFF_CYCLES, "cycles offset is wrong");
 _Static_assert(offsetof(m64k_t, ts_start) == M64K_OFF_TS_START, "ts_start offset is wrong");
 _Static_assert(offsetof(m64k_t, check_interrupts) == M64K_OFF_CHECK_INTERRUPTS, "check_interrupts offset is wrong");
+_Static_assert(offsetof(m64k_t, slice_break) == M64K_OFF_SLICE_BREAK, "slice_break offset is wrong");
+_Static_assert(offsetof(m64k_t, forced_remaining) == M64K_OFF_FORCED_REMAINING, "forced_remaining offset is wrong");
 #endif
 
 #endif

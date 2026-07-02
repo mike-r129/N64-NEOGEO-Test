@@ -355,7 +355,24 @@ _m64k_asmrun:
     jal reload_sr
     nop
 
+    # Entry-time IRQ check. The per-instruction check_interrupts poll is gone
+    # from main_loop: mid-slice IRQ/run_stop requests now force the timeslice
+    # to end (see slice_break / forced_remaining in the TLB handler and the
+    # reload_sr clamp), and the pending IRQ lines are re-examined here on the
+    # next entry. This keeps IRQ latency at the same instruction boundary as
+    # the old poll while removing 3 instructions from the dispatch hot path.
+    sb zero, M64K_OFF_SLICE_BREAK(ctx)
+    sb zero, M64K_OFF_CHECK_INTERRUPTS(ctx)
+    lbu t0, M64K_OFF_NMI_PENDING(ctx)
+    li t1, 7
+    bnez t0, entry_raise_irq
+    lbu t0, M64K_OFF_SR+2(ctx)
+    lbu t1, M64K_OFF_IPL(ctx)
+    andi t0, 7
+    bgt t1, t0, entry_raise_irq
+
     sw m_cycles, M64K_OFF_TS_START(ctx)
+    sw m_cycles, M64K_OFF_TS_CUR(ctx)
     #if M64K_CONFIG_TIMING_ACCURACY >= 0
     li rmw_cyctable, 0
     #endif
@@ -386,10 +403,7 @@ _m64k_asmrun:
 
 ALIGN(main_loop):
     blez m_cycles, main_loop_exit
-     sw m_cycles, M64K_OFF_TS_CUR(ctx)
-    lbu t0, M64K_OFF_CHECK_INTERRUPTS(ctx)
-    lhu opcode, 0(m_pc)
-    bnez t0, check_interrupt
+     lhu opcode, 0(m_pc)
     #if M64K_CONFIG_ADDRERR
     sw opcode, M64K_OFF_IR(ctx)
     #endif
@@ -439,20 +453,8 @@ OP(shifts):
     jr t0
     li opsize, 2
 
-check_interrupt:
-    beq t0, 2, main_loop_exit
-    sb zero, M64K_OFF_CHECK_INTERRUPTS(ctx)
-    # Check if a NMI is pending
-    lbu t0, M64K_OFF_NMI_PENDING(ctx)
-    bnez t0, raise_irq
-    li t1, 7
-    # Check if IPL > SR.irq_mask
-    lbu t0, M64K_OFF_SR+2(ctx)
-    lbu t1, M64K_OFF_IPL(ctx)
-    andi t0, 7
-    ble t1, t0, main_loop
-raise_irq:
-    # Raise an IRQ (level in t1)
+entry_raise_irq:
+    # Raise an IRQ (level in t1). Reached only from the entry-time check.
     li t0, M64K_PENDINGEXC_IRQ
     sw_ctx t0, M64K_OFF_PENDINGEXC+0
     j main_loop_exit
@@ -556,10 +558,25 @@ reload_sr_chstack:
     lw_ctx t2, M64K_OFF_USP,t1       # Copy USP/SSP to A7
     sw_ctx t2, M64K_OFF_AREGS+7*4
 
-    li t1, 1
-    sb t1, M64K_OFF_CHECK_INTERRUPTS(ctx)
-
-    jr ra
+    # If the (new) SR leaves a pending IRQ unmasked (or an NMI is pending),
+    # force the timeslice to end: bank the live cycle counter into
+    # forced_remaining and zero it. The current instruction still completes
+    # (so e.g. RTE/STOP finish updating PC/SR first), then main_loop exits
+    # and the re-entry check raises the IRQ at the exact same instruction
+    # boundary the old per-instruction poll would have.
+    lbu t1, M64K_OFF_NMI_PENDING(ctx)
+    lbu t2, M64K_OFF_IPL(ctx)
+    bnez t1, reload_sr_clamp
+    srl t0, 8
+    andi t0, 7
+    ble t2, t0, 1f
+reload_sr_clamp:
+    lw t1, M64K_OFF_FORCED_REMAINING(ctx)
+    addu t1, m_cycles
+    sw t1, M64K_OFF_FORCED_REMAINING(ctx)
+    sw m_cycles, M64K_OFF_TS_CUR(ctx)
+    li m_cycles, 0
+1:  jr ra
     nop
 
 reload_stack:
@@ -3040,3 +3057,9 @@ op_pack: op_rtm: op_trapcc: op_unpk:
     sw_ctx t0, M64K_OFF_PENDINGEXC+0
     addi m_pc, -2                          # 68000 stacks PC of the faulting opcode
     j main_loop_exit
+
+    # End-of-text marker: the TLB handler (hw_n64.S) uses [_m64k_asmrun,
+    # __m64k_asm_end) to recognize faults coming from the interpreter itself
+    # (where saved a1 == live m_cycles) vs nested/outside faults.
+    .globl __m64k_asm_end
+__m64k_asm_end:
