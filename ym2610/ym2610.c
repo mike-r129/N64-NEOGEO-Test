@@ -126,7 +126,7 @@
 
 /* MVS64: -DMVS64_YMPROF (N64) synthesis cost split, filled in
  * YM2610Update_stream, reported+reset by the sound module's [SNDRMS] print.
- * 0=EG 1=FM(chan_calc) 2=SSG 3=ADPCM 4=mix+output. */
+ * 0=sched(LFO+EG timer) 1=FM(EG replay+chan_calc) 2=SSG 3=ADPCM 4=mix+output. */
 #if defined(MVS64_YMPROF) && defined(N64)
 #include <libdragon.h>
 uint32_t ym_prof[5];
@@ -1118,7 +1118,11 @@ INLINE signed int op_calc1(u32 phase, unsigned int env, signed int pm) {
 	}
 }
 
-INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
+/* MVS64: takes the envelope counter by VALUE (not via OPN) so the channel-major
+ * update loop can replay the same eg_cnt sequence per channel with everything
+ * register-resident (an OPN->eg_cnt load per tick would also be reloaded after
+ * every SLOT store because of type-based aliasing). */
+INLINE void advance_eg_channel(u32 eg_cnt, FM_SLOT *SLOT) {
 	unsigned int out;
 	unsigned int swap_flag = 0;
 	unsigned int i;
@@ -1144,7 +1148,7 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 		 * A pending swap_flag forces the full path: the SSG swap must
 		 * still be applied to the channel's remaining slots. */
 		if (!swap_flag
-		    && (OPN->eg_cnt & ((1u << SLOT->eg_shv[SLOT->state]) - 1))) {
+		    && (eg_cnt & ((1u << SLOT->eg_shv[SLOT->state]) - 1))) {
 			SLOT++;
 			i--;
 			continue;
@@ -1152,10 +1156,10 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 
 		switch (SLOT->state) {
 		case EG_ATT: /* attack phase */
-			if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_ar) - 1))) {
+			if (!(eg_cnt & ((1 << SLOT->eg_sh_ar) - 1))) {
 				SLOT->volume += (~SLOT->volume
 						* (eg_inc[SLOT->eg_sel_ar
-								+ ((OPN->eg_cnt >> SLOT->eg_sh_ar) & 7)])) >> 4;
+								+ ((eg_cnt >> SLOT->eg_sh_ar) & 7)])) >> 4;
 				if (SLOT->volume <= MIN_ATT_INDEX) {
 					SLOT->volume = MIN_ATT_INDEX;
 					SLOT->state = EG_DEC;
@@ -1167,17 +1171,17 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 		case EG_DEC: /* decay phase */
 			if (SLOT->ssg & 0x08) /* SSG EG type envelope selected */
 			{
-				if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_d1r) - 1))) {
+				if (!(eg_cnt & ((1 << SLOT->eg_sh_d1r) - 1))) {
 					SLOT->volume += (eg_inc[SLOT->eg_sel_d1r
-							+ ((OPN->eg_cnt >> SLOT->eg_sh_d1r) & 7)] << 2);
+							+ ((eg_cnt >> SLOT->eg_sh_d1r) & 7)] << 2);
 
 					if (SLOT->volume >= SLOT->sl)
 						SLOT->state = EG_SUS;
 				}
 			} else {
-				if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_d1r) - 1))) {
+				if (!(eg_cnt & ((1 << SLOT->eg_sh_d1r) - 1))) {
 					SLOT->volume += eg_inc[SLOT->eg_sel_d1r
-							+ ((OPN->eg_cnt >> SLOT->eg_sh_d1r) & 7)];
+							+ ((eg_cnt >> SLOT->eg_sh_d1r) & 7)];
 
 					if (SLOT->volume >= SLOT->sl)
 						SLOT->state = EG_SUS;
@@ -1188,9 +1192,9 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 		case EG_SUS: /* sustain phase */
 			if (SLOT->ssg & 0x08) /* SSG EG type envelope selected */
 			{
-				if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_d2r) - 1))) {
+				if (!(eg_cnt & ((1 << SLOT->eg_sh_d2r) - 1))) {
 					SLOT->volume += (eg_inc[SLOT->eg_sel_d2r
-							+ ((OPN->eg_cnt >> SLOT->eg_sh_d2r) & 7)] << 2);
+							+ ((eg_cnt >> SLOT->eg_sh_d2r) & 7)] << 2);
 
 					if (SLOT->volume >= MAX_ATT_INDEX) {
 						SLOT->volume = MAX_ATT_INDEX;
@@ -1218,9 +1222,9 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 					}
 				}
 			} else {
-				if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_d2r) - 1))) {
+				if (!(eg_cnt & ((1 << SLOT->eg_sh_d2r) - 1))) {
 					SLOT->volume += eg_inc[SLOT->eg_sel_d2r
-							+ ((OPN->eg_cnt >> SLOT->eg_sh_d2r) & 7)];
+							+ ((eg_cnt >> SLOT->eg_sh_d2r) & 7)];
 
 					if (SLOT->volume >= MAX_ATT_INDEX) {
 						SLOT->volume = MAX_ATT_INDEX;
@@ -1232,9 +1236,9 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 			break;
 
 		case EG_REL: /* release phase */
-			if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_rr) - 1))) {
+			if (!(eg_cnt & ((1 << SLOT->eg_sh_rr) - 1))) {
 				SLOT->volume += eg_inc[SLOT->eg_sel_rr
-						+ ((OPN->eg_cnt >> SLOT->eg_sh_rr) & 7)];
+						+ ((eg_cnt >> SLOT->eg_sh_rr) & 7)];
 
 				if (SLOT->volume >= MAX_ATT_INDEX) {
 					SLOT->volume = MAX_ATT_INDEX;
@@ -1264,10 +1268,13 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 
 #define volume_calc(OP) ((OP)->vol_out + (AM & (OP)->AMmask))
 
-INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH) {
+/* MVS64: the LFO position comes in by VALUE (precomputed per sample by the
+ * channel-major update loop) instead of via the LFO_AM/LFO_PM globals — the
+ * globals would be reloaded after every *CH->connect store (aliasing). */
+INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH, u32 lfo_am, u32 lfo_pm) {
 	unsigned int eg_out;
 
-	u32 AM = LFO_AM >> CH->ams;
+	u32 AM = lfo_am >> CH->ams;
 
 	m2 = c1 = c2 = mem = 0;
 
@@ -1324,11 +1331,11 @@ INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH) {
 		 * LFO_PM only steps every few dozen samples and notes change far
 		 * slower, so cache the delta stack instead of redoing the
 		 * table+multiply work every sample. Values are bit-identical. */
-		u32 pm_key = (LFO_PM << 17) | block_fnum;
+		u32 pm_key = (lfo_pm << 17) | block_fnum;
 		if (pm_key != CH->pm_key) {
 			u32 fnum_lfo = ((block_fnum & 0x7f0) >> 4) * 32 * 8;
 			s32 lfo_fn_table_index_offset =
-					lfo_pm_table[fnum_lfo + CH->pms + LFO_PM];
+					lfo_pm_table[fnum_lfo + CH->pms + lfo_pm];
 
 			CH->pm_key = pm_key;
 			if (lfo_fn_table_index_offset) /* LFO phase modulation active */
@@ -2206,7 +2213,13 @@ static void OPNB_ADPCMA_init_table(void) {
 
 }
 
-/* ADPCM A (Non control type) : calculate one channel output */INLINE void OPNB_ADPCMA_calc_chan(
+/* ADPCM A (Non control type) : calculate one channel output.
+ * MVS64: RETURNS the sample contribution instead of accumulating it into the
+ * *ch->pan bucket, so the channel-major update loop can route it into its
+ * per-sample stereo accumulators (the pan pointer still identifies the bucket).
+ * The end-of-sample path returns 0 — exactly the old early return that skipped
+ * the *ch->pan += add. */
+INLINE s32 OPNB_ADPCMA_calc_chan(
 		ADPCMA *ch) {
 	u32 step;
 	u8 data;
@@ -2226,7 +2239,7 @@ static void OPNB_ADPCMA_init_table(void) {
 					== ((ch->end << 1) & ((1 << 21) - 1))) {
 				ch->flag = 0;
 				YM2610.adpcm_arrivedEndAddress |= ch->flagMask;
-				return;
+				return 0;
 			}
 
 			if (ch->now_addr & 1)
@@ -2262,8 +2275,8 @@ static void OPNB_ADPCMA_init_table(void) {
 				>> ch->vol_shift) & ~3; /* multiply, shift and mask out 2 LSB bits */
 	}
 
-	/* output for work of output channels (out_adpcma[OPNxxxx]) */
-	*ch->pan += ch->adpcma_out;
+	/* output for work of output channels */
+	return ch->adpcma_out;
 }
 
 /* ADPCM type A Write */
@@ -2586,7 +2599,10 @@ static void OPNB_ADPCMB_write(ADPCMB *adpcmb, int r, int v) {
 	}
 }
 
-INLINE void OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
+/* MVS64: like OPNB_ADPCMA_calc_chan, RETURNS the sample contribution instead
+ * of accumulating into *adpcmb->pan; the EOS path returns 0 (the old early
+ * return that skipped the add). */
+INLINE s32 OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
 	u32 step;
 	int data;
 
@@ -2618,7 +2634,7 @@ INLINE void OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
 					adpcmb->portstate = 0;
 					adpcmb->adpcml = 0;
 					adpcmb->prev_acc = 0;
-					return;
+					return 0;
 				}
 			}
 			if (adpcmb->now_addr & 1) {
@@ -2668,8 +2684,8 @@ INLINE void OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
 	adpcmb->adpcml = ((adpcmb->acc * (int)adpcmb->now_step) >> ADPCM_SHIFT)* (int)adpcmb->volume;;
 #endif
 
-	/* output for work of output channels (outd[OPNxxxx])*/
-	*adpcmb->pan += adpcmb->adpcml;
+	/* output for work of output channels */
+	return adpcmb->adpcml;
 }
 
 /*********************************************************************************************/
@@ -2970,6 +2986,10 @@ s16 mixing_buffer[2][16384];
 extern Uint16 play_buffer[16384];
 //static Uint32 buf_pos;
 
+/* MVS64: samples per channel-major batch. 64 keeps the per-chunk scratch
+ * (~1KB) plus one channel's state inside the VR4300's 8KB dcache. */
+#define YM_CHUNK 64
+
 /* Generate samples for one of the YM2610s */
 void YM2610Update_stream(int length) {
 	FM_OPN *OPN = &YM2610.OPN;
@@ -3006,8 +3026,9 @@ void YM2610Update_stream(int length) {
 	/* calc SSG count */
 	outn = SSG_calc_count(length);
 
-/* MVS64: -DMVS64_YMPROF (N64) — per-section TICKS split of the synthesis loop,
- * read+reset by the [SNDRMS] telemetry. 0=EG 1=FM 2=SSG 3=ADPCM 4=mix+copy. */
+/* MVS64: -DMVS64_YMPROF (N64) — per-pass TICKS split of the synthesis loop,
+ * read+reset by the [SNDRMS] telemetry. 0=sched(LFO+EG timer) 1=FM(EG replay
+ * + chan_calc) 2=SSG 3=ADPCM 4=mix+copy. */
 #if defined(MVS64_YMPROF) && defined(N64)
 #define YMPROF_T(x)   uint32_t _yp##x = TICKS_READ()
 #define YMPROF_A(n,x) (ym_prof[n] += TICKS_DISTANCE(_yp##x, TICKS_READ()))
@@ -3016,102 +3037,138 @@ void YM2610Update_stream(int length) {
 #define YMPROF_A(n,x) ((void)0)
 #endif
 
-	/* buffering */
-	for (i = 0; i < length; i++) {
+	/* MVS64: channel-major "batch" synthesis. The classic loop was sample-major
+	 * (per sample: EG for all channels, chan_calc for all channels, SSG, ADPCM,
+	 * mix), which reloads every channel's state from memory once per sample.
+	 * Instead: precompute the per-sample shared schedules (LFO position, EG
+	 * tick count) for a small chunk, run each FM/ADPCM channel over the whole
+	 * chunk with its state register/cache-resident, and mix last. Bit-exact
+	 * because channels never read each other's per-sample outputs, the shared
+	 * LFO/EG sequences are replayed identically per channel, and the final mix
+	 * is the same integer sum of the same terms (addition order irrelevant).
+	 * Register writes (key-on, pan, ...) only happen BETWEEN update calls, so
+	 * nothing can change channel routing or retrigger a channel mid-chunk.
+	 * External timer mode is required: the old loop's INTERNAL_TIMER_A/B were
+	 * empty macros here (no per-sample CSM key-on can occur). */
+#if FM_INTERNAL_TIMER
+#error "channel-major YM2610Update_stream requires FM_INTERNAL_TIMER == 0"
+#endif
+	{
+		/* deltaT pan bucket -> stereo routing, constant within the call */
+		ADPCMB * const dt = &YM2610.adpcmb;
+		const int dti = (int)(dt->pan - out_delta);
+		const int dtl = (dti == OUTD_LEFT || dti == OUTD_CENTER);
+		const int dtr = (dti == OUTD_RIGHT || dti == OUTD_CENTER);
+		/* out_fm index of the four active OPNB FM channels */
+		static const u8 fmn[4] = { 1, 2, 4, 5 };
 
-		advance_lfo(OPN);
+		while (length > 0) {
+			const int n = length < YM_CHUNK ? length : YM_CHUNK;
+			u8 lfo_am[YM_CHUNK], lfo_pm[YM_CHUNK], egt[YM_CHUNK];
+			s32 acc_l[YM_CHUNK], acc_r[YM_CHUNK], dtb[YM_CHUNK];
+			const u32 eg_base = OPN->eg_cnt;
 
-		/* clear output acc. */
-		out_adpcma[OUTD_LEFT] = out_adpcma[OUTD_RIGHT] =
-				out_adpcma[OUTD_CENTER] = 0;
-		out_delta[OUTD_LEFT] = out_delta[OUTD_RIGHT] = out_delta[OUTD_CENTER] =
-				0;
+			/* pass 0: per-sample shared schedules (LFO position, EG ticks) */
+			YMPROF_T(a);
+			for (i = 0; i < n; i++) {
+				u32 t = 0;
+				advance_lfo(OPN);
+				lfo_am[i] = (u8) LFO_AM;
+				lfo_pm[i] = (u8) LFO_PM;
+				OPN->eg_timer += OPN->eg_timer_add;
+				while (OPN->eg_timer >= OPN->eg_timer_overflow) {
+					OPN->eg_timer -= OPN->eg_timer_overflow;
+					t++;
+				}
+				egt[i] = (u8) t;   /* <= 3 even at 8kHz output */
+				OPN->eg_cnt += t;
+				acc_l[i] = 0;
+				acc_r[i] = 0;
+			}
+			YMPROF_A(0, a);
 
-		/* clear outputs */
-		out_fm[1] = 0;
-		out_fm[2] = 0;
-		out_fm[4] = 0;
-		out_fm[5] = 0;
+			/* pass 1: FM — each channel replays the same EG tick schedule
+			 * with a private counter, then synthesizes its sample */
+			YMPROF_T(b);
+			for (j = 0; j < 4; j++) {
+				FM_CH * const CH = cch[j];
+				s32 * const fmo = &out_fm[fmn[j]];
+				const u32 panl = OPN->pan[fmn[j] * 2 + 0];
+				const u32 panr = OPN->pan[fmn[j] * 2 + 1];
+				u32 cnt = eg_base;
+				for (i = 0; i < n; i++) {
+					u32 t = egt[i];
+					s32 o;
+					while (t--) {
+						cnt++;
+						advance_eg_channel(cnt, &CH->SLOT[SLOT1]);
+					}
+					*fmo = 0;
+					chan_calc(OPN, CH, lfo_am[i], lfo_pm[i]);
+					o = *fmo >> 1; /* the shift right was verified on real chip */
+					acc_l[i] += o & (s32) panl;
+					acc_r[i] += o & (s32) panr;
+				}
+			}
+			YMPROF_A(1, b);
 
-		/* clear outputs SSG */
-		out_ssg = 0;
+			/* pass 2: SSG */
+			YMPROF_T(c);
+			for (i = 0; i < n; i++) {
+				outn = SSG_CALC(outn);
+				acc_l[i] += out_ssg;
+				acc_r[i] += out_ssg;
+			}
+			YMPROF_A(2, c);
 
-		/* advance envelope generator */
-		YMPROF_T(a);
-		OPN->eg_timer += OPN->eg_timer_add;
-		while (OPN->eg_timer >= OPN->eg_timer_overflow) {
-			OPN->eg_timer -= OPN->eg_timer_overflow;
-			OPN->eg_cnt++;
-			//printf("%d\n",OPN->eg_cnt);
-			advance_eg_channel(OPN, &cch[0]->SLOT[SLOT1]);
-			advance_eg_channel(OPN, &cch[1]->SLOT[SLOT1]);
-			advance_eg_channel(OPN, &cch[2]->SLOT[SLOT1]);
-			advance_eg_channel(OPN, &cch[3]->SLOT[SLOT1]);
+			/* pass 3: deltaT ADPCM + ADPCM-A (flag/portstate can only go
+			 * OFF mid-chunk — end of sample — never ON, so the per-sample
+			 * guards match the old loop exactly) */
+			YMPROF_T(d);
+			for (i = 0; i < n; i++)
+				dtb[i] = (dt->portstate & 0x80) ? OPNB_ADPCMB_CALC(dt) : 0;
+			for (j = 0; j < 6; j++) {
+				ADPCMA * const ch = &YM2610.adpcma[j];
+				if (!ch->flag)
+					continue;
+				{
+					const int pi = (int)(ch->pan - out_adpcma);
+					const int al = (pi == OUTD_LEFT || pi == OUTD_CENTER);
+					const int ar = (pi == OUTD_RIGHT || pi == OUTD_CENTER);
+					for (i = 0; i < n && ch->flag; i++) {
+						const s32 o = OPNB_ADPCMA_calc_chan(ch);
+						if (al)
+							acc_l[i] += o;
+						if (ar)
+							acc_r[i] += o;
+					}
+				}
+			}
+			YMPROF_A(3, d);
+
+			/* pass 4: mix + output */
+			YMPROF_T(e);
+			for (i = 0; i < n; i++) {
+				lt = acc_l[i];
+				rt = acc_r[i];
+				if (dtl)
+					lt += dtb[i] >> 9;
+				if (dtr)
+					rt += dtb[i] >> 9;
+
+				lt <<= 1;
+				rt <<= 1;
+
+				Limit(lt, MAXOUT, MINOUT);
+				Limit(rt, MAXOUT, MINOUT);
+				*pl++ = lt;
+				*pl++ = rt;
+			}
+			YMPROF_A(4, e);
+
+			length -= n;
 		}
-		YMPROF_A(0, a);
-
-		/* calculate FM */
-		YMPROF_T(b);
-		chan_calc(OPN, cch[0]); /*remapped to 1*/
-		chan_calc(OPN, cch[1]); /*remapped to 2*/
-		chan_calc(OPN, cch[2]); /*remapped to 4*/
-		chan_calc(OPN, cch[3]); /*remapped to 5*/
-		YMPROF_A(1, b);
-
-		/* calculate SSG */
-		YMPROF_T(c);
-		outn = SSG_CALC(outn);
-		YMPROF_A(2, c);
-		/* deltaT ADPCM */
-		YMPROF_T(d);
-		if (YM2610.adpcmb.portstate & 0x80)
-			OPNB_ADPCMB_CALC(&YM2610.adpcmb);
-
-		for (j = 0; j < 6; j++) {
-			/* ADPCM */
-			if (YM2610.adpcma[j].flag)
-				OPNB_ADPCMA_calc_chan(&YM2610.adpcma[j]);
-		}
-		YMPROF_A(3, d);
-		/* buffering */
-		YMPROF_T(e);
-		lt = out_adpcma[OUTD_LEFT] + out_adpcma[OUTD_CENTER];
-		rt = out_adpcma[OUTD_RIGHT] + out_adpcma[OUTD_CENTER];
-
-		lt += (out_delta[OUTD_LEFT] + out_delta[OUTD_CENTER]) >> 9;
-		rt += (out_delta[OUTD_RIGHT] + out_delta[OUTD_CENTER]) >> 9;
-
-		lt += out_ssg;
-		rt += out_ssg;
-
-		lt += ((out_fm[1] >> 1) & OPN->pan[2]); /* the shift right was verified on real chip */
-		rt += ((out_fm[1] >> 1) & OPN->pan[3]);
-		lt += ((out_fm[2] >> 1) & OPN->pan[4]);
-		rt += ((out_fm[2] >> 1) & OPN->pan[5]);
-
-		lt += ((out_fm[4] >> 1) & OPN->pan[8]);
-		rt += ((out_fm[4] >> 1) & OPN->pan[9]);
-		lt += ((out_fm[5] >> 1) & OPN->pan[10]);
-		rt += ((out_fm[5] >> 1) & OPN->pan[11]);
-
-		lt <<= 1;
-		rt <<= 1;
-
-		Limit(lt, MAXOUT, MINOUT);
-		Limit(rt, MAXOUT, MINOUT);
-		/*
-		 mixing_buffer[0][i] = lt;
-		 mixing_buffer[1][i] = rt;
-		 */
-		*pl++ = lt;
-		*pl++ = rt;
-		YMPROF_A(4, e);
-
-		//my_timer();
-
-		INTERNAL_TIMER_A( OPN->ST , cch[1] );
-	} INTERNAL_TIMER_B(OPN->ST,length);
-
+	}
 }
 #undef YMPROF_T
 #undef YMPROF_A
