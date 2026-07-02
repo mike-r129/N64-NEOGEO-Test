@@ -37,11 +37,9 @@ obj_makerom = $(src_makerom:%.c=$(BUILD_DIR)/%.o)
 CFLAGS += -Wno-unused-function
 CFLAGS += $(EXTRA_DEFINES)
 
-# Real-time audio synthesis (YM2610+Z80) is the dominant CPU cost in-match;
-# compile those translation units -O3 (later -O wins over n64.mk's -O2).
-$(BUILD_DIR)/ym2610/ym2610.o: CFLAGS += -O3
-$(BUILD_DIR)/z80.o: CFLAGS += -O3
-$(BUILD_DIR)/sound_neogeo.o: CFLAGS += -O3
+# NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
+# REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll
+# bloat thrashes the VR4300's 16KB icache in the synthesis loop. Keep -O2.
 # Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
 # (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
 ASFLAGS += $(EXTRA_DEFINES)
