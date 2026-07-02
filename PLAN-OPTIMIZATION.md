@@ -31,9 +31,18 @@ Measured (ares, 300s AUTOINPUT protocol, in-match window = the real fight):
 17eb0d3 baseline 8.45fps → 4b8e417 **~14.9fps in-match (snd 261%, m68k ~110%, draw 33%,
 io 9.5%), menus ~27-30fps**. Guest frames/300s: 3784→4949.
 
+**2026-07-02 (daytime): lever (2) LANDED.** c1cb136 rewrote YM2610Update_stream channel-major
+(64-sample chunks, per-channel register-resident state, precomputed LFO/EG schedules) and
+7af2216 added a silent-FM-channel fast path (keyed-off channels batch-advance phases only).
+Both byte-identical-WAV gated. Measured (same 300s protocol, same analysis): **in-match
+median 15.0 → 17.5 fps; snd 255% → 143%; m68k ~100%; guest frames 4949 → 5256.** Within the
+remaining snd, synthesis still outweighs Z80 stepping ~3.5:1 (ymms≈600-1170 vs z80ms≈280-370
+per SNDRMS interval) — the residue is ADPCM decode + genuinely active channels, i.e. work
+only the RSP offload can remove.
+
 Next levers, in expected-value order: (1) **RSP YM2610/ADPCM offload** — the only step-change
-available for snd (weeks); (2) batch-per-channel synthesis rewrite (register-resident state,
-maybe 1.3-1.8x on FM+EG, WAV-gateable); (3) io read fast-path (input ports/VRAM read, ~3-5%);
+available for snd (weeks); (2) ~~batch-per-channel synthesis rewrite~~ DONE (above);
+(3) io read fast-path (input ports/VRAM read, ~3-5%);
 (4) m64k rank 4/14 (MOVE/Bcc dominate: 19.8%/14.1% of productive cycles); (5) draw (33%).
 The 2026-06-19 roadmap below is retained for history but its cpu-centric ranking is obsolete.
 
