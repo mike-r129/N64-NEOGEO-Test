@@ -214,15 +214,12 @@ void plat_audio_pump(void) {
         discarded++;
     }
 
-    // ANTI-REPLAY: when the AI DMA queue runs dry, the hardware REPLAYS its
-    // last buffer forever — the "stuck high-pitch tone" heard at boot and in
-    // character select. While overloaded we deliver few/no generated buffers
-    // (the governor above), so top up EVERY remaining free AI buffer with pure
-    // silence: no sound generation, no debt consumed, just packed zero stores
-    // (~µs). Generated audio in this state is zeros anyway (sound_silent), so
-    // the stream stays seamless; once the overload ends, real audio resumes
-    // behind at most one queue's worth (~160ms) of clean silence.
-    int silfill = 0;
+    // ANTI-REPLAY, part 2 (post-flood): after generating, top up any remaining
+    // free AI buffer with pure silence so the queue leaves this pass FULL — the
+    // hardware must never run dry and replay a stale buffer (the "stuck
+    // high-pitch tone"). Generated audio in this state is zeros anyway
+    // (sound_silent), so the stream stays seamless; once the overload ends,
+    // real audio resumes behind at most ~160ms of clean silence.
     if (underrun_streak >= 1) {
         while (audio_can_write()) {
             uint32_t *out = (uint32_t *)audio_write_begin();
