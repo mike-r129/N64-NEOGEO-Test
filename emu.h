@@ -10,9 +10,36 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// 68k core selection (defined via the Makefile CFLAGS so it is visible in all
+// TUs incl. the Musashi headers): USE_M64K -> fast MIPS-asm m64k interpreter
+// (N64 default). When unset on N64 (MUSASHI=1 build), the portable Musashi core
+// is used instead (proven on the PC build; slower) as a fallback while m64k
+// opcode bugs are investigated. USE_M64K gates only the 68k-core integration;
+// the libdragon platform stays under N64.
+
 #define MVS_CLOCK         24000000
 #define M68K_CLOCK_DIV    2
 #define FPS        		  60
+
+// Audio output sample rate (Hz). The AI plays at this rate and the YM2610 is
+// generated for it (sound_neogeo.c keys cyc_budget off this), so the two MUST
+// match — define it in one place. On N64, generating YM2610 FM is slower than
+// real time at 44.1kHz (the gngeo core is ~0.7x realtime here), so a lower rate
+// trades audio bandwidth for the CPU headroom needed to sustain real-time,
+// glitch-free playback alongside the 68k. Override via EXTRA_DEFINES=-DMVS64_AUDIO_RATE=N.
+#ifndef MVS64_AUDIO_RATE
+#ifdef N64
+// Real-time YM2610 FM synthesis is the dominant audio cost on N64 and scales
+// with the sample rate, so the N64 build defaults to a lower rate to keep the
+// framerate up. Measured (samsho2, ares, with the Z80 idle-skip): 44100~5fps,
+// 22050~6.5fps, 11025~13fps steady. 11025 keeps NeoGeo FM music clearly
+// recognizable while preserving playable speed. Override per-build with
+// EXTRA_DEFINES=-DMVS64_AUDIO_RATE=N.
+#define MVS64_AUDIO_RATE  11025
+#else
+#define MVS64_AUDIO_RATE  44100
+#endif
+#endif
 #define FRAME_CLOCK       (MVS_CLOCK / FPS)
 #define LINE_CLOCK        (FRAME_CLOCK / 264)
 #define WATCHDOG_PERIOD   3244030

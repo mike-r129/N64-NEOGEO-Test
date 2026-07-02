@@ -14,16 +14,28 @@
 
 #include "mvs.h"
 
-/* MVS64: busy-flag time source. The original called gngeo's timer.c; we supply
- * a Z80-cycle-based "seconds" clock from the sound module instead. */
-double ym2610_time_now(void);
-#define FM_GET_TIME_NOW() ym2610_time_now()
+/* MVS64: busy-flag/timer time source — INTEGER Z80 cycles (4 MHz), supplied by
+ * the sound module. The core must be FPU-FREE at runtime: on N64, YM register
+ * writes execute inside the TLB/MMIO exception handler, where the FPU is
+ * disabled (SR.CU1 clear) and no FP context is saved — any float/double math
+ * there faults into a wild jump. All double math happens at init time only. */
+u32 ym2610_time_now_cyc(void);
+#define FM_GET_TIME_NOW_CYC() ym2610_time_now_cyc()
+#define FM_TIMEBASE_CYC_PER_SEC 4000000 /* Z80 clock: the cycle domain above */
+
+/* MVS64: streamed ADPCM sample fetch, implemented by the sound module. Used
+ * when the ADPCM sample ROM is not resident (pcmbuf NULL but pcmsize > 0): the
+ * 7MB NeoGeo v.rom cannot live in RDRAM, so bytes come from small per-voice
+ * window caches backed by cart streaming. win 0-5 = ADPCM-A ch, 6 = ADPCM-B. */
+u8 ym2610_vrom_fetch(int win, u32 addr);
 
 typedef s16 FMSAMPLE;
 typedef s32 FMSAMPLE_MIX;
 #define TIMER_SH		16  /* 16.16 fixed point (timers calculations)    */
 
-typedef void (*FM_TIMERHANDLER)(int channel, int count, double stepTime);
+/* MVS64: was (channel, count, double stepTime); now passes the period as
+ * integer Z80 cycles directly (0 = stop timer), so no FP crosses the boundary. */
+typedef void (*FM_TIMERHANDLER)(int channel, u32 cycles);
 typedef void (*FM_IRQHANDLER)(int irq);
 
 void YM2610Init(int baseclock, int rate,

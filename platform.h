@@ -91,6 +91,12 @@ extern int g_screen_pitch;
 void plat_init(int audiofreq, int fps);
 int plat_poll(void);
 
+// Telemetry logger. Always writes to the debug channels (USB + emulator
+// ISViewer, same as debugf). Additionally, on N64 SND_HEALTH builds, writes to a
+// durable log on the flashcart SD card (sd:/mvs64log.txt) so the user can read it
+// on a PC after reproducing on real hardware — no USB cable / host tool needed.
+void plat_log(const char *fmt, ...);
+
 void plat_enable_audio(int enable);
 void plat_enable_video(int enable);
 
@@ -101,5 +107,10 @@ void plat_endframe(void);
 
 void plat_beginaudio(int16_t **buf, int *nsamples);
 void plat_endaudio(void);
+
+// N64 only: generate audio on demand to fill every free libdragon AI buffer.
+// The AI DMA is the real-time clock master; this decouples sound from the 68k
+// frame rate. Called once per main-loop pass (see emu.c / platform_n64.c).
+void plat_audio_pump(void);
 
 #endif

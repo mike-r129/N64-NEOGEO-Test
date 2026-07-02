@@ -151,8 +151,9 @@ static void wav_close(void) {
 	fclose(wav_fp); wav_fp = NULL;
 }
 
-#define AUDIO_FREQ 44100
-static int16_t audio_frame[(AUDIO_FREQ / FPS + 16) * 2];
+#define AUDIO_FREQ MVS64_AUDIO_RATE
+// Sized for MVS64_SIMFPS as low as 5fps (AUDIO_FREQ/5 samples/frame); see emu loop.
+static int16_t audio_frame[(AUDIO_FREQ / 5 + 16) * 2];
 #endif
 #ifdef USE_M64K
 m64k_t m64k;
@@ -349,7 +350,7 @@ int main(int argc, char *argv[]) {
 	argc = 0; argv = NULL;
 	#endif
 
-	plat_init(44100, FPS);
+	plat_init(MVS64_AUDIO_RATE, FPS);
 
 	#ifndef N64
 	// Headless test harness: when MVS64_FRAMES=N is set, run N frames with no
@@ -360,7 +361,17 @@ int main(int argc, char *argv[]) {
 	int headless = hl_env ? atoi(hl_env) : 0;
 	const char *shot_env = getenv("MVS64_SHOT");
 	int shot_interval = shot_env ? atoi(shot_env) : 0;
-	const int spf = AUDIO_FREQ / FPS;       // stereo frames produced per video frame
+	const char *sndchunk_env = getenv("MVS64_SNDCHUNK");
+	int sndchunk = sndchunk_env ? atoi(sndchunk_env) : 0;
+	// MVS64_SIMFPS=N reproduces the N64's REALTIME audio decoupling on the PC
+	// headless harness: the N64 AI drains at the wall-clock rate, so when the 68k
+	// loop runs at N fps it generates AUDIO_FREQ/N samples per LOGIC frame (more
+	// than the 1/60s the game logic assumes), desyncing 68k-driven sound events
+	// from the music. Setting this < 60 mimics a slow N64 so we can repro the
+	// in-combat stuck note without hardware. 0/unset = faithful 60fps lock.
+	const char *simfps_env = getenv("MVS64_SIMFPS");
+	int simfps = simfps_env ? atoi(simfps_env) : 0;
+	const int spf = AUDIO_FREQ / (simfps > 0 ? simfps : FPS); // samples per video frame
 	if (headless) {
 		keystate = hl_keys;                 // drive input from our scripted buffer
 		const char *script = getenv("MVS64_INPUT");
@@ -424,7 +435,22 @@ int main(int argc, char *argv[]) {
 		#ifndef N64
 		// Produce one video-frame's worth of audio through the sound seam.
 		if (headless) {
-			int n = sound_gen_samples(audio_frame, spf);
+			int n;
+			if (sndchunk > 0) {
+				// Validation: produce spf samples in arbitrary sub-chunks to
+				// exercise the rate-agnostic sound_gen_samples() path the N64
+				// AI pump uses (it asks for ~1764 at a time). Concatenation must
+				// be identical music to a single spf call (proves Rank 1 math).
+				int off = 0;
+				while (off < spf) {
+					int c = spf - off; if (c > sndchunk) c = sndchunk;
+					sound_gen_samples(audio_frame + off * 2, c);
+					off += c;
+				}
+				n = spf;
+			} else {
+				n = sound_gen_samples(audio_frame, spf);
+			}
 			wav_write(audio_frame, n);
 		} else {
 			int16_t *abuf; int an;
@@ -435,13 +461,11 @@ int main(int argc, char *argv[]) {
 		#endif
 
 		#ifdef N64
-		// Produce + push one video-frame of audio to the AI.
-		{
-			int16_t *abuf; int an;
-			plat_beginaudio(&abuf, &an);
-			sound_gen_samples(abuf, an);
-			plat_endaudio();
-		}
+		// Drive the AI directly: fill every free AI buffer on demand so audio
+		// plays at the true 44100 Hz wall-clock rate, decoupled from the (slow)
+		// 68k frame loop. sound_gen_samples() is rate-agnostic; the AI DMA is the
+		// real-time clock master. See plat_audio_pump() in platform_n64.c.
+		plat_audio_pump();
 		#endif
 
 		#ifndef N64

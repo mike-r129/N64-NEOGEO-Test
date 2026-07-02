@@ -1,6 +1,17 @@
 #include <SDL.h>
 #include <assert.h>
 #include <time.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+// Telemetry logger (see platform.h). On PC there is no flashcart SD; just write
+// to stderr, matching debugf.
+void plat_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 #define HW_AUDIO_NUMBUFFERS 3
 

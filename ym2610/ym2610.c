@@ -124,6 +124,14 @@
 #define PI 3.14159265358979323846
 #endif
 
+/* MVS64: -DMVS64_YMPROF (N64) synthesis cost split, filled in
+ * YM2610Update_stream, reported+reset by the sound module's [SNDRMS] print.
+ * 0=EG 1=FM(chan_calc) 2=SSG 3=ADPCM 4=mix+output. */
+#if defined(MVS64_YMPROF) && defined(N64)
+#include <libdragon.h>
+uint32_t ym_prof[5];
+#endif
+
 /* select timer system internal or external */
 #define FM_INTERNAL_TIMER 0
 
@@ -520,8 +528,11 @@ typedef struct {
 	int rate; /* sampling rate (Hz)   */
 	double freqbase; /* frequency base       */
 	double TimerBase; /* Timer base time      */
+	/* MVS64: integer runtime equivalents (computed at init in OPNSetPres) so no
+	 * FP executes on register writes (N64: those run in exception context). */
+	u32 TimerBase_cyc8; /* Z80 cycles per timer count, 24.8 fixed point */
 #if FM_BUSY_FLAG_SUPPORT
-	double BusyExpire; /* ExpireTime of Busy clear */
+	u32 BusyExpire; /* MVS64: busy-clear deadline in Z80 cycles (0 = not busy) */
 #endif
 	u8 address; /* address register     */
 	u8 irq; /* interrupt level      */
@@ -611,7 +622,7 @@ typedef struct {
 /* ADPCM type B struct */
 typedef struct adpcmb_state {
 	s32 *pan; /* pan : &output_pointer[pan]   */
-	double freqbase;
+	u32 freqbase16; /* MVS64: 16.16 fixed (was double; delta writes are runtime) */
 	int output_range;
 	u32 now_addr; /* current address      */
 	u32 now_step; /* currect step         */
@@ -734,14 +745,14 @@ static s32 LFO_PM; /* runtime LFO calculations helper */
 			ST->TBC = (256 - ST->TB) << 4;
 			/* External timer handler */
 #if FM_INTERNAL_TIMER==0
-			(ST->Timer_Handler)(1, ST->TBC, ST->TimerBase);
+			(ST->Timer_Handler)(1, ((u32)ST->TBC * ST->TimerBase_cyc8) >> 8);
 #endif
 		}
 	} else { /* stop timer b */
 		if (ST->TBC != 0) {
 			ST->TBC = 0;
 #if FM_INTERNAL_TIMER==0
-			(ST->Timer_Handler)(1, 0, ST->TimerBase);
+			(ST->Timer_Handler)(1, 0);
 #endif
 		}
 	}
@@ -751,14 +762,14 @@ static s32 LFO_PM; /* runtime LFO calculations helper */
 			ST->TAC = (1024 - ST->TA);
 			/* External timer handler */
 #if FM_INTERNAL_TIMER==0
-			(ST->Timer_Handler)(0, ST->TAC, ST->TimerBase);
+			(ST->Timer_Handler)(0, ((u32)ST->TAC * ST->TimerBase_cyc8) >> 8);
 #endif
 		}
 	} else { /* stop timer a */
 		if (ST->TAC != 0) {
 			ST->TAC = 0;
 #if FM_INTERNAL_TIMER==0
-			(ST->Timer_Handler)(0, 0, ST->TimerBase);
+			(ST->Timer_Handler)(0, 0);
 #endif
 		}
 	}
@@ -771,7 +782,7 @@ static s32 LFO_PM; /* runtime LFO calculations helper */
 	/* clear or reload the counter */
 	ST->TAC = (1024 - ST->TA);
 #if FM_INTERNAL_TIMER==0
-	(ST->Timer_Handler)(0, ST->TAC, ST->TimerBase);
+	(ST->Timer_Handler)(0, ((u32)ST->TAC * ST->TimerBase_cyc8) >> 8);
 #endif
 }
 /* Timer B Overflow */INLINE void TimerBOver(FM_ST *ST) {
@@ -781,7 +792,7 @@ static s32 LFO_PM; /* runtime LFO calculations helper */
 	/* clear or reload the counter */
 	ST->TBC = (256 - ST->TB) << 4;
 #if FM_INTERNAL_TIMER==0
-	(ST->Timer_Handler)(1, ST->TBC, ST->TimerBase);
+	(ST->Timer_Handler)(1, ((u32)ST->TBC * ST->TimerBase_cyc8) >> 8);
 #endif
 }
 
@@ -816,9 +827,12 @@ static s32 LFO_PM; /* runtime LFO calculations helper */
 #endif /* FM_INTERNAL_TIMER */
 
 #if FM_BUSY_FLAG_SUPPORT
+/* MVS64: busy tracked in integer Z80 cycles (wrap-safe compare), not double
+ * seconds — this runs on every YM status read/register write, including from
+ * the N64 exception handler where FP is forbidden. */
 INLINE u8 FM_STATUS_FLAG(FM_ST *ST) {
 	if (ST->BusyExpire) {
-		if ((ST->BusyExpire - FM_GET_TIME_NOW()) > 0)
+		if ((s32)(ST->BusyExpire - FM_GET_TIME_NOW_CYC()) > 0)
 			return ST->status | 0x80; /* with busy */
 		/* expire */
 		ST->BusyExpire = 0;
@@ -826,7 +840,8 @@ INLINE u8 FM_STATUS_FLAG(FM_ST *ST) {
 	return ST->status;
 }
 INLINE void FM_BUSY_SET(FM_ST *ST, int busyclock) {
-	ST->BusyExpire = FM_GET_TIME_NOW() + (ST->TimerBase * busyclock);
+	u32 t = FM_GET_TIME_NOW_CYC() + (((u32)busyclock * ST->TimerBase_cyc8) >> 8);
+	ST->BusyExpire = t ? t : 1; /* 0 means "not busy" */
 }
 #define FM_BUSY_CLEAR(ST) ((ST)->BusyExpire = 0)
 #else
@@ -948,6 +963,17 @@ static void setup_connection(FM_CH *CH, int ch) {
 
 /* set total level */INLINE void set_tl(FM_CH *CH, FM_SLOT *SLOT, int v) {
 	SLOT->tl = (v & 0x7f) << (ENV_BITS - 7); /* 7bit TL */
+	/* MVS64: keep vol_out coherent immediately. advance_eg_channel skips slots
+	 * parked in EG_OFF (speedup), so the per-EG-step recompute cannot be relied
+	 * on to pick up a TL change for those slots. (This also applies TL at most
+	 * one EG step earlier than before for active slots — the real chip applies
+	 * TL immediately too.) */
+	{
+		unsigned int out = SLOT->tl + (u32) SLOT->volume;
+		if ((SLOT->ssg & 0x08) && (SLOT->ssgn & 2))
+			out ^= ((1 << ENV_BITS) - 1);
+		SLOT->vol_out = out;
+	}
 }
 
 /* set attack rate & key scale  */INLINE void set_ar_ksr(FM_CH *CH,
@@ -1068,6 +1094,17 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 
 	i = 4; /* four operators per channel */
 	do {
+		/* MVS64 speedup: a slot parked in EG_OFF has constant volume, so its
+		 * vol_out cannot change here (TL writes recompute it in set_tl; a
+		 * pending SSG-EG swap_flag forces the full path so the ssgn xor quirk
+		 * below behaves exactly as before). On samsho2's sparse FM usage this
+		 * skips most of the EG work. */
+		if (SLOT->state == EG_OFF && !swap_flag) {
+			SLOT++;
+			i--;
+			continue;
+		}
+
 		switch (SLOT->state) {
 		case EG_ATT: /* attack phase */
 			if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_ar) - 1))) {
@@ -1484,6 +1521,12 @@ static void OPNInitTable(void) {
 	FM_KEYON(CH, SLOT4);
 }
 
+/* MVS64: precomputed ADPCM-A step (was float math at every key-on — key-on runs
+ * in exception context on N64, so it must be integer). Set in OPNSetPres.
+ * ADPCM_SHIFT moved up here from the ADPCM section so OPNSetPres can use it. */
+#define ADPCM_SHIFT    (16)      /* frequency step rate   */
+static u32 adpcma_step_base;
+
 /* prescaler set (and make time tables) */
 static void OPNSetPres(FM_OPN *OPN, int pres, int TimerPres, int SSGpres) {
 	int i;
@@ -1502,6 +1545,15 @@ static void OPNSetPres(FM_OPN *OPN, int pres, int TimerPres, int SSGpres) {
 
 	/* Timer base time */
 	OPN->ST.TimerBase = 1.0 / ((double) OPN->ST.clock / (double) TimerPres);
+
+	/* MVS64: integer runtime equivalents. Double math is allowed HERE (init /
+	 * normal context); the register-write paths then use only these integers.
+	 * For the NeoGeo (8MHz chip, 4MHz Z80, TimerPres=144) TimerBase_cyc8 is
+	 * exactly 72 cycles/count << 8. */
+	OPN->ST.TimerBase_cyc8 = (u32) (OPN->ST.TimerBase
+			* (double) FM_TIMEBASE_CYC_PER_SEC * 256.0 + 0.5);
+	adpcma_step_base = (u32) ((float) (1 << ADPCM_SHIFT)
+			* ((float) OPN->ST.freqbase) / 3.0);
 
 	/* SSG part  prescaler set */
 	if (SSGpres)
@@ -1642,6 +1694,14 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 
 		SLOT->ssg = v & 0x0f;
 		SLOT->ssgn = (v & 0x04) >> 1; /* bit 1 in ssgn = attack */
+		/* MVS64: keep vol_out coherent (EG_OFF slots are skipped in
+		 * advance_eg_channel, so the negate state must be applied here). */
+		{
+			unsigned int out = SLOT->tl + (u32) SLOT->volume;
+			if ((SLOT->ssg & 0x08) && (SLOT->ssgn & 2))
+				out ^= ((1 << ENV_BITS) - 1);
+			SLOT->vol_out = out;
+		}
 
 		/* SSG-EG envelope shapes :
 
@@ -2063,7 +2123,7 @@ static void SSG_write(int r, int v) {
 /*********************************************************************************************/
 
 /**** YM2610 ADPCM-A defines ****/
-#define ADPCM_SHIFT    (16)      /* frequency step rate   */
+/* MVS64: ADPCM_SHIFT define moved above OPNSetPres (adpcma_step_base). */
 #define ADPCMA_ADDRESS_SHIFT 8   /* adpcm A address shift */
 
 static u8 *pcmbufA;
@@ -2123,7 +2183,13 @@ static void OPNB_ADPCMA_init_table(void) {
 			if (ch->now_addr & 1)
 				data = ch->now_data & 0x0f;
 			else {
-				ch->now_data = *(pcmbufA + (ch->now_addr >> 1));
+				/* MVS64: resident buffer if present, else streamed window
+				 * fetch (pcmsizeA still bounds the address). */
+				u32 _a = ch->now_addr >> 1;
+				ch->now_data = (_a < pcmsizeA)
+						? (pcmbufA ? pcmbufA[_a]
+						           : ym2610_vrom_fetch((int)(ch - YM2610.adpcma), _a))
+						: 0;
 				data = (ch->now_data >> 4) & 0x0f;
 			}
 
@@ -2165,8 +2231,8 @@ static void OPNB_ADPCMA_write(int r, int v) {
 			for (c = 0; c < 6; c++) {
 				if ((v >> c) & 1) {
 					/**** start adpcm ****/
-					adpcma[c].step = (u32) ((float) (1 << ADPCM_SHIFT)
-							* ((float) YM2610.OPN.ST.freqbase) / 3.0);
+					/* MVS64: precomputed — no FP on key-on (exception context) */
+					adpcma[c].step = adpcma_step_base;
 					adpcma[c].now_addr = adpcma[c].start << 1;
 					adpcma[c].now_step = 0;
 					adpcma[c].adpcma_acc = 0;
@@ -2174,7 +2240,8 @@ static void OPNB_ADPCMA_write(int r, int v) {
 					adpcma[c].adpcma_out = 0;
 					adpcma[c].flag = 1;
 
-					if (pcmbufA == NULL) {
+					/* MVS64: "mapped" = resident OR streamed (pcmsizeA > 0) */
+					if (pcmbufA == NULL && pcmsizeA == 0) {
 						/* Check ROM Mapped */
 //						logerror("YM2610: ADPCM-A rom not mapped\n");
 						adpcma[c].flag = 0;
@@ -2357,7 +2424,8 @@ static void OPNB_ADPCMB_write(ADPCMB *adpcmb, int r, int v) {
 			adpcmb->memread = 2; /* two dummy reads needed before accesing external memory via register $08*/
 
 			/* if yes, then let's check if ADPCM memory is mapped and big enough */
-			if (!pcmbufB) {
+			/* MVS64: "mapped" = resident OR streamed (pcmsizeB > 0) */
+			if (!pcmbufB && pcmsizeB == 0) {
 //				logerror("YM2610: Delta-T ADPCM rom not mapped\n");
 				adpcmb->portstate = 0x00;
 				adpcmb->PCM_BSY = 0;
@@ -2441,9 +2509,10 @@ static void OPNB_ADPCMB_write(ADPCMB *adpcmb, int r, int v) {
 	case 0x19: /* DELTA-N L (ADPCM Playback Prescaler) */
 	case 0x1a: /* DELTA-N H */
 		adpcmb->delta = (YM2610.regs[0x1a] << 8) | YM2610.regs[0x19];
-		adpcmb->step =
-				(u32) ((double) (adpcmb->delta /* * (1 << (ADPCMb_SHIFT - 16)) */)
-						* (adpcmb->freqbase));
+		/* MVS64: integer 16.16 (was double) — register writes run in exception
+		 * context on N64 where FP is forbidden. */
+		adpcmb->step = (u32) (((unsigned long long) adpcmb->delta
+						* adpcmb->freqbase16) >> 16);
 		/*logerror("DELTAT deltan:09=%2x 0a=%2x\n", YM2610.regs[0x19], YM2610.regs[0x1a]);*/
 		break;
 
@@ -2459,8 +2528,9 @@ static void OPNB_ADPCMB_write(ADPCMB *adpcmb, int r, int v) {
 //								v	  *		(1<<15)				>>	15;
 		/*logerror("DELTAT vol = %2x\n", v & 0xff);*/
 		if (oldvol != 0) {
-			adpcmb->adpcml = (int) ((double) adpcmb->adpcml / (double) oldvol
-					* (double) adpcmb->volume);
+			/* MVS64: integer rescale (was double) — runtime register write */
+			adpcmb->adpcml = (int) ((long long) adpcmb->adpcml
+					* adpcmb->volume / oldvol);
 		}
 	}
 		break;
@@ -2505,7 +2575,11 @@ INLINE void OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
 			if (adpcmb->now_addr & 1) {
 				data = adpcmb->now_data & 0x0f;
 			} else {
-				adpcmb->now_data = *(pcmbufB + (adpcmb->now_addr >> 1));
+				/* MVS64: resident buffer if present, else streamed window 6 */
+				u32 _b = adpcmb->now_addr >> 1;
+				adpcmb->now_data = (_b < pcmsizeB)
+						? (pcmbufB ? pcmbufB[_b] : ym2610_vrom_fetch(6, _b))
+						: 0;
 				data = adpcmb->now_data >> 4;
 			}
 
@@ -2610,10 +2684,10 @@ void YM2610ChangeSamplerate(int rate) {
 	SSG.step = ((double) SSG_STEP * rate * 8) / YM2610.OPN.ST.clock;
 	OPNSetPres(&YM2610.OPN, 6 * 24, 6 * 24, 4 * 2); /* OPN 1/6, SSG 1/4 */
 	for (i = 0; i < 6; i++) {
-		YM2610.adpcma[i].step = (u32) ((float) (1 << ADPCM_SHIFT)
-				* ((float) YM2610.OPN.ST.freqbase) / 3.0);
+		YM2610.adpcma[i].step = adpcma_step_base;
 	}
-	YM2610.adpcmb.freqbase = YM2610.OPN.ST.freqbase;
+	YM2610.adpcmb.freqbase16 =
+			(u32) (YM2610.OPN.ST.freqbase * 65536.0 + 0.5);
 }
 /* reset one of chip */
 void YM2610Reset(void) {
@@ -2649,8 +2723,7 @@ void YM2610Reset(void) {
 	}
 	/**** ADPCM work initial ****/
 	for (i = 0; i < 6; i++) {
-		YM2610.adpcma[i].step = (u32) ((float) (1 << ADPCM_SHIFT)
-				* ((float) YM2610.OPN.ST.freqbase) / 3.0);
+		YM2610.adpcma[i].step = adpcma_step_base;
 		YM2610.adpcma[i].now_addr = 0;
 		YM2610.adpcma[i].now_step = 0;
 		YM2610.adpcma[i].start = 0;
@@ -2668,7 +2741,7 @@ void YM2610Reset(void) {
 	YM2610.adpcm_arrivedEndAddress = 0;
 
 	/* ADPCM-B unit */
-	YM2610.adpcmb.freqbase = OPN->ST.freqbase;
+	YM2610.adpcmb.freqbase16 = (u32) (OPN->ST.freqbase * 65536.0 + 0.5);
 	YM2610.adpcmb.portshift = 8; /* allways 8bits shift */
 	YM2610.adpcmb.output_range = 1 << 23;
 
@@ -2884,6 +2957,16 @@ void YM2610Update_stream(int length) {
 	/* calc SSG count */
 	outn = SSG_calc_count(length);
 
+/* MVS64: -DMVS64_YMPROF (N64) — per-section TICKS split of the synthesis loop,
+ * read+reset by the [SNDRMS] telemetry. 0=EG 1=FM 2=SSG 3=ADPCM 4=mix+copy. */
+#if defined(MVS64_YMPROF) && defined(N64)
+#define YMPROF_T(x)   uint32_t _yp##x = TICKS_READ()
+#define YMPROF_A(n,x) (ym_prof[n] += TICKS_DISTANCE(_yp##x, TICKS_READ()))
+#else
+#define YMPROF_T(x)   ((void)0)
+#define YMPROF_A(n,x) ((void)0)
+#endif
+
 	/* buffering */
 	for (i = 0; i < length; i++) {
 
@@ -2905,6 +2988,7 @@ void YM2610Update_stream(int length) {
 		out_ssg = 0;
 
 		/* advance envelope generator */
+		YMPROF_T(a);
 		OPN->eg_timer += OPN->eg_timer_add;
 		while (OPN->eg_timer >= OPN->eg_timer_overflow) {
 			OPN->eg_timer -= OPN->eg_timer_overflow;
@@ -2915,16 +2999,22 @@ void YM2610Update_stream(int length) {
 			advance_eg_channel(OPN, &cch[2]->SLOT[SLOT1]);
 			advance_eg_channel(OPN, &cch[3]->SLOT[SLOT1]);
 		}
+		YMPROF_A(0, a);
 
 		/* calculate FM */
+		YMPROF_T(b);
 		chan_calc(OPN, cch[0]); /*remapped to 1*/
 		chan_calc(OPN, cch[1]); /*remapped to 2*/
 		chan_calc(OPN, cch[2]); /*remapped to 4*/
 		chan_calc(OPN, cch[3]); /*remapped to 5*/
+		YMPROF_A(1, b);
 
 		/* calculate SSG */
+		YMPROF_T(c);
 		outn = SSG_CALC(outn);
+		YMPROF_A(2, c);
 		/* deltaT ADPCM */
+		YMPROF_T(d);
 		if (YM2610.adpcmb.portstate & 0x80)
 			OPNB_ADPCMB_CALC(&YM2610.adpcmb);
 
@@ -2933,7 +3023,9 @@ void YM2610Update_stream(int length) {
 			if (YM2610.adpcma[j].flag)
 				OPNB_ADPCMA_calc_chan(&YM2610.adpcma[j]);
 		}
+		YMPROF_A(3, d);
 		/* buffering */
+		YMPROF_T(e);
 		lt = out_adpcma[OUTD_LEFT] + out_adpcma[OUTD_CENTER];
 		rt = out_adpcma[OUTD_RIGHT] + out_adpcma[OUTD_CENTER];
 
@@ -2964,6 +3056,7 @@ void YM2610Update_stream(int length) {
 		 */
 		*pl++ = lt;
 		*pl++ = rt;
+		YMPROF_A(4, e);
 
 		//my_timer();
 
@@ -2971,6 +3064,8 @@ void YM2610Update_stream(int length) {
 	} INTERNAL_TIMER_B(OPN->ST,length);
 
 }
+#undef YMPROF_T
+#undef YMPROF_A
 
 void YM2610Update(int *p) {
 	int i;

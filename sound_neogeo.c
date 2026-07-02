@@ -6,6 +6,7 @@
 // (WS3): its ports are stubbed, so this boots the driver and completes the
 // 68k<->Z80 command handshake but still emits silence.
 #include "sound.h"
+#include "emu.h"
 #include "roms.h"
 #include "platform.h"
 #include "z80.h"
@@ -13,11 +14,19 @@
 #include <string.h>
 #include <stdlib.h>
 
+// Audio-health telemetry. MVS64_AUTOINPUT (headless validation) implies it, but
+// MVS64_SNDHEALTH enables the [SNDRMS]/[AIPUMP] USB logs in a normal, human-
+// driven build too (no scripted input), so real-hardware behaviour can be read
+// off a flashcart USB capture while actually playing.
+#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH)
+#define SND_HEALTH 1
+#endif
+
 // NeoGeo audio Z80 runs at 4 MHz; produce one video frame's worth per call.
 #define Z80_CLOCK            4000000
 #define Z80_CYCLES_PER_FRAME (Z80_CLOCK / 60)
 #define YM_CLOCK             8000000
-#define AUDIO_RATE           44100
+#define AUDIO_RATE           MVS64_AUDIO_RATE
 
 static z80 cpu;
 static int  z80_active;                 // false when there is no m.rom
@@ -28,31 +37,160 @@ static uint8_t sound_code;              // 68k -> Z80 command latch
 static uint8_t result_code;             // Z80 -> 68k reply latch
 static uint8_t pending_command;
 static int snd_dbg;                     // MVS64_SNDDBG: trace Z80 PC
+int sound_silent;                       // see sound.h: run Z80 but emit silence
+#ifdef SND_HEALTH
+static int g_timer_fires[2];            // YM2610TimerOver calls per SNDRMS interval
+#endif
+
+// NOTE (2026-07-01): the old "stuck-voice guard" that force-zeroed any SSG
+// channel holding a constant nonzero volume for 3s was REMOVED. Telemetry
+// proved it was killing LEGITIMATE sustained SSG content (stage ambience /
+// music beds — samsho2 holds SSG voices for many seconds by design): every
+// [STUCKGUARD] fire was followed by the in-game rms collapsing to 0, i.e. the
+// guard itself was the "audio keeps cutting out" bug. The failure it guarded
+// against (the AI replaying a stale buffer as an endless tone) is prevented
+// structurally by the guest-clock audio pump + sound_silent underrun path.
+
+// --- Sound event trace (MVS64_SNDTRACE) ------------------------------------
+// Differential debug of the "press Start -> stuck long beep" bug: log every
+// 68k->Z80 command and every YM2610 key-on/off (FM register 0x28) write, so we
+// can see which FM channel is keyed on at Start and whether a key-OFF ever
+// follows (a missing key-off = the stuck note). Events are pushed into a ring
+// from ANY context — including the m64k MMIO exception handler that runs the Z80
+// inline for sound_write_command, where SD/FatFs I/O is unsafe — and DRAINED to
+// plat_log() from sound_gen_samples(), which only ever runs in safe pump context.
+// Producers never overlap in time (the 68k frame step and the audio pump are
+// sequential in the main loop), so the single-producer ring is race-free.
+#ifdef MVS64_SNDTRACE
+#define TRACE_N 2048                          // power of two
+static volatile uint16_t trace_buf[TRACE_N];  // packed (type<<12)|payload12; 1=CMD 2=FMKEY 3=SSG
+static volatile unsigned trace_head, trace_tail;
+static inline void trace_push(int type, unsigned payload) {
+	unsigned h = trace_head;
+	trace_buf[h & (TRACE_N - 1)] = (uint16_t)((type << 12) | (payload & 0xFFF));
+	trace_head = h + 1;
+}
+static void trace_drain(void) {
+	while (trace_tail != trace_head) {
+		uint16_t e = trace_buf[trace_tail & (TRACE_N - 1)]; trace_tail++;
+		int type = e >> 12; unsigned p = e & 0xFFF; uint8_t v = (uint8_t)p;
+		if (type == 1) plat_log("[CMD] %02x\n", v);
+		else if (type == 2) plat_log("[YMKEY] %02x ch=%d %s\n", v, v & 7, ((v >> 4) ? "ON" : "off"));
+		else if (type == 4) // ADPCM-A key on/off (reg 0x100): b7=0 on, b7=1 dump/off
+			plat_log("[AKEY] %02x %s mask=%02x\n", v, (v & 0x80) ? "OFF" : "ON", v & 0x3f);
+		else { // SSG: payload = (reg<<8)|val
+			int reg = (p >> 8) & 0xF;
+			if (reg == 0x07) plat_log("[SSG] mixer=%02x toneA=%d toneB=%d toneC=%d\n",
+				v, !(v & 1), !(v & 2), !(v & 4));   // bit clear = tone ENABLED
+			else plat_log("[SSG] reg%X(%s)=%02x\n", reg,
+				reg==8?"volA":reg==9?"volB":reg==0xA?"volC":"tone", v);
+		}
+	}
+}
+#endif
+
+// Last register selected on YM port A (control-A write). Needed by both the
+// SNDTRACE event log and the N64 stuck-voice guard, so tracked unconditionally.
+static uint8_t ym_addr_a;
+#ifdef MVS64_SNDTRACE
+static uint8_t ym_addr_b;                // last register selected on YM port B
+#endif
+
+// --- Z80 idle-skip ---------------------------------------------------------
+// The NeoGeo sound driver spends most of its time in a tight interrupt-wait
+// spin (poll a flag / branch back) between FM-timer ticks. Single-stepping that
+// at the real 4 MHz rate dominates the N64 CPU (~70%), so without this the game
+// drops to ~4 fps once audio is decoupled to real time. We detect a PURE spin —
+// a backward branch that returns to the same PC with byte-identical registers
+// and no port/RAM writes in the loop — and fast-forward cpu.cyc to the next
+// timer deadline. emit() still synthesizes the FM audio for the skipped span, so
+// music keeps sounding; only the redundant Z80 stepping is skipped. Provably
+// equivalent: with identical state and no side effects, every iteration is the
+// same until an external event (the timer IRQ), which fires at the deadline.
+// Delay loops are NOT skipped — they mutate a register (e.g. DJNZ's B), so the
+// snapshot compare fails. This is the sound-CPU analog of the 68k idle-skip.
+static int z80_wrote;                    // set by z80_out/z80_write = real work
+#ifdef SND_HEALTH
+static unsigned long g_z80_steps, g_z80_skipcyc; static int g_z80_skips;
+#endif
+// [SNDPROF] split cost telemetry (N64): where does audio wall-time actually go —
+// stepping the Z80 vs synthesising the YM2610? Reported in the [SNDRMS] line as
+// z80ms/ymms per 60-call interval (TICKS_PER_SECOND/1000 ticks per ms).
+#if defined(SND_HEALTH) && defined(N64)
+static uint32_t g_prof_z80t, g_prof_ymt;
+#endif
+struct z80snap {
+	uint16_t sp, ix, iy;
+	uint8_t a,b,c,d,e,h,l, a_,b_,c_,d_,e_,h_,l_,f_, i;
+	uint8_t flags, iff;
+};
+static inline void z80_snap(struct z80snap *s, const z80 *z) {
+	memset(s, 0, sizeof *s);             // zero padding so memcmp is exact
+	s->sp=z->sp; s->ix=z->ix; s->iy=z->iy;
+	s->a=z->a; s->b=z->b; s->c=z->c; s->d=z->d; s->e=z->e; s->h=z->h; s->l=z->l;
+	s->a_=z->a_; s->b_=z->b_; s->c_=z->c_; s->d_=z->d_;
+	s->e_=z->e_; s->h_=z->h_; s->l_=z->l_; s->f_=z->f_; s->i=z->i;
+	s->flags = (z->sf<<7)|(z->zf<<6)|(z->yf<<5)|(z->hf<<4)|
+	           (z->xf<<3)|(z->pf<<2)|(z->nf<<1)|(z->cf);
+	s->iff = (z->iff1?1:0)|(z->iff2?2:0)|(z->interrupt_mode<<2);
+}
 
 // YM2610 stream output (interleaved s16 L/R), filled by YM2610Update_stream().
 uint16_t play_buffer[16384];
 
-// Resident ADPCM sample ROM (v.rom). The YM2610 core needs random access to it;
-// mvs64 normally streams v.rom from cart, so we pull it into RAM once here.
+// Resident ADPCM sample ROM (v.rom) when RAM allows (PC build); NULL otherwise.
 static uint8_t *vrom_resident;
 
+// --- ADPCM sample streaming (v.rom window caches) ---------------------------
+// The 7MB v.rom cannot live in N64 RDRAM, but the YM2610's ADPCM engines read
+// it strictly sequentially per voice. Each of the 7 voices (6x ADPCM-A + the
+// ADPCM-B) gets a small aligned window; a fetch outside the window reloads it
+// via vrom_read (cart DFS/PI DMA on N64) — ~one 2KB read per 0.2s per active
+// voice, a negligible PI load. Fetches happen only during synthesis (audio-pump
+// context, normal C), never inside the 68k MMIO exception handler (key-on just
+// arms the channel), so the PI DMA here is safe.
+#define VWIN_SIZE 2048
+static struct vwin {
+	uint32_t base;
+	int      valid;
+	uint8_t  buf[VWIN_SIZE] __attribute__((aligned(16)));
+} vwin[7];
+
+uint8_t ym2610_vrom_fetch(int win, uint32_t addr) {
+	struct vwin *w = &vwin[win];
+	uint32_t base = addr & ~(uint32_t)(VWIN_SIZE - 1);
+	if (!w->valid || w->base != base) {
+		int len = VWIN_SIZE;
+		if (base + (uint32_t)len > v_rom_size) {
+			len = (int)(v_rom_size - base);   // addr < v_rom_size is guaranteed
+			if (len <= 0) return 0;           // by the pcmsize clamp upstream
+		}
+		vrom_read(base, w->buf, len);
+		w->base = base; w->valid = 1;
+	}
+	return w->buf[addr & (VWIN_SIZE - 1)];
+}
+
 // --- YM2610 timer/IRQ glue (cycle-based) -----------------------------------
-// The chip schedules timers in seconds; we track deadlines in Z80 cycles and
-// fire YM2610TimerOver (which raises the Z80 IRQ that ticks the music driver).
+// The YM core hands us timer periods as integer Z80 cycles (0 = stop); we track
+// deadlines in Z80 cycles and fire YM2610TimerOver (which raises the Z80 IRQ
+// that ticks the music driver). This whole path is deliberately INTEGER-ONLY:
+// on N64 it runs inside the TLB/MMIO exception handler (68k sound-latch write ->
+// z80_run -> YM register write -> timer start), where the FPU is disabled and
+// no FP context is saved — a single float op there nests into a wild jump.
 static int           ym_timer_on[2];
 static unsigned long ym_timer_deadline[2];   // absolute cpu.cyc
 
-double ym2610_time_now(void) {              // FM_GET_TIME_NOW source (seconds)
-	return (double)cpu.cyc / (double)Z80_CLOCK;
+uint32_t ym2610_time_now_cyc(void) {        // FM_GET_TIME_NOW_CYC source
+	return (uint32_t)cpu.cyc;
 }
 
-static void ym_timer_handler(int c, int count, double stepTime) {
-	if (count == 0) {
+static void ym_timer_handler(int c, uint32_t cycles) {
+	if (cycles == 0) {
 		ym_timer_on[c] = 0;
 	} else {
 		ym_timer_on[c] = 1;
-		ym_timer_deadline[c] =
-			cpu.cyc + (unsigned long)((double)count * stepTime * Z80_CLOCK);
+		ym_timer_deadline[c] = cpu.cyc + cycles;
 	}
 }
 
@@ -87,6 +225,7 @@ static uint8_t z80_read(void *ud, uint16_t addr) {
 static void z80_write(void *ud, uint16_t addr, uint8_t val) {
 	(void)ud;
 	if (addr >= 0xF800) z80_ram[addr - 0xF800] = val;    // only work RAM is writable
+	z80_wrote = 1;                                        // taints idle-skip window
 }
 
 static uint8_t z80_in(z80 *z, uint16_t port) {
@@ -106,11 +245,29 @@ static uint8_t z80_in(z80 *z, uint16_t port) {
 
 static void z80_out(z80 *z, uint16_t port, uint8_t val) {
 	(void)z;
+	z80_wrote = 1;                                        // taints idle-skip window
 	switch (port & 0xff) {
-	case 0x04: YM2610Write(0, val); break;               // control A
-	case 0x05: YM2610Write(1, val); break;               // data A
-	case 0x06: YM2610Write(2, val); break;               // control B
-	case 0x07: YM2610Write(3, val); break;               // data B
+	case 0x04: YM2610Write(0, val);
+		ym_addr_a = val;                                 // register select (bank A)
+		break;                                           // control A
+	case 0x05: YM2610Write(1, val);
+#ifdef MVS64_SNDTRACE
+		if (ym_addr_a == 0x28) trace_push(2, val);                   // FM key on/off
+		else if (ym_addr_a == 0x07 ||                                // SSG mixer
+		         (ym_addr_a >= 0x08 && ym_addr_a <= 0x0A))           // SSG volA/B/C
+			trace_push(3, ((unsigned)ym_addr_a << 8) | val);
+#endif
+		break;                                           // data A
+	case 0x06: YM2610Write(2, val);
+#ifdef MVS64_SNDTRACE
+		ym_addr_b = val;                                 // register select (bank B)
+#endif
+		break;                                           // control B
+	case 0x07: YM2610Write(3, val);
+#ifdef MVS64_SNDTRACE
+		if (ym_addr_b == 0x00) trace_push(4, val);       // ADPCM-A key on/off/dump
+#endif
+		break;                                           // data B
 	case 0x0c: result_code = val; break;                 // reply to 68k
 	}
 }
@@ -127,7 +284,7 @@ void sound_init(void) {
 	snd_dbg = getenv("MVS64_SNDDBG") != NULL;
 	if (!M_ROM || m_rom_size == 0) {
 		z80_active = 0;
-		debugf("[SND] no m.rom; sound disabled\n");
+		plat_log("[SND] no m.rom; sound disabled\n");
 		return;
 	}
 	z80_init(&cpu);
@@ -136,35 +293,44 @@ void sound_init(void) {
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
 
-	// Pull v.rom (ADPCM-A/B sample ROM) resident for the YM2610. samsho2 has no
-	// separate ADPCM-B ROM, so A and B share the same data (as on real NeoGeo).
-	// If the alloc fails (e.g. tight N64 RAM), ADPCM is disabled but FM/SSG run.
+	// ADPCM sample source (v.rom, up to 7MB). samsho2 has no separate ADPCM-B
+	// ROM, so A and B share the same data (as on real NeoGeo). Resident when RAM
+	// allows (PC build); otherwise STREAMED per voice through the vwin window
+	// caches above — a NULL buffer with adpcm_size > 0 selects streaming inside
+	// the YM2610 core (ym2610_vrom_fetch). The old resident pull on N64 overran
+	// the 8MB heap (7MB malloc) and ADPCM used to be disabled entirely there.
+	unsigned adpcm_size = v_rom_size;
 	if (v_rom_size) {
 #ifdef N64
-		// mvs64 streams v.rom from cart. Pulling the ~7MB ADPCM sample ROM fully
-		// resident overruns the N64 heap into the stack region and corrupts return
-		// addresses (intermittent wild-jump crash ~9s into boot). Leave it
-		// non-resident: ADPCM disabled (vrom_resident NULL), FM/SSG still play.
-		// ADPCM via streaming is future work.
-		debugf("[SND] N64: v.rom not pulled resident (%u bytes); ADPCM disabled\n", v_rom_size);
+		plat_log("[SND] N64: v.rom streamed from cart (%u bytes); ADPCM enabled\n", v_rom_size);
 #else
-		vrom_resident = malloc(v_rom_size);
-		if (vrom_resident) {
-			vrom_read(0, vrom_resident, v_rom_size);
-			debugf("[SND] v.rom resident: %u bytes\n", v_rom_size);
+		if (getenv("MVS64_NO_ADPCM")) {
+			// A/B: force the no-ADPCM condition (what N64 used to be).
+			adpcm_size = 0;
+			plat_log("[SND] MVS64_NO_ADPCM: ADPCM force-disabled\n");
+		} else if (getenv("MVS64_STREAM_ADPCM")) {
+			// A/B: exercise the N64 streaming path on the PC build; the WAV
+			// must be byte-identical to the resident path.
+			plat_log("[SND] MVS64_STREAM_ADPCM: v.rom streamed (%u bytes)\n", v_rom_size);
 		} else {
-			debugf("[SND] v.rom alloc failed; ADPCM disabled\n");
+			vrom_resident = malloc(v_rom_size);
+			if (vrom_resident) {
+				vrom_read(0, vrom_resident, v_rom_size);
+				plat_log("[SND] v.rom resident: %u bytes\n", v_rom_size);
+			} else {
+				plat_log("[SND] v.rom alloc failed; streaming ADPCM\n");
+			}
 		}
 #endif
 	}
 	YM2610Init(YM_CLOCK, AUDIO_RATE,
-		vrom_resident, vrom_resident ? v_rom_size : 0,   // ADPCM-A
-		vrom_resident, vrom_resident ? v_rom_size : 0,   // ADPCM-B (shared)
+		vrom_resident, adpcm_size,   // ADPCM-A (NULL buf + size>0 = streamed)
+		vrom_resident, adpcm_size,   // ADPCM-B (shared)
 		ym_timer_handler, ym_irq_handler);
 
 	sound_reset();
 	z80_active = 1;
-	debugf("[SND] Z80 sound CPU init (m.rom %u bytes)\n", m_rom_size);
+	plat_log("[SND] Z80 sound CPU init (m.rom %u bytes)\n", m_rom_size);
 }
 
 void sound_reset(void) {
@@ -184,29 +350,44 @@ void sound_reset(void) {
 	YM2610Reset();
 }
 
+#ifdef SND_HEALTH
+static int g_cmd_lost;   // 68k overwrote a command the Z80 never consumed
+#endif
+
 void sound_write_command(uint8_t cmd) {
+#ifdef SND_HEALTH
+	// The NeoGeo sound latch holds ONE byte. If the previous command is still
+	// pending (Z80 hasn't read port 0x00 yet), this write destroys it — on real
+	// hardware the Z80 consumes within microseconds, but if our Z80 lags the
+	// 68k, commands vanish and the music driver desyncs (missing note-offs /
+	// never-started songs). Count it to prove/disprove that mechanism.
+	if (pending_command) g_cmd_lost++;
+#endif
 	sound_code = cmd;
 	pending_command = 1;
+#ifdef MVS64_SNDTRACE
+	trace_push(1, cmd);
+#endif
+#ifdef MVS64_FASTBOOT
+	// Diagnostic only: the one-time SNK boot voice/jingle (cmd 0x01) runs the Z80
+	// flat-out (~957k steps, not idle-skippable) and drops the emulator to ~4fps,
+	// so ares takes minutes just to clear boot. It is silenced anyway. Skip its
+	// processing and fake the echo-ack reply so boot is fast and we can reach
+	// combat quickly for tracing. NOT for release builds.
+	if (cmd == 0x01) { result_code = cmd; pending_command = 0; return; }
+#endif
 	if (!z80_active) return;
-#ifdef N64
-	// This runs inside the TLB/MMIO exception handler, which clears SR.CU1
-	// (FPU disabled) in hw_n64.S. The Z80 driver writes the YM2610, which uses
-	// FP math -> a Coprocessor-Unusable fault here nests into a wild jump. The
-	// NeoGeo BIOS polls for the sound reply in a bounded loop at boot, so the run
-	// MUST be synchronous (deferring it to the next frame mis-sequences the
-	// handshake -> the BIOS jumps wild ~frame 537). Fix: re-enable the FPU (CU1,
-	// status bit 29) just around the run, then restore it. Safe because the
-	// interrupted m64k 68k interpreter is integer-only and holds no live FP state.
-	uint32_t sr;
-	__asm__ volatile("mfc0 %0, $12" : "=r"(sr));
-	__asm__ volatile("mtc0 %0, $12" :: "r"(sr | (1u << 29)));  // set CU1
-	z80_gen_nmi(&cpu);
-	z80_run(300);
-	__asm__ volatile("mtc0 %0, $12" :: "r"(sr));               // restore CU1
-#else
+	// On N64 this runs inside the TLB/MMIO exception handler (68k sound-latch
+	// write). The NeoGeo BIOS busy-waits for the reply, so the run must stay
+	// synchronous. That is safe ONLY because the whole Z80+YM2610 command path
+	// is now integer-only (the YM core precomputes its double math at init:
+	// TimerBase_cyc8 / adpcma_step_base / freqbase16) — the handler leaves the
+	// FPU disabled (SR.CU1 clear, no FP context saved), and the previous
+	// mfc0/mtc0 CU1-re-enable trick had an unhandled CP0 hazard window that
+	// wedged Mupen (BizHawk) at the first sound command (~frame 537) and was
+	// fragile on real hardware.
 	z80_gen_nmi(&cpu);    // command latch raises Z80 NMI...
 	z80_run(300);         // ...and the driver replies within the 68k busy-wait
-#endif
 }
 
 uint8_t sound_read_status(void) {
@@ -214,11 +395,29 @@ uint8_t sound_read_status(void) {
 }
 
 static void emit(int16_t *out, int from, int count) {
+#if defined(SND_HEALTH) && defined(N64)
+	uint32_t _t0 = TICKS_READ();
+#endif
 	YM2610Update_stream(count);
+#ifdef N64
+	// `out` is an UNCACHED AI buffer: every store is a separate RDRAM
+	// transaction, so pack each stereo frame into ONE 32-bit store (big-endian:
+	// high half = left = out[0]) — halves the uncached traffic vs two 16-bit
+	// stores. A stereo frame is 4 bytes, so out+from*2 is always 4-aligned.
+	{
+		uint32_t *dst = (uint32_t *)(out + from * 2);
+		for (int i = 0; i < count; i++)
+			dst[i] = ((uint32_t)play_buffer[i * 2 + 0] << 16) | play_buffer[i * 2 + 1];
+	}
+#else
 	for (int i = 0; i < count; i++) {
 		out[(from + i) * 2 + 0] = (int16_t)play_buffer[i * 2 + 0];
 		out[(from + i) * 2 + 1] = (int16_t)play_buffer[i * 2 + 1];
 	}
+#endif
+#if defined(SND_HEALTH) && defined(N64)
+	g_prof_ymt += TICKS_DISTANCE(_t0, TICKS_READ());
+#endif
 }
 
 int sound_gen_samples(int16_t *out, int nsamples) {
@@ -226,42 +425,102 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		memset(out, 0, (size_t)nsamples * 2 * sizeof(int16_t));
 		return nsamples;
 	}
+#ifdef MVS64_SNDTRACE
+	trace_drain();   // flush 68k->Z80 commands + YM key on/off to the log (SD/USB)
+#endif
+
+	// Rate-agnostic: "nsamples" always means exactly nsamples/AUDIO_RATE seconds
+	// of Z80+YM2610 time, derived from the requested sample count rather than a
+	// hardcoded 1/60s. This lets the N64 backend drive us at the true 44100 Hz AI
+	// rate (any buffer length) so music plays at correct pitch AND tempo even when
+	// the 68k frame loop is slow. At nsamples=735 cyc_budget == Z80_CYCLES_PER_FRAME
+	// exactly, so the PC/SDL and headless paths are byte-identical to before.
+	// Sustained-underrun silence: keep running the Z80 (handshake/timers) but skip
+	// the YM2610 synthesis and output zeros. The buffer is pre-zeroed; every emit()
+	// below is gated on !silent so nothing overwrites it.
+	const int silent = sound_silent;
+	if (silent) memset(out, 0, (size_t)nsamples * 2 * sizeof(int16_t));
 
 	const unsigned long frame_start = cpu.cyc;
-	const unsigned long frame_end   = cpu.cyc + Z80_CYCLES_PER_FRAME;
+	const unsigned long cyc_budget  =
+		(unsigned long)((unsigned long long)nsamples * Z80_CLOCK / AUDIO_RATE);
+	const unsigned long frame_end   = cpu.cyc + cyc_budget;
 	int produced = 0;
+
+	uint16_t last_back = 0xFFFF;        // idle-skip: target of previous back-branch
+	struct z80snap spin_snap;           // registers at last_back last time we hit it
+	int spin_armed = 0;                 // snapshot valid + no writes since it taken
 
 	while (cpu.cyc < frame_end) {
 		// Service any due FM timers first (re-arms them forward + raises IRQ).
+		// Wrap-safe signed compare: cpu.cyc is 32-bit on N64 and wraps at ~17min
+		// once it advances at the true ~4MHz rate (deltas here are tiny, <budget).
 		for (int c = 0; c < 2; c++)
-			if (ym_timer_on[c] && cpu.cyc >= ym_timer_deadline[c])
+			if (ym_timer_on[c] && (long)(cpu.cyc - ym_timer_deadline[c]) >= 0) {
+#ifdef SND_HEALTH
+				g_timer_fires[c]++;
+#endif
 				YM2610TimerOver(c);
+			}
 
-		// Run the Z80 in a bounded slice, stopping early on a timer deadline so
-		// the music driver's IRQ tick stays on time.
-		unsigned long next = cpu.cyc + 1000;
-		if (next > frame_end) next = frame_end;
+		// Next event boundary = nearest future timer deadline, else end of budget.
+		// We run the Z80 up to it, idle-skipping any interrupt-wait spin (so we
+		// don't single-step 4 MHz of wait loop). The timer fires exactly at the
+		// deadline, so tempo stays correct; emit() below renders the FM audio for
+		// the whole span whether stepped or skipped.
+		unsigned long next = frame_end;
 		for (int c = 0; c < 2; c++)
-			if (ym_timer_on[c] && ym_timer_deadline[c] > cpu.cyc &&
-			    ym_timer_deadline[c] < next)
+			if (ym_timer_on[c] && (long)(ym_timer_deadline[c] - cpu.cyc) > 0 &&
+			    (long)(ym_timer_deadline[c] - next) < 0)
 				next = ym_timer_deadline[c];
-		while (cpu.cyc < next)
-			z80_step(&cpu);
 
-		// Generate samples up to the cycle-proportional point in the frame.
+#if defined(SND_HEALTH) && defined(N64)
+		uint32_t _zt0 = TICKS_READ();
+#endif
+		while (cpu.cyc < next) {
+			uint16_t pc0 = cpu.pc;
+			z80_wrote = 0;
+			z80_step(&cpu);
+#ifdef SND_HEALTH
+			g_z80_steps++;
+#endif
+			if (z80_wrote) spin_armed = 0;      // any write breaks the pure spin
+			if (cpu.pc < pc0) {                 // backward branch = loop edge
+				if (cpu.pc == last_back) {      // repeated target = candidate spin
+					struct z80snap now; z80_snap(&now, &cpu);
+					if (spin_armed && memcmp(&now, &spin_snap, sizeof now) == 0) {
+#ifdef SND_HEALTH
+						g_z80_skipcyc += (next - cpu.cyc); g_z80_skips++;
+#endif
+#ifndef MVS64_NOIDLESKIP
+						cpu.cyc = next;         // identical iteration -> jump to event
+						break;
+#endif
+					}
+					spin_snap = now; spin_armed = 1;   // seed/refresh for next compare
+				} else {
+					last_back = cpu.pc; spin_armed = 0;  // new target: cheap path
+				}
+			}
+		}
+#if defined(SND_HEALTH) && defined(N64)
+		g_prof_z80t += TICKS_DISTANCE(_zt0, TICKS_READ());
+#endif
+
+		// Generate samples up to the cycle-proportional point in the budget.
 		int target = (int)((unsigned long long)(cpu.cyc - frame_start) *
-		                    nsamples / Z80_CYCLES_PER_FRAME);
+		                    nsamples / cyc_budget);
 		if (target > nsamples) target = nsamples;
-		if (target > produced) { emit(out, produced, target - produced); produced = target; }
+		if (target > produced) { if (!silent) emit(out, produced, target - produced); produced = target; }
 	}
-	if (produced < nsamples) emit(out, produced, nsamples - produced);
+	if (produced < nsamples && !silent) emit(out, produced, nsamples - produced);
 
 	if (snd_dbg)
-		debugf("[SND] z80 pc=%04x code=%02x result=%02x timers=%d%d s0=%d\n",
+		plat_log("[SND] z80 pc=%04x code=%02x result=%02x timers=%d%d s0=%d\n",
 			cpu.pc, sound_code, result_code, ym_timer_on[0], ym_timer_on[1],
 			(int)play_buffer[0]);
 
-#ifdef MVS64_AUTOINPUT
+#ifdef SND_HEALTH
 	// Audio-activity probe: report the RMS amplitude of the generated frame so
 	// "is sound actually being produced" is verifiable headless (non-zero,
 	// varying RMS = the Z80 music driver is feeding the YM2610).
@@ -273,8 +532,43 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			acc += (uint64_t)v * v; if (v > pk) pk = v;
 		}
 		int rms = 0; if (nsamples) { uint64_t m = acc / (nsamples * 2); while ((uint64_t)(rms+1)*(rms+1) <= m) rms++; }
-		if ((sc++ % 60) == 0)
-			debugf("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x\n", rms, pk, cpu.pc, sound_code);
+		if ((sc++ % 60) == 0) {
+			// steps = z80 instrs actually run; skipcyc = idle cycles fast-forwarded.
+			// High skipcyc:steps ratio = idle-skip working (cheap waits).
+#if defined(SND_HEALTH) && defined(N64)
+			// z80ms/ymms: wall ms spent stepping the Z80 vs synthesising the
+			// YM2610 over the 60-call interval — the audio cost split.
+			// lost = commands the 68k overwrote before the Z80 consumed them
+			// (cumulative); t = FM timer A/B armed (music engine tick source).
+			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu lost=%d t=%d%d\n",
+				rms, pk, cpu.pc, sound_code,
+				g_z80_steps, g_z80_skips, g_z80_skipcyc,
+				(unsigned long)(g_prof_z80t / (TICKS_PER_SECOND / 1000)),
+				(unsigned long)(g_prof_ymt / (TICKS_PER_SECOND / 1000)),
+				g_cmd_lost, ym_timer_on[0], ym_timer_on[1]);
+			plat_log("[SNDTMR] fires=%d,%d\n", g_timer_fires[0], g_timer_fires[1]);
+			g_timer_fires[0] = g_timer_fires[1] = 0;
+			g_prof_z80t = 0; g_prof_ymt = 0;
+#ifdef MVS64_YMPROF
+			{
+				extern uint32_t ym_prof[5];
+				plat_log("[YMPROF] egms=%lu fmms=%lu ssgms=%lu adpcmms=%lu mixms=%lu\n",
+					(unsigned long)(ym_prof[0] / (TICKS_PER_SECOND / 1000)),
+					(unsigned long)(ym_prof[1] / (TICKS_PER_SECOND / 1000)),
+					(unsigned long)(ym_prof[2] / (TICKS_PER_SECOND / 1000)),
+					(unsigned long)(ym_prof[3] / (TICKS_PER_SECOND / 1000)),
+					(unsigned long)(ym_prof[4] / (TICKS_PER_SECOND / 1000)));
+				memset(ym_prof, 0, sizeof(uint32_t) * 5);
+			}
+#endif
+#else
+			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu lost=%d t=%d%d\n",
+				rms, pk, cpu.pc, sound_code,
+				g_z80_steps, g_z80_skips, g_z80_skipcyc,
+				g_cmd_lost, ym_timer_on[0], ym_timer_on[1]);
+#endif
+			g_z80_steps = 0; g_z80_skipcyc = 0; g_z80_skips = 0;
+		}
 	}
 #endif
 	return nsamples;
