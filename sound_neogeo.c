@@ -194,9 +194,35 @@ static void ym_timer_handler(int c, uint32_t cycles) {
 	}
 }
 
+// The YM2610 /IRQ pin is LEVEL-triggered: as long as any unmasked timer flag
+// is set, the line stays low and a real Z80 re-enters the interrupt the moment
+// it executes EI/RETI. z80_gen_int models a one-shot edge (int_pending is
+// consumed on acceptance), so when timers A and B fire close together — they
+// run at ~130/s and ~107/s here and collide constantly — the second assert
+// used to be swallowed (FM_STATUS_SET only calls the IRQ handler on the 0->1
+// edge of ST->irq) and that music tick was silently LOST. A lost tick at the
+// wrong moment leaves the driver's note-off step unexecuted = a latched voice.
+// ym_irq_level mirrors the line so the Z80 run loops can re-assert while high.
+static int ym_irq_level;
+#ifdef SND_HEALTH
+static int g_irq_redeliver;                 // level-triggered re-asserts (see above)
+#endif
 static void ym_irq_handler(int irq) {
+	ym_irq_level = irq;
 	if (irq) z80_gen_int(&cpu, 0xff);       // assert (IM1 -> RST 38h)
 	else     cpu.int_pending = 0;           // deassert if not yet serviced
+}
+
+// Re-deliver a level-held IRQ the edge model dropped: the line is high, the
+// CPU can take interrupts, but no interrupt is pending = a real Z80 would be
+// entering the handler right now. Call before stepping in every Z80 run loop.
+static inline void z80_service_level_irq(void) {
+	if (ym_irq_level && cpu.iff1 && !cpu.int_pending) {
+		z80_gen_int(&cpu, 0xff);
+#ifdef SND_HEALTH
+		g_irq_redeliver++;
+#endif
+	}
 }
 
 // Bank switch: window <bank> is remapped to M_ROM + size*(porthi & mask).
@@ -272,13 +298,6 @@ static void z80_out(z80 *z, uint16_t port, uint8_t val) {
 	}
 }
 
-static void z80_run(unsigned cycles) {
-	if (!z80_active) return;
-	unsigned long target = cpu.cyc + cycles;
-	while (cpu.cyc < target)
-		z80_step(&cpu);
-}
-
 // --- sound.h seam ----------------------------------------------------------
 void sound_init(void) {
 	snd_dbg = getenv("MVS64_SNDDBG") != NULL;
@@ -352,6 +371,8 @@ void sound_reset(void) {
 
 #ifdef SND_HEALTH
 static int g_cmd_lost;   // 68k overwrote a command the Z80 never consumed
+static int g_nmi_precap; // command NMI injected while Z80 still mid-handler
+static int g_nmi_postcap;// command NMI handler didn't finish within the cap
 #endif
 
 void sound_write_command(uint8_t cmd) {
@@ -386,8 +407,44 @@ void sound_write_command(uint8_t cmd) {
 	// mfc0/mtc0 CU1-re-enable trick had an unhandled CP0 hazard window that
 	// wedged Mupen (BizHawk) at the first sound command (~frame 537) and was
 	// fragile on real hardware.
-	z80_gen_nmi(&cpu);    // command latch raises Z80 NMI...
-	z80_run(300);         // ...and the driver replies within the 68k busy-wait
+	//
+	// Deliver the NMI the way real-hardware timing would: never into the middle
+	// of another handler. The audio pump stops the Z80 wherever its cycle budget
+	// runs out — routinely INSIDE the YM-timer IRQ tick handler (~5 music ticks
+	// per audio buffer), which is exactly the code that maintains channel state
+	// and issues SSG/FM note-offs. The old fixed z80_run(300) injected the
+	// command NMI right there, and the command processing trampled the tick
+	// handler's half-updated state: the note-off for the live SSG chord was
+	// never issued and the tone latched on forever (the stuck boot beep /
+	// character-select chord). On real hardware the Z80 runs continuously, so
+	// an NMI landing mid-tick is a microsecond-window fluke the driver
+	// tolerates; our chunked execution made it near-certain during command
+	// bursts. So: (1) if the Z80 is inside a handler or DI section (IFF1
+	// clear), first let it run back to EI/main-loop; (2) inject the NMI;
+	// (3) run the NMI handler to COMPLETION (RETN restores IFF1), so the 68k's
+	// busy-wait sees the real reply and never re-sends into a half-done
+	// handler. Both runs are cycle-capped so a driver phase that parks with DI
+	// (the boot jingle's RAM wait loop) cannot stall the 68k exception handler;
+	// on cap we inject/return anyway, which is exactly the old behavior.
+	if (!cpu.iff1 && !cpu.halted) {   // a DI+HALT park only an NMI can wake:
+		unsigned long cap = cpu.cyc + 1500;   // don't burn the cap stepping it
+		while (cpu.cyc < cap && !cpu.iff1 && !cpu.halted)
+			z80_step(&cpu);
+#ifdef SND_HEALTH
+		if (!cpu.iff1) g_nmi_precap++;
+#endif
+	}
+	z80_gen_nmi(&cpu);
+	{
+		unsigned long cap = cpu.cyc + 8000;
+		while (cpu.cyc < cap && (cpu.nmi_pending || !cpu.iff1)) {
+			z80_service_level_irq();
+			z80_step(&cpu);
+		}
+#ifdef SND_HEALTH
+		if (!cpu.iff1) g_nmi_postcap++;
+#endif
+	}
 }
 
 uint8_t sound_read_status(void) {
@@ -478,6 +535,27 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		uint32_t _zt0 = TICKS_READ();
 #endif
 		while (cpu.cyc < next) {
+			z80_service_level_irq();   // must precede the HALT check: a
+			                           // re-delivered tick wakes a halted CPU
+#ifndef MVS64_NOIDLESKIP
+			// A HALTed Z80 with nothing deliverable pending is pure dead time,
+			// but it defeats the back-branch idle-skip below (HALT never
+			// branches: each z80_step burns a flat 4 cycles in place) — the
+			// boot jingle's DI/HALT park cost ~1M single-steps per wall second,
+			// most of the boot-window Z80 load. Fast-forwarding to the next
+			// event boundary is EXACT, not heuristic: the only wake sources are
+			// the YM timer IRQ (which bounds `next`) and the command NMI
+			// (which arrives between pump calls). A pending-but-masked IRQ
+			// (DI+HALT) cannot wake it either — only an NMI can.
+			if (cpu.halted && !cpu.nmi_pending &&
+			    (!cpu.int_pending || !cpu.iff1)) {
+#ifdef SND_HEALTH
+				g_z80_skipcyc += (next - cpu.cyc); g_z80_skips++;
+#endif
+				cpu.cyc = next;
+				break;
+			}
+#endif
 			uint16_t pc0 = cpu.pc;
 			z80_wrote = 0;
 			z80_step(&cpu);
@@ -540,15 +618,29 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			// YM2610 over the 60-call interval — the audio cost split.
 			// lost = commands the 68k overwrote before the Z80 consumed them
 			// (cumulative); t = FM timer A/B armed (music engine tick source).
-			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu lost=%d t=%d%d\n",
+			// irqre = level-held YM IRQs the edge model had dropped and we
+			// re-delivered (each one was a lost music tick before this fix);
+			// nmiw  = command NMIs delivered mid-handler (pre-run cap hit) /
+			//         handlers that outran the completion cap.
+			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu lost=%d t=%d%d irqre=%d nmiw=%d,%d\n",
 				rms, pk, cpu.pc, sound_code,
 				g_z80_steps, g_z80_skips, g_z80_skipcyc,
 				(unsigned long)(g_prof_z80t / (TICKS_PER_SECOND / 1000)),
 				(unsigned long)(g_prof_ymt / (TICKS_PER_SECOND / 1000)),
-				g_cmd_lost, ym_timer_on[0], ym_timer_on[1]);
+				g_cmd_lost, ym_timer_on[0], ym_timer_on[1],
+				g_irq_redeliver, g_nmi_precap, g_nmi_postcap);
 			plat_log("[SNDTMR] fires=%d,%d\n", g_timer_fires[0], g_timer_fires[1]);
 			g_timer_fires[0] = g_timer_fires[1] = 0;
 			g_prof_z80t = 0; g_prof_ymt = 0;
+			{
+				// Latched-voice hunt: snapshot every tone-holding state element
+				// (SSG regs, FM key/EG state, ADPCM activity). A channel that
+				// stays hot for many seconds while the stuck tone is audible
+				// is the culprit; see ym2610_dbg_state for field meanings.
+				char ymst[128];
+				ym2610_dbg_state(ymst, sizeof ymst);
+				plat_log("[YMSTATE] %s\n", ymst);
+			}
 #ifdef MVS64_YMPROF
 			{
 				extern uint32_t ym_prof[5];
