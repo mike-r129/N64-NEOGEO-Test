@@ -149,26 +149,21 @@ static uint8_t *vrom_resident;
 // voice, a negligible PI load. Fetches happen only during synthesis (audio-pump
 // context, normal C), never inside the 68k MMIO exception handler (key-on just
 // arms the channel), so the PI DMA here is safe.
-#define VWIN_SIZE 2048
-static struct vwin {
-	uint32_t base;
-	int      valid;
-	uint8_t  buf[VWIN_SIZE] __attribute__((aligned(16)));
-} vwin[7];
+// Windows are defined in ym2610.h so the per-byte hit path can be inlined
+// into the ADPCM decoders (it used to be a cross-TU call per nibble pair).
+struct ym2610_vwin ym2610_vwin[7];
 
-uint8_t ym2610_vrom_fetch(int win, uint32_t addr) {
-	struct vwin *w = &vwin[win];
-	uint32_t base = addr & ~(uint32_t)(VWIN_SIZE - 1);
-	if (!w->valid || w->base != base) {
-		int len = VWIN_SIZE;
-		if (base + (uint32_t)len > v_rom_size) {
-			len = (int)(v_rom_size - base);   // addr < v_rom_size is guaranteed
-			if (len <= 0) return 0;           // by the pcmsize clamp upstream
-		}
-		vrom_read(base, w->buf, len);
-		w->base = base; w->valid = 1;
+uint8_t ym2610_vrom_fetch_slow(int win, uint32_t addr) {
+	struct ym2610_vwin *w = &ym2610_vwin[win];
+	uint32_t base = addr & ~(uint32_t)(YM2610_VWIN_SIZE - 1);
+	int len = YM2610_VWIN_SIZE;
+	if (base + (uint32_t)len > v_rom_size) {
+		len = (int)(v_rom_size - base);   // addr < v_rom_size is guaranteed
+		if (len <= 0) return 0;           // by the pcmsize clamp upstream
 	}
-	return w->buf[addr & (VWIN_SIZE - 1)];
+	vrom_read(base, w->buf, len);
+	w->base = base; w->valid = 1;
+	return w->buf[addr & (YM2610_VWIN_SIZE - 1)];
 }
 
 // --- YM2610 timer/IRQ glue (cycle-based) -----------------------------------

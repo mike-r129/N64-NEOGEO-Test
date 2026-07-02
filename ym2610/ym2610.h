@@ -31,8 +31,23 @@ int ym2610_dbg_state(char *o, int n);
 /* MVS64: streamed ADPCM sample fetch, implemented by the sound module. Used
  * when the ADPCM sample ROM is not resident (pcmbuf NULL but pcmsize > 0): the
  * 7MB NeoGeo v.rom cannot live in RDRAM, so bytes come from small per-voice
- * window caches backed by cart streaming. win 0-5 = ADPCM-A ch, 6 = ADPCM-B. */
-u8 ym2610_vrom_fetch(int win, u32 addr);
+ * window caches backed by cart streaming. win 0-5 = ADPCM-A ch, 6 = ADPCM-B.
+ * The hit path is inlined here (one fetch per decoded byte, synthesis-hot);
+ * only a window miss calls into the sound module to stream from cart. */
+#define YM2610_VWIN_SIZE 2048
+struct ym2610_vwin {
+	u32 base;
+	int valid;
+	u8  buf[YM2610_VWIN_SIZE] __attribute__((aligned(16)));
+};
+extern struct ym2610_vwin ym2610_vwin[7];
+u8 ym2610_vrom_fetch_slow(int win, u32 addr);
+static inline u8 ym2610_vrom_fetch(int win, u32 addr) {
+	struct ym2610_vwin *w = &ym2610_vwin[win];
+	if (w->valid && w->base == (addr & ~(u32)(YM2610_VWIN_SIZE - 1)))
+		return w->buf[addr & (YM2610_VWIN_SIZE - 1)];
+	return ym2610_vrom_fetch_slow(win, addr);
+}
 
 typedef s16 FMSAMPLE;
 typedef s32 FMSAMPLE_MIX;
