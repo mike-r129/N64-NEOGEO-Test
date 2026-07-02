@@ -153,14 +153,17 @@ void plat_audio_pump(void) {
 
     // Sustained-underrun detection: owing more than the whole AI buffer set
     // means we can't generate real-time audio fast enough (the boot voice/jingle
-    // is Z80-CPU-bound on N64). Drop the excess debt and tell sound_gen_samples
-    // to emit silence — the user hears clean silence instead of the AI replaying
-    // a stale buffer as a stuck note. The Z80 still advances (handshake/timers
-    // intact). sound_silent is set from the PREVIOUS pass's streak so a single
-    // slow frame isn't muted.
+    // is Z80-CPU-bound on N64). Drop the debt to ONE buffer and tell
+    // sound_gen_samples to emit silence. Dropping to one buffer (not the full
+    // set) matters: while overloaded the governor below processes only one
+    // buffer per pass, so a 4-buffer debt could never be repaid below ~25fps and
+    // a single stall (e.g. character-select loading hitch) trapped the pump in
+    // silent+starved mode permanently — audible as a stuck replay tone. The Z80
+    // still advances (handshake/timers intact). sound_silent is set from the
+    // PREVIOUS pass's streak so a single slow frame isn't muted.
     sound_silent = (underrun_streak >= 1);
     if (due > AI_NUM_BUFFERS * buflen) {
-        due = AI_NUM_BUFFERS * buflen;
+        due = buflen;
         if (underrun_streak < 1000) underrun_streak++;
     } else {
         underrun_streak = 0;
@@ -194,6 +197,25 @@ void plat_audio_pump(void) {
         due -= n;
         discarded++;
     }
+
+    // ANTI-REPLAY: when the AI DMA queue runs dry, the hardware REPLAYS its
+    // last buffer forever — the "stuck high-pitch tone" heard at boot and in
+    // character select. While overloaded we deliver few/no generated buffers
+    // (the governor above), so top up EVERY remaining free AI buffer with pure
+    // silence: no sound generation, no debt consumed, just packed zero stores
+    // (~µs). Generated audio in this state is zeros anyway (sound_silent), so
+    // the stream stays seamless; once the overload ends, real audio resumes
+    // behind at most one queue's worth (~160ms) of clean silence.
+    int silfill = 0;
+    if (underrun_streak >= 1) {
+        while (audio_can_write()) {
+            uint32_t *out = (uint32_t *)audio_write_begin();
+            for (int i = 0; i < buflen; i++)
+                out[i] = 0;
+            audio_write_end();
+            silfill++;
+        }
+    }
 #ifdef SND_HEALTH
     // Delivery-health probe (USB/ISViewer). buffers/60 ~= real-time delivery
     // rate; discard>0 = the AI is not draining (broken emulator AI — never on
@@ -204,16 +226,22 @@ void plat_audio_pump(void) {
     //            synthesis alone can't keep up -> the fundamental perf wall.
     {
         static int pumps = 0, total = 0, deep = 0, maxf = 0, disc = 0;
+        static int sil = 0, dry = 0;
         static uint32_t tacc = 0;
         tacc += TICKS_DISTANCE(_t0, TICKS_READ());
         total += filled; if (filled > maxf) maxf = filled;
         disc += discarded;
+        sil += silfill;
+        // dry: the whole queue was free at pass start = the AI had fully
+        // drained = the hardware was replaying its last buffer. Must stay 0
+        // (except the very first pass) or a stuck tone was audible.
+        if (filled + silfill >= AI_NUM_BUFFERS && pumps > 0) dry++;
         if (underrun_streak) deep++;
         if ((pumps++ % 60) == 0) {
-            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d due=%d sndms=%.2f silent=%d\n",
-                     pumps, total, maxf, deep, disc, due,
+            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d sil=%d dry=%d due=%d sndms=%.2f silent=%d\n",
+                     pumps, total, maxf, deep, disc, sil, dry, due,
                      (float)tacc * 1000.f / (float)TICKS_PER_SECOND / 60.f, sound_silent);
-            total = 0; maxf = 0; tacc = 0; disc = 0; deep = 0;
+            total = 0; maxf = 0; tacc = 0; disc = 0; deep = 0; sil = 0; dry = 0;
             // Commit the SD log to the card so it survives a power-off. FatFs only
             // writes the directory entry (file size) on close, so we close+reopen
             // in append mode here; until this runs the file can appear empty on a
