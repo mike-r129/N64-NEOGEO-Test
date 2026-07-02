@@ -497,13 +497,16 @@ typedef struct {
 	s32 volume; /* envelope counter */
 	u32 sl; /* sustain level:sl_table[SL] */
 	u32 vol_out; /* current output from EG circuit (without AM from LFO) */
-	u8 eg_sh_ar; /*  (attack state) */
+	/* MVS64: the four per-state EG rate shifts live in one array indexed by
+	 * SLOT->state (EG_REL/SUS/DEC/ATT; [EG_OFF] unused), so the envelope
+	 * advance can test "is this slot due at this eg_cnt" with one load
+	 * before entering the state switch. The original field names are
+	 * macro-aliased right below, so every existing reader/writer compiles
+	 * unchanged and the array stays the single source of truth. */
+	u8 eg_shv[5];
 	u8 eg_sel_ar; /*  (attack state) */
-	u8 eg_sh_d1r; /*  (decay state) */
 	u8 eg_sel_d1r; /*  (decay state) */
-	u8 eg_sh_d2r; /*  (sustain state) */
 	u8 eg_sel_d2r; /*  (sustain state) */
-	u8 eg_sh_rr; /*  (release state) */
 	u8 eg_sel_rr; /*  (release state) */
 	u8 ssg; /* SSG-EG waveform */
 	u8 ssgn; /* SSG-EG negated output */
@@ -511,6 +514,12 @@ typedef struct {
 	/* LFO */u32 AMmask; /* AM enable flag */
 
 } FM_SLOT;
+
+/* MVS64: aliases for the eg_shv[] state-indexed array (see FM_SLOT). */
+#define eg_sh_ar  eg_shv[EG_ATT]
+#define eg_sh_d1r eg_shv[EG_DEC]
+#define eg_sh_d2r eg_shv[EG_SUS]
+#define eg_sh_rr  eg_shv[EG_REL]
 
 typedef struct {
 	FM_SLOT SLOT[4]; /* four SLOTs (operators) */
@@ -1107,6 +1116,20 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 		 * below behaves exactly as before). On samsho2's sparse FM usage this
 		 * skips most of the EG work. */
 		if (SLOT->state == EG_OFF && !swap_flag) {
+			SLOT++;
+			i--;
+			continue;
+		}
+
+		/* MVS64 exact-skip: a slot's envelope only advances when eg_cnt
+		 * lands on its current state's rate mask. Off-mask, neither volume
+		 * nor state nor ssgn can change, and vol_out was already computed
+		 * from these exact inputs the last time the slot WAS due (or at
+		 * key-on/TL write), so skipping the whole body is bit-exact.
+		 * A pending swap_flag forces the full path: the SSG swap must
+		 * still be applied to the channel's remaining slots. */
+		if (!swap_flag
+		    && (OPN->eg_cnt & ((1u << SLOT->eg_shv[SLOT->state]) - 1))) {
 			SLOT++;
 			i--;
 			continue;
