@@ -1268,6 +1268,64 @@ INLINE void advance_eg_channel(u32 eg_cnt, FM_SLOT *SLOT) {
 
 #define volume_calc(OP) ((OP)->vol_out + (AM & (OP)->AMmask))
 
+/* Advance the four phase counters of an LFO-PM'd channel by one sample.
+ * MVS64: extracted from chan_calc's tail so the silent-channel fast path can
+ * keep phases (and the pm_dp cache) exact without computing any output.
+ *
+ * The four PM'd phase deltas depend only on (LFO_PM, block_fnum) and slot
+ * DT/mul (invalidated via refresh_fc_eg_chan). LFO_PM only steps every few
+ * dozen samples and notes change far slower, so cache the delta stack instead
+ * of redoing the table+multiply work every sample. Values are bit-identical. */
+INLINE void update_phase_lfo(FM_OPN *OPN, FM_CH *CH, u32 lfo_pm) {
+	/* add support for 3 slot mode */
+
+	u32 block_fnum = CH->block_fnum;
+
+	u32 pm_key = (lfo_pm << 17) | block_fnum;
+	if (pm_key != CH->pm_key) {
+		u32 fnum_lfo = ((block_fnum & 0x7f0) >> 4) * 32 * 8;
+		s32 lfo_fn_table_index_offset =
+				lfo_pm_table[fnum_lfo + CH->pms + lfo_pm];
+
+		CH->pm_key = pm_key;
+		if (lfo_fn_table_index_offset) /* LFO phase modulation active */
+		{
+			u8 blk;
+			u32 fn;
+			int kc, fc;
+
+			block_fnum = block_fnum * 2 + lfo_fn_table_index_offset;
+
+			blk = (block_fnum & 0x7000) >> 12;
+			fn = block_fnum & 0xfff;
+
+			/* keyscale code */
+			kc = (blk << 2) | opn_fktable[fn >> 8];
+			/* phase increment counter */
+			fc = OPN->fn_table[fn] >> (7 - blk);
+
+			CH->pm_dp[0] = ((fc + CH->SLOT[SLOT1].DT[kc])
+					* CH->SLOT[SLOT1].mul) >> 1;
+			CH->pm_dp[1] = ((fc + CH->SLOT[SLOT2].DT[kc])
+					* CH->SLOT[SLOT2].mul) >> 1;
+			CH->pm_dp[2] = ((fc + CH->SLOT[SLOT3].DT[kc])
+					* CH->SLOT[SLOT3].mul) >> 1;
+			CH->pm_dp[3] = ((fc + CH->SLOT[SLOT4].DT[kc])
+					* CH->SLOT[SLOT4].mul) >> 1;
+		} else /* LFO phase modulation  = zero */
+		{
+			CH->pm_dp[0] = CH->SLOT[SLOT1].Incr;
+			CH->pm_dp[1] = CH->SLOT[SLOT2].Incr;
+			CH->pm_dp[2] = CH->SLOT[SLOT3].Incr;
+			CH->pm_dp[3] = CH->SLOT[SLOT4].Incr;
+		}
+	}
+	CH->SLOT[SLOT1].phase += CH->pm_dp[0];
+	CH->SLOT[SLOT2].phase += CH->pm_dp[1];
+	CH->SLOT[SLOT3].phase += CH->pm_dp[2];
+	CH->SLOT[SLOT4].phase += CH->pm_dp[3];
+}
+
 /* MVS64: the LFO position comes in by VALUE (precomputed per sample by the
  * channel-major update loop) instead of via the LFO_AM/LFO_PM globals — the
  * globals would be reloaded after every *CH->connect store (aliasing). */
@@ -1321,59 +1379,7 @@ INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH, u32 lfo_am, u32 lfo_pm) {
 
 	/* update phase counters AFTER output calculations */
 	if (CH->pms) {
-
-		/* add support for 3 slot mode */
-
-		u32 block_fnum = CH->block_fnum;
-
-		/* MVS64: the four PM'd phase deltas depend only on (LFO_PM,
-		 * block_fnum) and slot DT/mul (invalidated via refresh_fc_eg_chan).
-		 * LFO_PM only steps every few dozen samples and notes change far
-		 * slower, so cache the delta stack instead of redoing the
-		 * table+multiply work every sample. Values are bit-identical. */
-		u32 pm_key = (lfo_pm << 17) | block_fnum;
-		if (pm_key != CH->pm_key) {
-			u32 fnum_lfo = ((block_fnum & 0x7f0) >> 4) * 32 * 8;
-			s32 lfo_fn_table_index_offset =
-					lfo_pm_table[fnum_lfo + CH->pms + lfo_pm];
-
-			CH->pm_key = pm_key;
-			if (lfo_fn_table_index_offset) /* LFO phase modulation active */
-			{
-				u8 blk;
-				u32 fn;
-				int kc, fc;
-
-				block_fnum = block_fnum * 2 + lfo_fn_table_index_offset;
-
-				blk = (block_fnum & 0x7000) >> 12;
-				fn = block_fnum & 0xfff;
-
-				/* keyscale code */
-				kc = (blk << 2) | opn_fktable[fn >> 8];
-				/* phase increment counter */
-				fc = OPN->fn_table[fn] >> (7 - blk);
-
-				CH->pm_dp[0] = ((fc + CH->SLOT[SLOT1].DT[kc])
-						* CH->SLOT[SLOT1].mul) >> 1;
-				CH->pm_dp[1] = ((fc + CH->SLOT[SLOT2].DT[kc])
-						* CH->SLOT[SLOT2].mul) >> 1;
-				CH->pm_dp[2] = ((fc + CH->SLOT[SLOT3].DT[kc])
-						* CH->SLOT[SLOT3].mul) >> 1;
-				CH->pm_dp[3] = ((fc + CH->SLOT[SLOT4].DT[kc])
-						* CH->SLOT[SLOT4].mul) >> 1;
-			} else /* LFO phase modulation  = zero */
-			{
-				CH->pm_dp[0] = CH->SLOT[SLOT1].Incr;
-				CH->pm_dp[1] = CH->SLOT[SLOT2].Incr;
-				CH->pm_dp[2] = CH->SLOT[SLOT3].Incr;
-				CH->pm_dp[3] = CH->SLOT[SLOT4].Incr;
-			}
-		}
-		CH->SLOT[SLOT1].phase += CH->pm_dp[0];
-		CH->SLOT[SLOT2].phase += CH->pm_dp[1];
-		CH->SLOT[SLOT3].phase += CH->pm_dp[2];
-		CH->SLOT[SLOT4].phase += CH->pm_dp[3];
+		update_phase_lfo(OPN, CH, lfo_pm);
 	} else /* no LFO phase modulation */
 	{
 		CH->SLOT[SLOT1].phase += CH->SLOT[SLOT1].Incr;
@@ -3096,6 +3102,49 @@ void YM2610Update_stream(int length) {
 				const u32 panl = OPN->pan[fmn[j] * 2 + 0];
 				const u32 panr = OPN->pan[fmn[j] * 2 + 1];
 				u32 cnt = eg_base;
+
+				/* MVS64: silent-channel fast path. If all four slots are
+				 * parked in EG_OFF at >= ENV_QUIET attenuation, and the
+				 * feedback/MEM history has already decayed to zero, the
+				 * channel contributes exact zero for the whole chunk and no
+				 * per-sample work can change its state: EG_OFF slots are
+				 * no-ops in advance_eg_channel (vol_out frozen; key-on and
+				 * register writes only happen between update calls), quiet
+				 * ops produce no output for ANY AM (AM only attenuates
+				 * further), and with op1_out/mem_value zero chan_calc would
+				 * compute all-zero connections and leave them zero. Only the
+				 * phase counters still advance — batch them. The vol_out
+				 * check (not just EG_OFF) keeps the SSG-EG negate quirk
+				 * exact: a negated EG_OFF slot can sit at LOW attenuation.
+				 * samsho2 leaves most FM channels keyed off most of the
+				 * time, so this skips the bulk of pass 1 in-game. */
+				if (CH->SLOT[SLOT1].state == EG_OFF
+				    && CH->SLOT[SLOT2].state == EG_OFF
+				    && CH->SLOT[SLOT3].state == EG_OFF
+				    && CH->SLOT[SLOT4].state == EG_OFF
+				    && CH->SLOT[SLOT1].vol_out >= ENV_QUIET
+				    && CH->SLOT[SLOT2].vol_out >= ENV_QUIET
+				    && CH->SLOT[SLOT3].vol_out >= ENV_QUIET
+				    && CH->SLOT[SLOT4].vol_out >= ENV_QUIET
+				    && CH->op1_out[0] == 0 && CH->op1_out[1] == 0
+				    && CH->mem_value == 0) {
+					if (CH->pms) {
+						/* per-sample deltas (LFO-PM), phases stay exact */
+						for (i = 0; i < n; i++)
+							update_phase_lfo(OPN, CH, lfo_pm[i]);
+					} else {
+						CH->SLOT[SLOT1].phase +=
+								(u32) CH->SLOT[SLOT1].Incr * (u32) n;
+						CH->SLOT[SLOT2].phase +=
+								(u32) CH->SLOT[SLOT2].Incr * (u32) n;
+						CH->SLOT[SLOT3].phase +=
+								(u32) CH->SLOT[SLOT3].Incr * (u32) n;
+						CH->SLOT[SLOT4].phase +=
+								(u32) CH->SLOT[SLOT4].Incr * (u32) n;
+					}
+					continue;
+				}
+
 				for (i = 0; i < n; i++) {
 					u32 t = egt[i];
 					s32 o;
