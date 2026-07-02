@@ -61,6 +61,14 @@ static void rom_cache_init(void) {
 	sprite_cache_init(&crom_cache, 8*16, 1280);
 }
 
+// fread whose short-read is tolerated (EOF-bounded lookahead, cache fills
+// from known-good files). Exists to satisfy -Werror=unused-result on the
+// PC build without changing behavior.
+static inline void fread_ok(void *dst, size_t sz, FILE *f) {
+	size_t got = fread(dst, 1, sz, f);
+	(void)got;
+}
+
 uint8_t* srom_get_sprite(int spritenum) {
 	if (spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
 	uint8_t *pix = sprite_cache_lookup(&srom_cache, spritenum);
@@ -77,7 +85,7 @@ uint8_t* srom_get_sprite(int spritenum) {
 	profile_dma_load += TICKS_READ();
 	#else
 	fseek(srom_file, spritenum*4*8, SEEK_SET);
-	fread(pix, 1, 4*8, srom_file);
+	fread_ok(pix, 4*8, srom_file);
 	#endif
 
 	return pix;
@@ -101,7 +109,7 @@ uint8_t* crom_get_sprite(int spritenum) {
 	profile_dma_load += TICKS_READ();
 	#else
 	fseek(crom_file, spritenum*8*16, SEEK_SET);
-	fread(pix, 1, 8*16, crom_file);
+	fread_ok(pix, 8*16, crom_file);
 	#endif
 
 	return pix;
@@ -267,7 +275,7 @@ void pbrom_init(const char *fn) {
 	dfs_read(PB_ROM, 1, len, pbrom_file);
 	dfs_close(pbrom_file); pbrom_file = -1;
 	#else
-	fread(PB_ROM, 1, len, pbrom_file);
+	fread_ok(PB_ROM, len, pbrom_file);
 	fclose(pbrom_file); pbrom_file = NULL;
 	#endif
 	pbrom_is_linear = true;
@@ -338,7 +346,7 @@ uint8_t *pbrom_cache_lookup(uint32_t address) {
 	dfs_read(mem, 1, (1<<PBROM_BANK_BITS)+2, pbrom_file);
 	#else
 	fseek(pbrom_file, base, SEEK_SET);
-	fread(mem, 1, (1<<PBROM_BANK_BITS)+2, pbrom_file);
+	fread_ok(mem, (1<<PBROM_BANK_BITS)+2, pbrom_file);
 	#endif
 
 	pbrom_last_mem = mem;
@@ -450,7 +458,7 @@ void vrom_read(uint32_t offset, uint8_t *buf, int len) {
 	#else
 	if (!vrom_file) { memset(buf, 0, len); return; }
 	fseek(vrom_file, offset, SEEK_SET);
-	fread(buf, 1, len, vrom_file);
+	fread_ok(buf, len, vrom_file);
 	#endif
 }
 
@@ -470,7 +478,8 @@ void rom_load(const char *dir) {
 	strcat(ini, "game.ini");
 	FILE *f = fopen(ini, "rb");
 	if (f) {
-		fread(ini, 1, sizeof(ini), f);
+		size_t n = fread(ini, 1, sizeof(ini) - 1, f);
+		ini[n] = 0;   // also fixes the unterminated-buffer parse
 		fclose(f);
 
 		bool ok;
