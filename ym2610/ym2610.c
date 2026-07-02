@@ -3449,3 +3449,40 @@ STATE_LOAD( ym2610 )
 }
 
 #endif /* SAVE_STATE */
+
+#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH)
+#include <stdio.h>
+// MVS64 diagnostic: one-line snapshot of every state element that can hold a
+// sustained tone, printed by sound_neogeo.c's [SNDRMS] telemetry (~1/s). Used
+// to identify WHICH voice is latched during the "stuck boot beep" bug:
+//   en       = SSG enable reg 0x07 (ACTIVE-LOW: bit clear = tone/noise ON)
+//   v        = SSG volume regs 0x08-0x0A (bit4 = envelope mode)
+//   p        = SSG tone periods (pitch of a stuck square wave)
+//   fmkey    = FM key-on bits (ch*4+slot); a bit held for many seconds = stuck
+//   fmhot    = FM slots NOT in EG_OFF whose vol_out is audible (<512)
+//   offhot   = FM slots parked in EG_OFF whose vol_out is still audible —
+//              nonzero means the EG_OFF-skip optimization left stale volume
+//   ab       = ADPCM-B port state (bit7 busy; looping sample = stuck sound)
+int ym2610_dbg_state(char *o, int n) {
+	unsigned fmkey = 0, fmhot = 0, offhot = 0;
+	for (int c = 0; c < 6; c++)
+		for (int s = 0; s < 4; s++) {
+			const FM_SLOT *sl = &YM2610.CH[c].SLOT[s];
+			if (sl->key) fmkey |= 1u << (c * 4 + s);
+			if (sl->vol_out < 512) {
+				if (sl->state != EG_OFF) fmhot |= 1u << (c * 4 + s);
+				else                     offhot |= 1u << (c * 4 + s);
+			}
+		}
+	unsigned aa = 0;
+	for (int c = 0; c < 6; c++)
+		if (YM2610.adpcma[c].flag) aa |= 1u << c;
+	return snprintf(o, n,
+		"en=%02x v=%02x,%02x,%02x p=%03x,%03x,%03x fmkey=%06x fmhot=%06x offhot=%06x aa=%02x ab=%02x",
+		YM2610.regs[0x07], YM2610.regs[0x08], YM2610.regs[0x09], YM2610.regs[0x0A],
+		((YM2610.regs[1] & 0xf) << 8) | YM2610.regs[0],
+		((YM2610.regs[3] & 0xf) << 8) | YM2610.regs[2],
+		((YM2610.regs[5] & 0xf) << 8) | YM2610.regs[4],
+		fmkey, fmhot, offhot, aa, YM2610.adpcmb.portstate);
+}
+#endif
