@@ -222,10 +222,13 @@ void plat_audio_pump(void) {
 
     // Top the ring up toward TARGET_LEAD. The ISR consumes exactly n frames
     // per callback, so lead is always a multiple of n.
+    extern uint32_t profile_snd;
     while (filled < pass_budget) {
         uint32_t lead = aring_wr - aring_rd;
         if (lead + (uint32_t)n > TARGET_LEAD) break;   // topped up
+        uint32_t snd_t0 = TICKS_READ();
         sound_gen_samples(stage, n);
+        profile_snd += TICKS_DISTANCE(snd_t0, TICKS_READ());
         uint32_t wr = aring_wr;
         for (int i = 0; i < n; i++) {
             uint32_t s = (wr + i) & (ARING_FRAMES - 1);
@@ -264,7 +267,9 @@ void plat_audio_pump(void) {
         last_t = now;
         last_rd = rd_now;
         if (filled == 0 && wall_due >= 2 * n) {
+            uint32_t snd_t0 = TICKS_READ();
             sound_gen_samples(stage, n);
+            profile_snd += TICKS_DISTANCE(snd_t0, TICKS_READ());
             wall_due -= n;
             discarded++;
         }

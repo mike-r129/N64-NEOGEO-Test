@@ -163,12 +163,20 @@ static uint64_t m68k_clock;
 static EmuEvent events[MAX_EVENTS];
 uint32_t profile_hw_io;
 uint32_t profile_dma_load;
+uint32_t profile_m68k;   // ticks inside the 68k core this frame (incl. MMIO)
+uint32_t profile_snd;    // ticks synthesizing audio (Z80+YM2610) this frame
 
 static uint64_t m68k_exec(uint64_t clock) {
 	clock /= M68K_CLOCK_DIV;
 	if (clock > m68k_clock) {
 		#ifdef USE_M64K
+		#ifdef N64
+		uint32_t t0 = TICKS_READ();
 		m68k_clock = m64k_run(&m64k, clock);
+		profile_m68k += TICKS_DISTANCE(t0, TICKS_READ());
+		#else
+		m68k_clock = m64k_run(&m64k, clock);
+		#endif
 		#else
 		m68k_clock += m68k_execute(clock - m68k_clock);
 		#endif
@@ -422,6 +430,8 @@ int main(int argc, char *argv[]) {
 		render_time = 0;
 		profile_hw_io = 0;
 		profile_dma_load = 0;
+		profile_m68k = 0;
+		profile_snd = 0;
 		#ifdef N64
 		uint32_t t0 = TICKS_READ();
 		#endif
@@ -485,8 +495,10 @@ int main(int argc, char *argv[]) {
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());
 
-		framef("[PROFILE] cpu:%.2f%% io:%.2f%% draw:%.2f%% dma:%.2f%% PC:%06lx\n",
+		framef("[PROFILE] cpu:%.2f%% m68k:%.2f%% snd:%.2f%% io:%.2f%% draw:%.2f%% dma:%.2f%% PC:%06lx\n",
 			(float)emu_time * 100.f / (float)(TICKS_PER_SECOND / 60),
+			(float)profile_m68k * 100.f / (float)(TICKS_PER_SECOND / 60),
+			(float)profile_snd * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)profile_hw_io * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)render_time * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)profile_dma_load * 100.f / (float)(TICKS_PER_SECOND / 60),
