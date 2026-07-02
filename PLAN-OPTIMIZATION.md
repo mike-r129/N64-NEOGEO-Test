@@ -4,6 +4,39 @@
 > Goal: raise framerate toward 60fps **without frameskip** and **without deviating from the
 > original arcade experience** (cycle timing, audio sync, input feel must stay intact).
 
+## ⚠️⚠️ Empirical update (2026-07-02 overnight session) — THE WALL IS SOUND, NOT THE 68K
+
+A new `[PROFILE] m68k%/snd%` split (af95d16) corrected this plan's central premise: the old
+`cpu ~235-272%` bucket lumped the 68k core together with **real-time audio synthesis**. In a
+real match (not attract/menus, which is what the old numbers measured): **m68k ≈ 94-120% of
+frame budget; snd (Z80+YM2610 synthesis) ≈ 280-530% — audio is the dominant wall.** The AI
+pump synthesizes wall-clock real-time 11025Hz audio regardless of game speed, so at low fps
+audio eats 50-75% of ALL wall time. YMPROF section split in-match: FM 38%, EG 29%, ADPCM 23%,
+SSG 8%, mix 2%.
+
+Landed 2026-07-02 (all gated by TomHarte testsuite 125/126 and/or a **bit-identical WAV** on a
+3600-frame deterministic scripted PC run):
+- 81e7d26 m64k dispatch slim (main loop 10→6 insns; TLB handler owns ts_cur + forced slice
+  exits with exact cycle accounting) — took in-match m68k to ~real-time budget.
+- ea6a4c8 M64K_BLOCKOPS: fused DBF copy/fill loops incl. the `move.w (A0)+,(A4=VRAM port)`
+  SCB upload (was one TLB exception per word). Attract 23.5→30+fps.
+- d17aced ADDQ/SUBQ testsuite coverage (Musashi-oracle generator).
+- 73204cf/4b8e417 ym2610 table shrink: 16-bit tables, then tl_tab collapsed to a 512-byte
+  base + shift/negate (VR4300 dcache is 8KB direct-mapped; the 13-26KB table thrashed it).
+- 110f2ce EG exact-skip (state-indexed rate-shift array; skip off-mask slots).
+- 7f30c76 LFO-PM phase-delta cache; d1d3b93 inlined streamed-ADPCM window fetch.
+- 4b29c4d **-O3 on audio TUs REGRESSED snd ~+40% (icache bloat) — keep -O2.**
+
+Measured (ares, 300s AUTOINPUT protocol, in-match window = the real fight):
+17eb0d3 baseline 8.45fps → 4b8e417 **~14.9fps in-match (snd 261%, m68k ~110%, draw 33%,
+io 9.5%), menus ~27-30fps**. Guest frames/300s: 3784→4949.
+
+Next levers, in expected-value order: (1) **RSP YM2610/ADPCM offload** — the only step-change
+available for snd (weeks); (2) batch-per-channel synthesis rewrite (register-resident state,
+maybe 1.3-1.8x on FM+EG, WAV-gateable); (3) io read fast-path (input ports/VRAM read, ~3-5%);
+(4) m64k rank 4/14 (MOVE/Bcc dominate: 19.8%/14.1% of productive cycles); (5) draw (33%).
+The 2026-06-19 roadmap below is retained for history but its cpu-centric ranking is obsolete.
+
 ## ⚠️ Empirical update (2026-06-19, after implementing rank 1)
 
 Rank 1 (idle-skip) was implemented and **measured**, which corrected the plan's central
