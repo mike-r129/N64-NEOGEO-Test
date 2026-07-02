@@ -17,6 +17,15 @@
 // opcode bugs are investigated. USE_M64K gates only the 68k-core integration;
 // the libdragon platform stays under N64.
 
+// MVS64_QUIET: silence per-frame debugf tracing for release builds. On N64
+// every debugf is an ISViewer/USB write (PI transactions) — several lines per
+// frame cost real frame time on hardware and flood emulator logs.
+#ifdef MVS64_QUIET
+#define framef(...) ((void)0)
+#else
+#define framef(...) debugf(__VA_ARGS__)
+#endif
+
 #define MVS_CLOCK         24000000
 #define M68K_CLOCK_DIV    2
 #define FPS        		  60

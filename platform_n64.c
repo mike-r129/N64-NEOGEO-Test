@@ -166,8 +166,16 @@ void plat_audio_pump(void) {
         underrun_streak = 0;
     }
 
+    // Overload governor: in sustained underrun (sound_silent set), generation
+    // is slower than real time and the output is zeros anyway, so wall-locking
+    // the Z80 only burns the frame budget stepping it — the boot jingle's
+    // Z80-bound phase dropped the whole machine to ~4fps this way. Process at
+    // most ONE buffer per pass while overloaded (the debt clamp above drops the
+    // rest); the machine then slows uniformly instead of audio starving video.
+    int pass_budget = (underrun_streak >= 1) ? 1 : AI_NUM_BUFFERS;
+
     int filled = 0, discarded = 0;
-    while (due >= buflen && audio_can_write()) {
+    while (due >= buflen && filled < pass_budget && audio_can_write()) {
         short *out = audio_write_begin();
         sound_gen_samples((int16_t *)out, buflen);
         audio_write_end();
@@ -179,7 +187,7 @@ void plat_audio_pump(void) {
     // the 68k<->Z80 handshake cannot starve. Never triggers on real hardware
     // (there the AI frees buffers at exactly the debt rate); the 2-buffer slack
     // absorbs scheduling jitter so a legit briefly-full queue is left alone.
-    if (due >= 2 * buflen) {
+    if (due >= 2 * buflen && filled < pass_budget) {
         static int16_t discard[2048 * 2];
         int n = buflen <= 2048 ? buflen : 2048;
         sound_gen_samples(discard, n);
