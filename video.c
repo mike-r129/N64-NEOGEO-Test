@@ -203,6 +203,11 @@ static void render_sprites(void) {
 
 
 void video_render(void) {
+#ifdef MVS64_NORENDER
+	// Diagnostic: skip all sprite/fix drawing (RSP/RDP) to isolate whether the
+	// ~frame-537 crash is in the N64 render path. Frames still flip (blank screen).
+	return;
+#endif
 	render_begin();
 	render_sprites();
 	render_fix();

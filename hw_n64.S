@@ -467,16 +467,49 @@ tlb_done_delayslot_jump26:
 	eret
 
 tlb_done_delayslot_indirect:
-	# TODO: not implemented. We just checked that this is a SPECIAL opcode
-	# (so it should be either JR or JALR). We only implment JR RA for now.
+	# SPECIAL opcode (JR/JALR). m64k's threaded interpreter dispatches via
+	# "jr t0/t1/t3" (m64k_asm.S optable jumps + rmw), so an m68k memory access
+	# (incl. the first MMIO read) can fault in one of those delay slots. Resolve
+	# them by jumping to the live register value (restored above). jr ra / jalr t7
+	# are the original cases. Anything else is a real bug -> tlbfallback.
 	li k1, 0x03e00008
 	beq k0, k1, tlb_done_delayslot_jr_ra
 	nop
 	li k1, 0x01e0f809
 	beq k0, k1, tlb_done_delayslot_jalr_t7
 	nop
+	li k1, 0x01000008          # jr t0
+	beq k0, k1, tlb_done_delayslot_jr_t0
+	nop
+	li k1, 0x01200008          # jr t1
+	beq k0, k1, tlb_done_delayslot_jr_t1
+	nop
+	li k1, 0x01600008          # jr t3
+	beq k0, k1, tlb_done_delayslot_jr_t3
+	nop
 	j tlbfallback
 	nop
+
+tlb_done_delayslot_jr_t0:
+	mtc0 t0, C0_EPC
+	nop  # 2 hazards before eret
+	nop
+	PROFILE_END
+	eret
+
+tlb_done_delayslot_jr_t1:
+	mtc0 t1, C0_EPC
+	nop
+	nop
+	PROFILE_END
+	eret
+
+tlb_done_delayslot_jr_t3:
+	mtc0 t3, C0_EPC
+	nop
+	nop
+	PROFILE_END
+	eret
 
 tlb_done_delayslot_jalr_t7:
 	mtc0 t7, C0_EPC

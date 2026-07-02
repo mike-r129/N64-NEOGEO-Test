@@ -1,5 +1,5 @@
 
-static uint8_t input_p1cnt_r(void) {
+static __attribute__((noinline)) uint8_t input_p1cnt_r(void) {
 	uint8_t state = 0;
 	state |= (~keystate[PLAT_KEY_P1_UP] & 1) << 0;
 	state |= (~keystate[PLAT_KEY_P1_DOWN] & 1) << 1;
@@ -12,7 +12,7 @@ static uint8_t input_p1cnt_r(void) {
 	return state;
 }
 
-static uint8_t input_status_a_r(void) {
+static __attribute__((noinline)) uint8_t input_status_a_r(void) {
 	uint8_t state = 0;
 
 	state |= (~keystate[PLAT_KEY_COIN_1] & 1) << 0;
@@ -26,7 +26,7 @@ static uint8_t input_status_a_r(void) {
 	return state;
 }
 
-static uint8_t input_status_b_r(void) {
+static __attribute__((noinline)) uint8_t input_status_b_r(void) {
 	uint8_t state = 0;
 
 	state |= (~keystate[PLAT_KEY_P1_START] & 1) << 0;

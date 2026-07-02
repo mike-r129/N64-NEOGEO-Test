@@ -5,7 +5,7 @@
 #include "roms.h"
 #include "video.h"
 #include "emu.h"
-#ifdef N64
+#ifdef USE_M64K
 #include "m64k/m64k.h"
 #else
 #include "m68k.h"
@@ -29,6 +29,7 @@ uint8_t P_ROM_VECTOR[0x80];
 uint8_t BIOS[128*1024];
 uint8_t WORK_RAM[64*1024] ALIGN_64K;
 uint8_t BACKUP_RAM[64*1024] ALIGN_64K;
+uint8_t MEMCARD_RAM[64*1024] ALIGN_64K;   // 68k bank 0x8 (memory card); open-bus 0xFF = no card
 uint16_t PALETTE_RAM[8*1024];  // two banks
 uint16_t VIDEO_RAM[34*1024];
 
@@ -72,7 +73,7 @@ void write_pbrom(uint32_t addr, uint32_t val, int sz) {
 		// If the PBROM area linearly mapped, update the mapping.
 		if (banks[0x2].mem) {
 			banks[0x2].mem = pbrom_linear() + val*0x100000;
-			#ifdef N64
+			#ifdef USE_M64K
 			extern m64k_t m64k;
 			m64k_map_memory(&m64k, 0x200000, 0x100000, banks[0x2].mem, false);
 			// m64k_map_memory_change(&m64k, pbrom_memid, banks[0x2].mem, false);
@@ -101,11 +102,17 @@ uint32_t read_pbrom(uint32_t addr, int sz) {
 	return *rom;
 }
 
-uint32_t read_hwio(uint32_t addr, int sz)  {
+#ifdef N64
+// I/O read trace ring buffer (boot-divergence debugging): last 1024 (68kPC,addr,val).
+volatile uint32_t io_trace[1024][3];
+volatile uint32_t io_trace_idx;
+#endif
+
+static uint32_t read_hwio_impl(uint32_t addr, int sz)  {
 	if (sz == 4) {
 		// NOTE: order is important
-		uint32_t val = read_hwio(addr+0, 2) << 16;
-		return val | read_hwio(addr+2, 2);
+		uint32_t val = read_hwio_impl(addr+0, 2) << 16;
+		return val | read_hwio_impl(addr+2, 2);
 	}
 
 	// Idle skip for RTC Wait Pulse in BIOS boot
@@ -142,6 +149,20 @@ uint32_t read_hwio(uint32_t addr, int sz)  {
 
 	// debugf("[HWIO] unknown read%d: %06x\n", sz*8, (unsigned int)addr);
 	return 0xFFFFFFFF;
+}
+
+uint32_t read_hwio(uint32_t addr, int sz)  {
+	uint32_t v = read_hwio_impl(addr, sz);
+#ifndef N64
+	{
+		extern int printf(const char *, ...);
+		extern char *getenv(const char *);
+		static int log = -1;
+		if (log < 0) log = getenv("MVS64_IOLOG") ? 1 : 0;
+		if (log) printf("[IO] pc=%06x a=%06x v=%04x\n", (unsigned)emu_pc(), (unsigned)addr, (unsigned)(v & 0xFFFF));
+	}
+#endif
+	return v;
 }
 
 void write_hwio(uint32_t addr, uint32_t val, int sz)  {
@@ -182,7 +203,7 @@ void write_hwio(uint32_t addr, uint32_t val, int sz)  {
 }
 
 
-#ifndef N64
+#ifndef USE_M64K
 
 unsigned int  m68k_read_memory_8(unsigned int address) {
 	Bank *b = &banks[(address>>20)&0xF];
@@ -260,6 +281,7 @@ void hw_init(void) {
 	uint8_t *PB_ROM = pbrom_linear();
 
 	memset(banks, 0, sizeof(banks));
+	memset(MEMCARD_RAM, 0xFF, sizeof(MEMCARD_RAM));   // no card inserted -> open-bus 0xFF (matches PC build)
 	memcpy(P_ROM_VECTOR, P_ROM, sizeof(P_ROM_VECTOR));
 	PALETTE_RAM_BANK = 0x0000;
 
@@ -271,10 +293,11 @@ void hw_init(void) {
 		banks[0x2] = (Bank){ NULL,         0xFFFFF,   read_pbrom,      write_pbrom };
 	banks[0x3] = (Bank){ NULL,             0x00000,   read_hwio,       write_hwio };
 	banks[0x4] = (Bank){ NULL,             0x00000,   video_palette_r, video_palette_w };
+	banks[0x8] = (Bank){ MEMCARD_RAM,      0x0FFFF,   NULL,            write_unk };
 	banks[0xC] = (Bank){ BIOS,             0x1FFFF,   NULL,            write_unk };
 	banks[0xD] = (Bank){ BACKUP_RAM,       0x0FFFF,   NULL,            write_unk };
 
-	#ifdef N64
+	#ifdef USE_M64K
 	extern m64k_t m64k;
 	disable_interrupts();
 
@@ -284,6 +307,7 @@ void hw_init(void) {
 	if (PB_ROM) {
 		m64k_map_memory(&m64k, 0x200000, 0x100000, PB_ROM+0x000000, false);
 	}
+	m64k_map_memory(&m64k, 0x800000, 0x010000, MEMCARD_RAM, true);
 	m64k_map_memory(&m64k, 0xC00000, 0x020000, BIOS,       false);
 	m64k_map_memory(&m64k, 0xD00000, 0x010000, BACKUP_RAM, true);
 
