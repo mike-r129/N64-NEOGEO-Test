@@ -177,7 +177,23 @@ void plat_audio_pump(void) {
     // rest); the machine then slows uniformly instead of audio starving video.
     int pass_budget = (underrun_streak >= 1) ? 1 : AI_NUM_BUFFERS;
 
-    int filled = 0, discarded = 0;
+    int filled = 0, discarded = 0, silfill = 0;
+
+    // ANTI-REPLAY, part 1 (pre-flood): while overloaded, generating even one
+    // buffer can take 100-200ms (the Z80-bound jingle), during which the AI
+    // drains the whole queue and the hardware starts REPLAYING its last buffer
+    // (the stuck-tone bug). Top up every free slot but one with pure silence
+    // BEFORE generating, so the ~160ms queue cushion covers the generation time
+    // itself. The one slot left free receives this pass's generated buffer.
+    if (underrun_streak >= 1) {
+        for (int k = 0; k < AI_NUM_BUFFERS - 1 && audio_can_write(); k++) {
+            uint32_t *o = (uint32_t *)audio_write_begin();
+            for (int i = 0; i < buflen; i++)
+                o[i] = 0;
+            audio_write_end();
+            silfill++;
+        }
+    }
     while (due >= buflen && filled < pass_budget && audio_can_write()) {
         short *out = audio_write_begin();
         sound_gen_samples((int16_t *)out, buflen);
