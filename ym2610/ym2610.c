@@ -177,12 +177,16 @@ uint32_t ym_prof[5];
  *   TL_RES_LEN - sinus resolution (X axis)
  */
 #define TL_TAB_LEN (13*2*TL_RES_LEN)
-static signed int ALIGN_DATA tl_tab[TL_TAB_LEN];
+/* MVS64: narrowed from signed int — max magnitude is 13 bits (see
+ * OPNInitTable), and the VR4300's 8KB dcache is the synthesis bottleneck:
+ * tl_tab+sin_tab at 32-bit were 30KB of hot lookup tables. 16-bit halves
+ * the footprint/miss traffic with identical values. */
+static s16 ALIGN_DATA tl_tab[TL_TAB_LEN];
 
 #define ENV_QUIET		(TL_TAB_LEN>>3)
 
 /* sin waveform table in 'decibel' scale */
-static unsigned int ALIGN_DATA sin_tab[SIN_LEN];
+static u16 ALIGN_DATA sin_tab[SIN_LEN];  /* MVS64: values < 2*TL_TAB_LEN, see above */
 
 /* sustain level table (3dB per step) */
 /* bit0, bit1, bit2, bit3, bit4, bit5, bit6 */
@@ -430,7 +434,10 @@ static const u8 ALIGN_DATA lfo_pm_output[7 * 8][8] = { /* 7 bits meaningful (of 
 };
 
 /* all 128 LFO PM waveforms */
-static s32 ALIGN_DATA lfo_pm_table[128 * 8 * 32]; /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
+/* MVS64: narrowed from s32 (128KB!) — entries are ±(sum of u8s) so ±255
+ * worst-case, well inside s16. Halves the table to 64KB to cut dcache/RDRAM
+ * traffic when LFO PM is active. */
+static s16 ALIGN_DATA lfo_pm_table[128 * 8 * 32]; /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
 
 /*----------------------------------
  for SSG emulator
@@ -2142,7 +2149,8 @@ static int step_inc[8] = { -1 * 16, -1 * 16, -1 * 16, -1 * 16, 2 * 16, 5 * 16, 7
 		* 16, 9 * 16 };
 
 /* speedup purposes only */
-static int jedi_table[49 * 16];
+/* MVS64: narrowed from int — max |value| = 15*steps[48]/8 = 2910. */
+static s16 jedi_table[49 * 16];
 
 static void OPNB_ADPCMA_init_table(void) {
 	int step, nib;
