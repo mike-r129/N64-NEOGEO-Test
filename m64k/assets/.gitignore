@@ -1,3 +1,6 @@
 # TomHarte/SingleStepTests vectors (downloaded) and generated binaries — never commit (huge)
 *.json.gz
 *.btest
+
+# compiled host generator for the synthesized ADDQ/SUBQ vectors (see mkquick.c)
+/mkquick
