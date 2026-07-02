@@ -537,6 +537,12 @@ typedef struct {
 	u32 fc; /* fnum,blk:adjusted to sample rate */
 	u8 kcode; /* key code:                        */
 	u32 block_fnum; /* current blk/fnum value for this slot (can be different betweeen slots of one channel in 3slot mode) */
+	/* MVS64: cache for the LFO-PM phase-delta stack in chan_calc. The four
+	 * per-slot deltas only depend on (LFO_PM step, block_fnum) plus the
+	 * slots' DT/mul (whose every change funnels through Incr=-1 ->
+	 * refresh_fc_eg_chan, which invalidates this). 0xFFFFFFFF = invalid. */
+	u32 pm_key;
+	u32 pm_dp[4];
 } FM_CH;
 
 typedef struct {
@@ -1304,41 +1310,54 @@ INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH) {
 
 		u32 block_fnum = CH->block_fnum;
 
-		u32 fnum_lfo = ((block_fnum & 0x7f0) >> 4) * 32 * 8;
-		s32 lfo_fn_table_index_offset =
-				lfo_pm_table[fnum_lfo + CH->pms + LFO_PM];
+		/* MVS64: the four PM'd phase deltas depend only on (LFO_PM,
+		 * block_fnum) and slot DT/mul (invalidated via refresh_fc_eg_chan).
+		 * LFO_PM only steps every few dozen samples and notes change far
+		 * slower, so cache the delta stack instead of redoing the
+		 * table+multiply work every sample. Values are bit-identical. */
+		u32 pm_key = (LFO_PM << 17) | block_fnum;
+		if (pm_key != CH->pm_key) {
+			u32 fnum_lfo = ((block_fnum & 0x7f0) >> 4) * 32 * 8;
+			s32 lfo_fn_table_index_offset =
+					lfo_pm_table[fnum_lfo + CH->pms + LFO_PM];
 
-		if (lfo_fn_table_index_offset) /* LFO phase modulation active */
-		{
-			u8 blk;
-			u32 fn;
-			int kc, fc;
+			CH->pm_key = pm_key;
+			if (lfo_fn_table_index_offset) /* LFO phase modulation active */
+			{
+				u8 blk;
+				u32 fn;
+				int kc, fc;
 
-			block_fnum = block_fnum * 2 + lfo_fn_table_index_offset;
+				block_fnum = block_fnum * 2 + lfo_fn_table_index_offset;
 
-			blk = (block_fnum & 0x7000) >> 12;
-			fn = block_fnum & 0xfff;
+				blk = (block_fnum & 0x7000) >> 12;
+				fn = block_fnum & 0xfff;
 
-			/* keyscale code */
-			kc = (blk << 2) | opn_fktable[fn >> 8];
-			/* phase increment counter */
-			fc = OPN->fn_table[fn] >> (7 - blk);
+				/* keyscale code */
+				kc = (blk << 2) | opn_fktable[fn >> 8];
+				/* phase increment counter */
+				fc = OPN->fn_table[fn] >> (7 - blk);
 
-			CH->SLOT[SLOT1].phase += ((fc + CH->SLOT[SLOT1].DT[kc])
-					* CH->SLOT[SLOT1].mul) >> 1;
-			CH->SLOT[SLOT2].phase += ((fc + CH->SLOT[SLOT2].DT[kc])
-					* CH->SLOT[SLOT2].mul) >> 1;
-			CH->SLOT[SLOT3].phase += ((fc + CH->SLOT[SLOT3].DT[kc])
-					* CH->SLOT[SLOT3].mul) >> 1;
-			CH->SLOT[SLOT4].phase += ((fc + CH->SLOT[SLOT4].DT[kc])
-					* CH->SLOT[SLOT4].mul) >> 1;
-		} else /* LFO phase modulation  = zero */
-		{
-			CH->SLOT[SLOT1].phase += CH->SLOT[SLOT1].Incr;
-			CH->SLOT[SLOT2].phase += CH->SLOT[SLOT2].Incr;
-			CH->SLOT[SLOT3].phase += CH->SLOT[SLOT3].Incr;
-			CH->SLOT[SLOT4].phase += CH->SLOT[SLOT4].Incr;
+				CH->pm_dp[0] = ((fc + CH->SLOT[SLOT1].DT[kc])
+						* CH->SLOT[SLOT1].mul) >> 1;
+				CH->pm_dp[1] = ((fc + CH->SLOT[SLOT2].DT[kc])
+						* CH->SLOT[SLOT2].mul) >> 1;
+				CH->pm_dp[2] = ((fc + CH->SLOT[SLOT3].DT[kc])
+						* CH->SLOT[SLOT3].mul) >> 1;
+				CH->pm_dp[3] = ((fc + CH->SLOT[SLOT4].DT[kc])
+						* CH->SLOT[SLOT4].mul) >> 1;
+			} else /* LFO phase modulation  = zero */
+			{
+				CH->pm_dp[0] = CH->SLOT[SLOT1].Incr;
+				CH->pm_dp[1] = CH->SLOT[SLOT2].Incr;
+				CH->pm_dp[2] = CH->SLOT[SLOT3].Incr;
+				CH->pm_dp[3] = CH->SLOT[SLOT4].Incr;
+			}
 		}
+		CH->SLOT[SLOT1].phase += CH->pm_dp[0];
+		CH->SLOT[SLOT2].phase += CH->pm_dp[1];
+		CH->SLOT[SLOT3].phase += CH->pm_dp[2];
+		CH->SLOT[SLOT4].phase += CH->pm_dp[3];
 	} else /* no LFO phase modulation */
 	{
 		CH->SLOT[SLOT1].phase += CH->SLOT[SLOT1].Incr;
@@ -1387,6 +1406,7 @@ INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH) {
 		refresh_fc_eg_slot(&CH->SLOT[SLOT2], fc, kc);
 		refresh_fc_eg_slot(&CH->SLOT[SLOT3], fc, kc);
 		refresh_fc_eg_slot(&CH->SLOT[SLOT4], fc, kc);
+		CH->pm_key = 0xFFFFFFFF;   /* DT/mul/fc changed: PM cache stale */
 	}
 }
 
@@ -1426,6 +1446,7 @@ static void reset_channels(FM_ST *ST, FM_CH *CH, int num) {
 
 	for (c = 0; c < num; c++) {
 		CH[c].fc = 0;
+		CH[c].pm_key = 0xFFFFFFFF;   /* MVS64: PM delta cache starts stale */
 		for (s = 0; s < 4; s++) {
 			CH[c].SLOT[s].ssg = 0;
 			CH[c].SLOT[s].ssgn = 0;
