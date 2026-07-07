@@ -544,6 +544,24 @@ int main(int argc, char *argv[]) {
 				(unsigned long)(perf_draw_end / fb));
 			perf_m68k_insns = perf_idle_skips = perf_tlb_faults = 0;
 			perf_draw_wait = perf_draw_issue = perf_draw_end = 0;
+
+			// DRAW-1 fine split of the draw-issue bucket (video.c): phase
+			// ticks (same 0.01%-of-frame units) + per-frame draw counts.
+			// walk = sprite pass minus cache lookups minus rspq issue.
+			extern uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
+			extern uint32_t perf_dr_cache, perf_dr_rspq;
+			extern uint32_t perf_dr_tiles, perf_dr_cells;
+			framef("[PERF2] begin=%lu spr=%lu (cache=%lu rspq=%lu) fix=%lu tiles=%lu cells=%lu\n",
+				(unsigned long)(perf_dr_begin / fb),
+				(unsigned long)(perf_dr_sprites / fb),
+				(unsigned long)(perf_dr_cache / fb),
+				(unsigned long)(perf_dr_rspq / fb),
+				(unsigned long)(perf_dr_fix / fb),
+				(unsigned long)perf_dr_tiles,
+				(unsigned long)perf_dr_cells);
+			perf_dr_begin = perf_dr_sprites = perf_dr_fix = 0;
+			perf_dr_cache = perf_dr_rspq = 0;
+			perf_dr_tiles = perf_dr_cells = 0;
 		}
 		#endif
 		#ifdef MVS64_IDLEPROBE

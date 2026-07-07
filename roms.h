@@ -1,6 +1,9 @@
 #ifndef ROMS_H
 #define ROMS_H
 
+#include <stdint.h>
+#include <stdbool.h>
+
 extern uint8_t *P_ROM;
 extern unsigned int rom_pc_idle_skip;
 
@@ -15,6 +18,11 @@ void rom_load_prom(const char *dir);
 
 uint8_t* crom_get_sprite(int spritenum);
 uint8_t* srom_get_sprite(int spritenum);
+
+// True if the fix-layer tile decodes to all index-0 (fully transparent)
+// pixels — drawing it can never touch the screen, so callers skip it.
+// Learns lazily on first sight of each tile; reset by srom_set_bank.
+bool srom_tile_empty(int spritenum);
 
 void srom_set_bank(int bank);  // 0 = fixed (BIOS), 1 = game
 

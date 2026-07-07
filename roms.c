@@ -69,6 +69,33 @@ static inline void fread_ok(void *dst, size_t sz, FILE *f) {
 	(void)got;
 }
 
+// Empty-tile knowledge for the fix layer. Most of the 40x28 fix map is
+// "blank" cells whose tile decodes to all index-0 pixels (color 0 has alpha
+// forced to 0 in every palette, so such a draw can never touch the screen).
+// The map is full of nonzero tile codes though, so the `if (v)` check in
+// render_fix passes for every cell and we used to issue ~1120 draws/frame,
+// ~15% of the frame budget, almost all fully transparent. Tile pixel data is
+// ROM (immutable per SROM bank), so emptiness is a stable per-tile fact:
+// learn it on first sight, then skip empty tiles forever. Pixel-identical by
+// construction. Reset on srom_set_bank (tile numbers change meaning).
+#define SROM_MAX_TILES 8192
+static uint8_t srom_known[SROM_MAX_TILES/8];
+static uint8_t srom_empty[SROM_MAX_TILES/8];
+
+bool srom_tile_empty(int spritenum) {
+	if ((unsigned)spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
+	int byte = spritenum >> 3, bit = 1 << (spritenum & 7);
+	if (!(srom_known[byte] & bit)) {
+		const uint8_t *pix = srom_get_sprite(spritenum);
+		uint32_t acc = 0;
+		for (int i=0; i<4*8; i+=4)
+			acc |= *(const uint32_t*)(pix + i);
+		srom_known[byte] |= bit;
+		if (acc == 0) srom_empty[byte] |= bit;
+	}
+	return (srom_empty[byte] & bit) != 0;
+}
+
 uint8_t* srom_get_sprite(int spritenum) {
 	if (spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
 	uint8_t *pix = sprite_cache_lookup(&srom_cache, spritenum);
@@ -137,6 +164,11 @@ void srom_set_bank(int bank) {
 
 		sprite_cache_reset(&srom_cache);
 		srom_num_tiles = len / (4*8);
+		assertf(srom_num_tiles <= SROM_MAX_TILES, "SROM too large: %d tiles", srom_num_tiles);
+
+		// Tile numbers refer to the new bank now: relearn emptiness.
+		memset(srom_known, 0, sizeof(srom_known));
+		memset(srom_empty, 0, sizeof(srom_empty));
 	}
 }
 

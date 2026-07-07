@@ -48,6 +48,17 @@ static uint16_t color_convert(uint16_t val) {
 
 static uint16_t PALETTE_RAM_EMU[4*1024];
 
+#if defined(N64) && defined(MVS64_PERFCOUNT)
+// DRAW-1 fine split (diagnostic builds): where does the draw bucket go?
+// Ticks: render_begin / sprite walk / fix layer, and inside the sprite walk
+// the sprite-cache lookups vs the rspq command issue. Counts: tiles, fix
+// cells. Printed as [PERF2] in emu.c, reset per frame.
+uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
+uint32_t perf_dr_cache, perf_dr_rspq;
+uint32_t perf_dr_tiles, perf_dr_cells;
+#define DRAW_PERF 1
+#endif
+
 #ifdef N64
 	#if 1
 	#include "video_n64.c"
@@ -67,7 +78,11 @@ static void render_fix(void) {
 		fix += 2; // skip two lines
 		for (int j=0;j<28;j++) {
 			uint16_t v = *fix++;
-			if (v)
+			// Skip tiles known to decode to all-transparent pixels: the map
+			// is full of nonzero "blank" codes, so without this we issue
+			// ~1120 draws/frame that can never touch the screen (see
+			// srom_tile_empty).
+			if (v && !srom_tile_empty(v & 0xFFF))
 				draw_sprite_fix(v & 0xFFF, (v >> 12) & 0xF, i*8, j*8);
 		}
 		fix += 2;
@@ -216,10 +231,24 @@ void video_render(void) {
 	// ~frame-537 crash is in the N64 render path. Frames still flip (blank screen).
 	return;
 #endif
+#ifdef DRAW_PERF
+	uint32_t t0 = TICKS_READ();
+	render_begin();
+	uint32_t t1 = TICKS_READ();
+	render_sprites();
+	uint32_t t2 = TICKS_READ();
+	render_fix();
+	render_end();
+	uint32_t t3 = TICKS_READ();
+	perf_dr_begin   += TICKS_DISTANCE(t0, t1);
+	perf_dr_sprites += TICKS_DISTANCE(t1, t2);
+	perf_dr_fix     += TICKS_DISTANCE(t2, t3);
+#else
 	render_begin();
 	render_sprites();
 	render_fix();
 	render_end();
+#endif
 }
 
 // Set on every palette write / bank switch; consumed by the N64 render_begin
