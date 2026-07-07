@@ -3179,6 +3179,368 @@ static void rspa_verify_cmp(int n, const s32 *refl, const s32 *refr,
 #endif /* MVS64_RSPADPCM_VERIFY */
 #endif /* N64 && MVS64_RSPADPCM */
 
+/* ============================================================================
+ * MVS64: RSP FM synthesis offload (-DMVS64_RSPFM, N64 only).
+ *
+ * rsp_fm.S replays pass 1 of YM2610Update_stream bit-exactly for the shipped
+ * channels: the shared EG tick schedule, the per-slot envelope state machine,
+ * the operator chain with feedback/MEM, and the phase generators. Per chunk
+ * the CPU ships each eligible channel's state plus a per-sample dp index into
+ * a precomputed phase-delta table (this is how LFO phase modulation works
+ * without the 16KB fn_table: the deltas depend only on the <=8 distinct
+ * lfo_pm values in a chunk). Channels fall back to the C path per chunk when
+ * any slot uses SSG-EG, or when a fast LFO (48/72Hz) yields >8 distinct
+ * lfo_pm values. The silent-channel fast path stays on the CPU as before.
+ *
+ * The RSP reconstructs sin_tab from its first 256 entries by quarter folding;
+ * rspfm_init() verifies that fold against the real table once at boot and
+ * permanently disables the offload if libm rounding ever breaks the symmetry.
+ *
+ * -DMVS64_RSPFM_VERIFY dual-computes every chunk (C authoritative) with
+ * [RSPFM] mismatch telemetry — the gate is zero mismatches over a long run.
+ * ==========================================================================*/
+#if defined(N64) && defined(MVS64_RSPFM)
+#include <libdragon.h>
+#include <stddef.h>
+
+extern uint32_t RSP_FM_OVL_ID;
+
+/* Mirrors of the rsp_fm.S PARAM/OUT layouts (offsets asserted below). */
+typedef struct {
+	u32 phase;
+	s32 volume;
+	u32 vol_out;
+	u32 pad0;
+	u16 tl, sl;
+	u8 sh[4];    /* EG rate shift, indexed state-1 (REL,SUS,DEC,ATT) */
+	u8 sel[4];   /* eg_inc row offset, same indexing */
+	u8 state, amflag;
+	u16 pad1;
+} rspfm_slot_t;
+
+typedef struct {
+	s32 op1_out[2];
+	s32 mem_value;
+	s32 maskL, maskR;
+	u8 i_memc, i_om1, i_om2, i_oc1;
+	u8 algo5, fb, ams, pms_mask;
+	u32 pad0;
+	u32 dp[8][4];    /* phase deltas per pm index, slot order S1,S3,S2,S4 */
+	u8 pmidx[128];
+	rspfm_slot_t slot[4];   /* memory order S1,S3,S2,S4 */
+} rspfm_ch_t;
+
+typedef struct __attribute__((aligned(16))) {
+	u32 sinq_phys;
+	u32 tlb_phys;
+	u16 n;
+	u8 chmask, pad0;
+	u32 eg_base;
+	u8 egt[128];
+	u8 lfo_am[128];
+	u8 pad1[16];
+	rspfm_ch_t ch[4];
+} rspfm_param_t;
+
+typedef struct __attribute__((aligned(16))) {
+	s32 l[128];
+	s32 r[128];
+	rspfm_ch_t echo[4];
+	u32 seq;
+	u8 pad[12];
+} rspfm_out_t;
+
+_Static_assert(sizeof(rspfm_slot_t) == 32, "rspfm slot layout");
+_Static_assert(sizeof(rspfm_ch_t) == 416, "rspfm ch layout");
+_Static_assert(offsetof(rspfm_ch_t, dp) == 32, "rspfm dp offset");
+_Static_assert(offsetof(rspfm_ch_t, pmidx) == 160, "rspfm pmidx offset");
+_Static_assert(offsetof(rspfm_ch_t, slot) == 288, "rspfm slot offset");
+_Static_assert(offsetof(rspfm_param_t, egt) == 16, "rspfm egt offset");
+_Static_assert(offsetof(rspfm_param_t, lfo_am) == 144, "rspfm lfoam offset");
+_Static_assert(offsetof(rspfm_param_t, ch) == 288, "rspfm ch[] offset");
+_Static_assert(sizeof(rspfm_param_t) == 288 + 4 * 416, "rspfm param size");
+_Static_assert(offsetof(rspfm_out_t, echo) == 1024, "rspfm echo offset");
+_Static_assert(offsetof(rspfm_out_t, seq) == 2688, "rspfm seq offset");
+_Static_assert(sizeof(rspfm_out_t) == 2704, "rspfm out size");
+
+static rspfm_param_t rspfm_pb;
+static rspfm_out_t rspfm_ob;
+static u32 rspfm_seqno;
+static int rspfm_dead;      /* fold-check fail or poll timeout */
+static int rspfm_checked;
+/* last-sample pm cache values to restore into CH after adopting (pms only) */
+static u32 rspfm_pmkey_last[4];
+static u32 rspfm_pmdp_last[4][4];   /* C order: S1,S2,S3,S4 */
+#ifdef MVS64_RSPFM_VERIFY
+static u32 rspfm_chunks, rspfm_badchunks, rspfm_badsamp, rspfm_badstate;
+#endif
+
+/* One-time init: verify the RSP's quarter fold reproduces sin_tab exactly
+ * (libm rounding could in principle break the mirror symmetry), and push the
+ * tables to RDRAM for the RSP to DMA. */
+static void rspfm_init(void) {
+	int i;
+	rspfm_checked = 1;
+	for (i = 0; i < SIN_LEN; i++) {
+		u32 j = i & 255;
+		u32 rec;
+		if (i & 256)
+			j = 255 - j;
+		rec = (u32) sin_tab[j] + ((u32) i >> 9 & 1);
+		if (sin_tab[j] & 1)   /* quarter entries must carry sign 0 */
+			rec = ~0u;
+		if (rec != sin_tab[i]) {
+			debugf("[RSPFM] sin fold check FAILED at %d (tab=%u rec=%lu)"
+					" - FM offload disabled\n", i, sin_tab[i],
+					(unsigned long) rec);
+			rspfm_dead = 1;
+			return;
+		}
+	}
+	data_cache_hit_writeback(sin_tab, sizeof(sin_tab));
+	data_cache_hit_writeback(tl_tab_base, sizeof(tl_tab_base));
+	debugf("[RSPFM] sin fold check OK\n");
+}
+
+/* Compute the four phase deltas for one lfo_pm value, mirroring
+ * update_phase_lfo() WITHOUT touching the CH pm cache. dp[] comes back in
+ * C slot-name order S1,S2,S3,S4. */
+static void rspfm_pm_dp(FM_OPN *OPN, FM_CH *CH, u32 lfo_pm, u32 dp[4]) {
+	u32 block_fnum = CH->block_fnum;
+	u32 fnum_lfo = ((block_fnum & 0x7f0) >> 4) * 32 * 8;
+	s32 off = lfo_pm_table[fnum_lfo + CH->pms + lfo_pm];
+	if (off) {
+		u8 blk;
+		u32 fn;
+		int kc, fc;
+		block_fnum = block_fnum * 2 + off;
+		blk = (block_fnum & 0x7000) >> 12;
+		fn = block_fnum & 0xfff;
+		kc = (blk << 2) | opn_fktable[fn >> 8];
+		fc = OPN->fn_table[fn] >> (7 - blk);
+		dp[0] = (u32) ((fc + CH->SLOT[SLOT1].DT[kc]) * CH->SLOT[SLOT1].mul) >> 1;
+		dp[1] = (u32) ((fc + CH->SLOT[SLOT2].DT[kc]) * CH->SLOT[SLOT2].mul) >> 1;
+		dp[2] = (u32) ((fc + CH->SLOT[SLOT3].DT[kc]) * CH->SLOT[SLOT3].mul) >> 1;
+		dp[3] = (u32) ((fc + CH->SLOT[SLOT4].DT[kc]) * CH->SLOT[SLOT4].mul) >> 1;
+	} else {
+		dp[0] = CH->SLOT[SLOT1].Incr;
+		dp[1] = CH->SLOT[SLOT2].Incr;
+		dp[2] = CH->SLOT[SLOT3].Incr;
+		dp[3] = CH->SLOT[SLOT4].Incr;
+	}
+}
+
+/* Pack one channel into param block slot j. Returns 0 if the channel must
+ * stay on the CPU this chunk (SSG-EG in use, or >8 distinct lfo_pm values).
+ * Must run BEFORE any C code mutates the channel this chunk. */
+static int rspfm_pack_chan(FM_OPN *OPN, FM_CH *CH, int j, int n,
+		const u8 *lfo_pm_arr, u32 panl, u32 panr,
+		int i_memc, int i_om1, int i_om2, int i_oc1) {
+	rspfm_ch_t * const p = &rspfm_pb.ch[j];
+	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
+	int s, i;
+
+	for (s = 0; s < 4; s++)
+		if (CH->SLOT[s].ssg & 0x08)
+			return 0;
+
+	if (CH->pms) {
+		/* map each sample's lfo_pm to a dp table index (<= 8 distinct) */
+		u8 vals[8];
+		u32 dp_c[4];
+		int nv = 0;
+		for (i = 0; i < n; i++) {
+			u8 v = lfo_pm_arr[i];
+			int k;
+			for (k = 0; k < nv; k++)
+				if (vals[k] == v)
+					break;
+			if (k == nv) {
+				if (nv == 8)
+					return 0;   /* fast LFO: fall back to C this chunk */
+				vals[nv++] = v;
+			}
+			p->pmidx[i] = (u8) k;
+		}
+		for (i = 0; i < nv; i++) {
+			rspfm_pm_dp(OPN, CH, vals[i], dp_c);
+			p->dp[i][0] = dp_c[0];   /* RSP slot order S1,S3,S2,S4 */
+			p->dp[i][1] = dp_c[2];
+			p->dp[i][2] = dp_c[1];
+			p->dp[i][3] = dp_c[3];
+		}
+		p->pms_mask = 0xFF;
+		/* pm cache state C would leave behind (adopted after the chunk) */
+		rspfm_pmkey_last[j] = ((u32) lfo_pm_arr[n - 1] << 17) | CH->block_fnum;
+		rspfm_pm_dp(OPN, CH, lfo_pm_arr[n - 1], rspfm_pmdp_last[j]);
+	} else {
+		p->dp[0][0] = CH->SLOT[SLOT1].Incr;
+		p->dp[0][1] = CH->SLOT[SLOT3].Incr;
+		p->dp[0][2] = CH->SLOT[SLOT2].Incr;
+		p->dp[0][3] = CH->SLOT[SLOT4].Incr;
+		p->pms_mask = 0;
+	}
+
+	p->op1_out[0] = CH->op1_out[0];
+	p->op1_out[1] = CH->op1_out[1];
+	p->mem_value = CH->mem_value;
+	p->maskL = (s32) panl;
+	p->maskR = (s32) panr;
+	p->i_memc = (u8) i_memc;
+	p->i_om1 = (u8) i_om1;
+	p->i_om2 = (u8) i_om2;
+	p->i_oc1 = (u8) i_oc1;
+	p->algo5 = (CH->ALGO & 7) == 5;
+	p->fb = CH->FB;
+	p->ams = CH->ams;
+
+	for (s = 0; s < 4; s++) {
+		const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
+		rspfm_slot_t * const q = &p->slot[s];
+		q->phase = SL->phase;
+		q->volume = SL->volume;
+		q->vol_out = SL->vol_out;
+		q->tl = (u16) SL->tl;
+		q->sl = (u16) SL->sl;
+		q->sh[0] = SL->eg_shv[EG_REL];
+		q->sh[1] = SL->eg_shv[EG_SUS];
+		q->sh[2] = SL->eg_shv[EG_DEC];
+		q->sh[3] = SL->eg_shv[EG_ATT];
+		q->sel[0] = SL->eg_sel_rr;
+		q->sel[1] = SL->eg_sel_d2r;
+		q->sel[2] = SL->eg_sel_d1r;
+		q->sel[3] = SL->eg_sel_ar;
+		q->state = SL->state;
+		q->amflag = SL->AMmask ? 1 : 0;
+	}
+	return 1;
+}
+
+static void rspfm_kick(int n, u32 eg_base, const u8 *egt_arr,
+		const u8 *lfo_am_arr) {
+	if (!rspfm_checked)
+		rspfm_init();
+	rspfm_pb.sinq_phys = PhysicalAddr(sin_tab);
+	rspfm_pb.tlb_phys = PhysicalAddr(tl_tab_base);
+	rspfm_pb.n = (u16) n;
+	rspfm_pb.eg_base = eg_base;
+	memcpy(rspfm_pb.egt, egt_arr, (size_t) n);
+	memcpy(rspfm_pb.lfo_am, lfo_am_arr, (size_t) n);
+	rspfm_seqno++;
+	data_cache_hit_writeback(&rspfm_pb, sizeof(rspfm_pb));
+	data_cache_hit_invalidate(&rspfm_ob, sizeof(rspfm_ob));
+	rspq_highpri_begin();
+	rspq_write(RSP_FM_OVL_ID, 0x0, PhysicalAddr(&rspfm_pb),
+			PhysicalAddr(&rspfm_ob), rspfm_seqno);
+	rspq_highpri_end();
+}
+
+static int rspfm_wait(void) {
+	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&rspfm_ob.seq);
+	u32 t0 = TICKS_READ();
+	while (*seqp != rspfm_seqno) {
+		if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50)) {
+			debugf("[RSPFM] TIMEOUT seq=%lu got=%lu - disabling FM offload\n",
+					(unsigned long) rspfm_seqno, (unsigned long) *seqp);
+			rspfm_dead = 1;
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Write the echoed channel state back into the live structs (non-verify). */
+static void rspfm_adopt_chan(FM_CH *CH, int j) {
+	const rspfm_ch_t * const e = &rspfm_ob.echo[j];
+	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
+	int s;
+	for (s = 0; s < 4; s++) {
+		FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
+		const rspfm_slot_t * const q = &e->slot[s];
+		SL->phase = q->phase;
+		SL->volume = q->volume;
+		SL->vol_out = q->vol_out;
+		SL->state = q->state;
+	}
+	CH->op1_out[0] = e->op1_out[0];
+	CH->op1_out[1] = e->op1_out[1];
+	CH->mem_value = e->mem_value;
+	if (CH->pms) {
+		CH->pm_key = rspfm_pmkey_last[j];
+		CH->pm_dp[0] = rspfm_pmdp_last[j][0];
+		CH->pm_dp[1] = rspfm_pmdp_last[j][1];
+		CH->pm_dp[2] = rspfm_pmdp_last[j][2];
+		CH->pm_dp[3] = rspfm_pmdp_last[j][3];
+	}
+}
+
+#ifdef MVS64_RSPFM_VERIFY
+/* Compare the RSP result against the (authoritative) C pass-1 outcome for
+ * the shipped channels. refl/refr are the C contributions of exactly those
+ * channels. */
+static void rspfm_verify_cmp(int n, const s32 *refl, const s32 *refr,
+		FM_CH **cch) {
+	static const u8 fm_chix[4] = { 0, 1, 2, 3 };
+	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
+	static int prints;
+	int i, j, s, bad = 0;
+	(void) fm_chix;
+	for (i = 0; i < n; i++) {
+		if (rspfm_ob.l[i] != refl[i] || rspfm_ob.r[i] != refr[i]) {
+			bad++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPFM] SAMPDIFF chunk=%lu i=%d rsp=%ld/%ld c=%ld/%ld\n",
+						(unsigned long) rspfm_chunks, i,
+						(long) rspfm_ob.l[i], (long) rspfm_ob.r[i],
+						(long) refl[i], (long) refr[i]);
+			}
+		}
+	}
+	rspfm_badsamp += (u32) bad;
+	for (j = 0; j < 4; j++) {
+		const rspfm_ch_t * const e = &rspfm_ob.echo[j];
+		const FM_CH *CH;
+		if (!(rspfm_pb.chmask & (1 << j)))
+			continue;
+		CH = cch[j];
+		for (s = 0; s < 4; s++) {
+			const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
+			const rspfm_slot_t * const q = &e->slot[s];
+			if (q->phase != SL->phase || q->volume != SL->volume
+					|| q->vol_out != SL->vol_out || q->state != SL->state) {
+				bad++;
+				rspfm_badstate++;
+				if (prints < 8) {
+					prints++;
+					debugf("[RSPFM] SLOTSTATE ch%d s%d rsp=%lx/%ld/%lu/%d "
+							"c=%lx/%ld/%lu/%d\n", j, s,
+							(unsigned long) q->phase, (long) q->volume,
+							(unsigned long) q->vol_out, q->state,
+							(unsigned long) SL->phase, (long) SL->volume,
+							(unsigned long) SL->vol_out, SL->state);
+				}
+			}
+		}
+		if (e->op1_out[0] != CH->op1_out[0] || e->op1_out[1] != CH->op1_out[1]
+				|| e->mem_value != CH->mem_value) {
+			bad++;
+			rspfm_badstate++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPFM] CHSTATE ch%d rsp=%ld/%ld/%ld c=%ld/%ld/%ld\n",
+						j, (long) e->op1_out[0], (long) e->op1_out[1],
+						(long) e->mem_value, (long) CH->op1_out[0],
+						(long) CH->op1_out[1], (long) CH->mem_value);
+			}
+		}
+	}
+	if (bad)
+		rspfm_badchunks++;
+}
+#endif /* MVS64_RSPFM_VERIFY */
+#endif /* N64 && MVS64_RSPFM */
+
 /*********************************************************************************************/
 
 /* YM2610(OPNB) */
@@ -3594,6 +3956,53 @@ void YM2610Update_stream(int length) {
 			}
 			YMPROF_A(0, a);
 
+#if defined(N64) && defined(MVS64_RSPFM)
+			/* MVS64: ship the eligible FM channels to the RSP now, so it
+			 * synthesizes them underneath the CPU's remaining passes.
+			 * Packing MUST happen before any C code mutates channel state
+			 * this chunk; silent channels stay on the CPU fast path. */
+			int fm_any = 0;
+			if (!rspfm_checked)
+				rspfm_init();
+			if (!rspfm_dead) {
+				rspfm_pb.chmask = 0;
+				for (j = 0; j < 4; j++) {
+					FM_CH * const CH = cch[j];
+					const int algo = CH->ALGO & 7;
+					if (CH->SLOT[SLOT1].state == EG_OFF
+					    && CH->SLOT[SLOT2].state == EG_OFF
+					    && CH->SLOT[SLOT3].state == EG_OFF
+					    && CH->SLOT[SLOT4].state == EG_OFF
+					    && CH->SLOT[SLOT1].vol_out >= ENV_QUIET
+					    && CH->SLOT[SLOT2].vol_out >= ENV_QUIET
+					    && CH->SLOT[SLOT3].vol_out >= ENV_QUIET
+					    && CH->SLOT[SLOT4].vol_out >= ENV_QUIET
+					    && CH->op1_out[0] == 0 && CH->op1_out[1] == 0
+					    && CH->mem_value == 0)
+						continue;   /* silent: CPU batch-advances phases */
+					if (rspfm_pack_chan(OPN, CH, j, n, lfo_pm,
+							OPN->pan[fmn[j] * 2 + 0],
+							OPN->pan[fmn[j] * 2 + 1],
+							ccs_memc[algo], ccs_om1[algo],
+							ccs_om2[algo], ccs_oc1[algo]))
+						rspfm_pb.chmask |= (u8) (1 << j);
+				}
+				if (rspfm_pb.chmask) {
+					fm_any = 1;
+					rspfm_kick(n, eg_base, egt, lfo_am);
+				}
+			}
+#ifdef MVS64_RSPFM_VERIFY
+			static s32 rspfm_refl[YM_CHUNK], rspfm_refr[YM_CHUNK];
+			if (fm_any) {
+				for (i = 0; i < n; i++) {
+					rspfm_refl[i] = 0;
+					rspfm_refr[i] = 0;
+				}
+			}
+#endif
+#endif
+
 			/* pass 1: FM — each channel replays the same EG tick schedule
 			 * with a private counter, then synthesizes its sample */
 			YMPROF_T(b);
@@ -3602,6 +4011,20 @@ void YM2610Update_stream(int length) {
 				const u32 panl = OPN->pan[fmn[j] * 2 + 0];
 				const u32 panr = OPN->pan[fmn[j] * 2 + 1];
 				u32 cnt = eg_base;
+				s32 *fm_al = acc_l, *fm_ar = acc_r;
+
+#if defined(N64) && defined(MVS64_RSPFM)
+				if (fm_any && (rspfm_pb.chmask & (1 << j))) {
+#ifdef MVS64_RSPFM_VERIFY
+					/* C stays authoritative but synthesizes into the ref
+					 * arrays so the RSP result can be compared 1:1 */
+					fm_al = rspfm_refl;
+					fm_ar = rspfm_refr;
+#else
+					continue;   /* the RSP owns this channel this chunk */
+#endif
+				}
+#endif
 
 				/* MVS64: silent-channel fast path. If all four slots are
 				 * parked in EG_OFF at >= ENV_QUIET attenuation, and the
@@ -3660,8 +4083,8 @@ void YM2610Update_stream(int length) {
 					o = chan_calc_stream(OPN, CH, lfo_am[i], lfo_pm[i],
 							algo, i_memc, i_om1, i_om2, i_oc1) >> 1;
 					/* the shift right was verified on real chip */
-					acc_l[i] += o & (s32) panl;
-					acc_r[i] += o & (s32) panr;
+					fm_al[i] += o & (s32) panl;
+					fm_ar[i] += o & (s32) panr;
 				}
 			}
 			YMPROF_A(1, b);
@@ -3785,6 +4208,72 @@ void YM2610Update_stream(int length) {
 			}
 #endif
 			YMPROF_A(3, d);
+
+#if defined(N64) && defined(MVS64_RSPFM)
+			/* collect the RSP FM result (kicked right after pass 0) */
+			if (fm_any) {
+#ifdef MVS64_RSPFM_VERIFY
+				rspfm_chunks++;
+				if (rspfm_wait())
+					rspfm_verify_cmp(n, rspfm_refl, rspfm_refr, cch);
+				else
+					rspfm_badchunks++;
+				for (i = 0; i < n; i++) {
+					acc_l[i] += rspfm_refl[i];
+					acc_r[i] += rspfm_refr[i];
+				}
+				if ((rspfm_chunks & 1023) == 0)
+					debugf("[RSPFM] chunks=%lu badchunks=%lu badsamp=%lu "
+							"badstate=%lu\n",
+							(unsigned long) rspfm_chunks,
+							(unsigned long) rspfm_badchunks,
+							(unsigned long) rspfm_badsamp,
+							(unsigned long) rspfm_badstate);
+#else
+				if (rspfm_wait()) {
+					for (i = 0; i < n; i++) {
+						acc_l[i] += rspfm_ob.l[i];
+						acc_r[i] += rspfm_ob.r[i];
+					}
+					for (j = 0; j < 4; j++)
+						if (rspfm_pb.chmask & (1 << j))
+							rspfm_adopt_chan(cch[j], j);
+				} else {
+					/* timeout: no state was adopted — synthesize the shipped
+					 * channels on the CPU from their untouched state (cold
+					 * path; rspfm_dead now forces C for the session) */
+					for (j = 0; j < 4; j++) {
+						FM_CH * const CH = cch[j];
+						const u32 panl = OPN->pan[fmn[j] * 2 + 0];
+						const u32 panr = OPN->pan[fmn[j] * 2 + 1];
+						u32 cnt = eg_base;
+						if (!(rspfm_pb.chmask & (1 << j)))
+							continue;
+						{
+							const int algo = CH->ALGO & 7;
+							const int i_memc = ccs_memc[algo];
+							const int i_om1 = ccs_om1[algo];
+							const int i_om2 = ccs_om2[algo];
+							const int i_oc1 = ccs_oc1[algo];
+							for (i = 0; i < n; i++) {
+								u32 t = egt[i];
+								s32 o;
+								while (t--) {
+									cnt++;
+									advance_eg_channel(cnt, &CH->SLOT[SLOT1]);
+								}
+								o = chan_calc_stream(OPN, CH, lfo_am[i],
+										lfo_pm[i], algo, i_memc, i_om1,
+										i_om2, i_oc1) >> 1;
+								acc_l[i] += o & (s32) panl;
+								acc_r[i] += o & (s32) panr;
+							}
+						}
+					}
+				}
+#endif
+			}
+#endif
 
 			/* pass 4: mix + output */
 			YMPROF_T(e);

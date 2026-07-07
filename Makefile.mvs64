@@ -10,7 +10,7 @@ BUILD_DIR = build/mvs64
 include $(N64_INST)/include/n64.mk
 
 core_src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80.c ym2610/ym2610.c lib/rdl.c $(wildcard hle_*.c)
-rsp = rsp_video.S rsp_audio.S
+rsp = rsp_video.S rsp_audio.S rsp_fm.S
 ifdef MUSASHI
 # Fallback 68k core: portable Musashi (proven on the PC build). Slower than m64k
 # but known-good — use while m64k opcode bugs are investigated. No m64k TLB asm;
@@ -44,6 +44,11 @@ CFLAGS += $(EXTRA_DEFINES)
 # make ... ADPCM_CPU=1 to force the C decoders (debug/fallback).
 ifndef ADPCM_CPU
 CFLAGS += -DMVS64_RSPADPCM
+endif
+# FM synthesis offload (rsp_fm.S + ym2610.c rspfm_* glue): default ON.
+# Disable with make ... FM_CPU=1 to force the C synthesis path.
+ifndef FM_CPU
+CFLAGS += -DMVS64_RSPFM
 endif
 
 # NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and

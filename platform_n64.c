@@ -33,9 +33,11 @@ void plat_log(const char *fmt, ...) {
 volatile int N64_FRAME = 0;
 uint32_t RSP_OVL_ID = 0;
 uint32_t RSP_AUDIO_OVL_ID = 0;
+uint32_t RSP_FM_OVL_ID = 0;
 
 DEFINE_RSP_UCODE(rsp_video);
 DEFINE_RSP_UCODE(rsp_audio);
+DEFINE_RSP_UCODE(rsp_fm);
 
 // Boot-time self-test of the audio RSP overlay: round-trip a small buffer
 // through cmd_adpcm_test (DMA in, +1 every byte, DMA out). Proves overlay
@@ -172,6 +174,7 @@ void plat_init(int audiofreq, int fps) {
     // Register our custom RSP overlays into the RSP queue engine
     RSP_OVL_ID = rspq_overlay_register(&rsp_video);
     RSP_AUDIO_OVL_ID = rspq_overlay_register(&rsp_audio);
+    RSP_FM_OVL_ID = rspq_overlay_register(&rsp_fm);
     rsp_audio_selftest();
 
     audio_init(audiofreq, AI_NUM_BUFFERS);
