@@ -40,6 +40,15 @@ CFLAGS += $(EXTRA_DEFINES)
 # NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
 # REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll
 # bloat thrashes the VR4300's 16KB icache in the synthesis loop. Keep -O2.
+# The opposite experiment (code-size-first, AUDIO_OS=1) was ALSO tried
+# (2026-07-07): -Os REGRESSED in-match snd% 136->155 (fps 22->19.3) — the
+# shorter-but-branchier codegen loses more in the synthesis inner loops than
+# the icache saves. -O2 is the confirmed sweet spot from both directions.
+ifdef AUDIO_OS
+$(BUILD_DIR)/ym2610/ym2610.o: CFLAGS += -Os
+$(BUILD_DIR)/z80.o: CFLAGS += -Os
+$(BUILD_DIR)/sound_neogeo.o: CFLAGS += -Os
+endif
 # Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
 # (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
 ASFLAGS += $(EXTRA_DEFINES)
