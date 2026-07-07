@@ -116,3 +116,44 @@ r: 0.52 → ~0.28 → wall 34.1ms → ~23ms → **~40-44 fps** if glue stays sma
 RSP: FM ~2.8ms per 128-sample chunk worst case, ~30% occupancy — fits with
 draw + ADPCM. Chunk commands are short → highpri audio never blocks video
 for long (the monolithic-command trap from FM-P1 does not apply).
+
+## WP-M2 measured addendum (2026-07-07 evening) — why full M2 is required
+
+M2-lite (lockstep-1 deferred ADPCM adopt, commit 84bfac1) measured 23.8 fps
+sustained in-fight (wpperf9, 600s, no crashes, 0 watchdog kicks) with adpcm
+waits ~1.1s/128pumps. The wpperf6 45.6 fps was a short atypical fight window
+(n=219); its own fight-phase RSPWAIT entries were already escalating.
+
+Root cause (now fully characterized): within a pump the CPU generates chunks
+at BURST speed (~1.5ms of CPU work per chunk), while the RSP needs ~3-4ms
+per chunk (FM 1.5-2.5 + ADPCM 1.5-2). The deficit accumulates inside every
+pump and is paid at the lockstep-1 adopt and the pump-end force-finish. NO
+in-pump pipeline depth fixes this: the deficit can only drain during the
+inter-pump 68k window (~25-40ms), which requires:
+
+1. RSP-resident ADPCM waveform state (acc/astep/aout/now_data per A channel,
+   acc/adpcmd/prev_acc/now_data/adpcml for B) with a fresh-mask for key-ons —
+   ucode overlay command mirroring cmd_fm_wp. Address fields (now_addr,
+   now_step) advance arithmetically at build time (the nib math already in
+   rspa_build; post-end values are dead state since key-on resets them).
+   B limit/repeat chunks: hard-drain hatch (download resident block, C
+   decode, re-fresh next chunk).
+2. rspa param/out/src rings of 16 aligned with the FM ring (same slot);
+   ADPCM l/r folds at the SAME deferred collect as FM (pend gains the rspa
+   seq; final mix = acc + fm_ob + rspa_ob).
+3. Cross-pump OUTPUT deferral: the pull-ring holds ~80ms of lead (TARGET_
+   LEAD 2 buffers), so pump N may return with tail chunks pending; they
+   complete during the inter-pump 68k window and fold at the next pump's
+   start. Force-finish only when the ring read pointer approaches a pending
+   segment (the fm-defer-experiment "lead<n force-finish" concept, but
+   WITHOUT the per-YM-write sync hooks — state consistency comes from
+   residency, not adoption). Ring wrap is safe: pendings live < one pump
+   << ring size. SNDRMS tail-chunk rms becomes approximate (diagnostic only).
+
+Also measured/landed on the way:
+- lowpri audio queue: NET-NEGATIVE (adpcm waits 3ms -> 1.6s/128pumps, fps
+  18.9) — the deferred adopt inherits the video pipeline's RDP stalls. Audio
+  stays highpri.
+- rspq lost-wakeup watchdog (plat_audio_pump): halted+SIG_MORE persisting
+  across two pumps -> clear halt. Covers the kernel race that panicked
+  display_get three times; 1200s of soaks since with zero false positives.

@@ -3116,22 +3116,14 @@ static void rspa_kick(void) {
 	/* drop any cached rspa_ob lines NOW so no dirty line writes back over the
 	 * RSP's output later; the seq poll below goes through the uncached alias */
 	data_cache_hit_invalidate(&rspa_ob, sizeof(rspa_ob));
-#ifdef MVS64_RSPWP
-	/* Whole-pump: nothing waits synchronously on this command anymore, so
-	 * it rides the standard lowpri queue behind at most ~1-2ms of video —
-	 * well inside the one-chunk adopt cover. The highpri machinery was
-	 * hitting a probabilistic rspq kernel wedge at our ~500 events/s (RSP
-	 * halted at kernel PC 0x18 in display_get, twice, both after minutes
-	 * of clean running). */
-	rspq_write(RSP_AUDIO_OVL_ID, 0x1, PhysicalAddr(&rspa_pb),
-			PhysicalAddr(&rspa_ob), rspa_seqno);
-	rspq_flush();
-#else
+	/* highpri: on the lowpri queue the deferred adopt inherited the video
+	 * pipeline's RDP stalls (measured: adpcm waits 3ms -> 1.6s per 128
+	 * pumps, fps 45.6 -> 18.9). The rspq lost-wakeup race that highpri
+	 * exposes is covered by the watchdog in plat_audio_pump. */
 	rspq_highpri_begin();
 	rspq_write(RSP_AUDIO_OVL_ID, 0x1, PhysicalAddr(&rspa_pb),
 			PhysicalAddr(&rspa_ob), rspa_seqno);
 	rspq_highpri_end();
-#endif
 }
 
 static int rspa_wait_slot(int slot, u32 seq) {
@@ -4137,12 +4129,12 @@ static void rspwp_ship(void) {
 	if (slot < 0)
 		return;
 	rspwp_ship_slot = -1;
-	/* lowpri: see rspa_kick — deferred commands need no priority and the
-	 * highpri path wedged the rspq kernel probabilistically */
+	/* highpri: see rspa_kick — lowpri coupled the adopt to RDP stalls */
+	rspq_highpri_begin();
 	rspq_write(RSP_FM_OVL_ID, 0x1, PhysicalAddr(&rspwp_pbr[slot]),
 			PhysicalAddr(&rspwp_obr[slot]), rspwp_pend[slot].seq,
 			PhysicalAddr(rspwp_dyn));
-	rspq_flush();
+	rspq_highpri_end();
 }
 
 /* Ready gate + seed/disable transitions; call at each chunk top. */

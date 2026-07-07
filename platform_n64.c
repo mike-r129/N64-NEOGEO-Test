@@ -210,6 +210,39 @@ void plat_enable_audio(int enable) {
 
 void plat_audio_pump(void) {
     if (!audio_enabled) return;
+
+#ifdef MVS64_RSPWP
+    // rspq lost-wakeup watchdog. The whole-pump audio offload issues bursts
+    // of commands separated by idle gaps (~500 halt/wake edges per second),
+    // which hits a race in the rspq kernel's going-idle path: the RSP halts
+    // just as the CPU sets SIG_MORE, and stays halted with work pending
+    // (observed three times as "RSP CRASH ... display_get wait loop timed
+    // out", RSP halted at kernel PC 0x18 with SIG_MORE set — on both the
+    // highpri and lowpri queues). Halted+SIG_MORE is legal only for the
+    // few-cycle window inside libdragon's own wake sequence, so if it
+    // persists across two pump calls (~30-70ms, still well under
+    // display_get's 200ms panic), clear the halt: that resumes the kernel's
+    // idle loop, which re-checks SIG_MORE and proceeds. A spurious kick in
+    // the benign window is a no-op (the CPU's own clear-halt follows).
+    {
+        volatile uint32_t * const SP_STATUS_REG =
+            (volatile uint32_t *) 0xA4040010;
+        static int wedged_seen;
+        static uint32_t wedge_kicks;
+        uint32_t st = *SP_STATUS_REG;
+        if ((st & 1u /*HALTED*/) && (st & (1u << 14) /*SIG_MORE*/)) {
+            if (wedged_seen++) {
+                *SP_STATUS_REG = 1u /*SP_WSTATUS_CLEAR_HALT*/;
+                wedged_seen = 0;
+                wedge_kicks++;
+                debugf("[RSPWP] rspq lost-wakeup kicked (%lu)\n",
+                       (unsigned long) wedge_kicks);
+            }
+        } else {
+            wedged_seen = 0;
+        }
+    }
+#endif
 #ifdef SND_HEALTH
     uint32_t _t0 = TICKS_READ();
 #endif
