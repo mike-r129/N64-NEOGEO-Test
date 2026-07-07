@@ -560,6 +560,12 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			if (z80_wrote) spin_armed = 0;      // any write breaks the pure spin
 			if (cpu.pc < pc0) {                 // backward branch = loop edge
 				if (cpu.pc == last_back) {      // repeated target = candidate spin
+					// NOTE: do not gate this behind a repeat threshold. Delaying
+					// the skip changes where cpu.cyc lands when the budget/timer
+					// boundary arrives mid-spin (a natural step OVERSHOOTS
+					// `next` by instruction granularity; the skip lands exactly
+					// on it), which shifts YM timer phase = audible divergence.
+					// Measured: a >=8-repeat gate broke the byte-identical WAV.
 					struct z80snap now; z80_snap(&now, &cpu);
 					if (spin_armed && memcmp(&now, &spin_snap, sizeof now) == 0) {
 #ifdef SND_HEALTH

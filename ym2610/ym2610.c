@@ -3097,7 +3097,7 @@ extern Uint16 play_buffer[16384];
 
 /* MVS64: samples per channel-major batch. 64 keeps the per-chunk scratch
  * (~1KB) plus one channel's state inside the VR4300's 8KB dcache. */
-#define YM_CHUNK 64
+#define YM_CHUNK 128
 
 /* Generate samples for one of the YM2610s */
 void YM2610Update_stream(int length) {
