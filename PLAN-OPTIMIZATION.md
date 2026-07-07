@@ -51,6 +51,24 @@
    bizhawk-mupen-verdict), reproduced identically by stock libdragon audio ROMs. Not a
    regression signal; ares remains the pre-hardware gate (full boot→menus→fight validated).
 
+## ✅ SCOPE CLOSED (2026-07-07 overnight) — CPU-side plan complete
+
+Every remaining ranked item is now landed, measured-neutral-but-kept, or closed with
+measured reasoning (see BUILDS-2026-07-07.md for the full table): rank 5 (io reads are
+~0.1ms — write-dominated bucket already asm-fast-pathed), rank 7 (deterministic eviction,
+landed), rank 9 (snapshot gating provably breaks WAV; bus inline priced ~1.5-2%), rank 11
+(Y-cull landed, pixel-identical, ~neutral in fights), rank 12/13 (no meat on hot paths),
+rank 4 (~2% total in the dcache-bound regime — deferred to the RSP era). Codegen sweet
+spot confirmed from both directions: -O3 +40% (2026-07-02), -Os +14% (2026-07-07).
+
+**Final in-fight state: ~22 fps median (menus 39-42, peaks 60), split snd 135% /
+m68k 69% / draw 33% / io 7%.** The remaining levers are STRUCTURAL, in order:
+(1) RSP YM2610 offload — snd is ~53% of wall; (2) RSP draw-issue offload — draw is pure
+CPU command issue; (3) rank-4 fast paths become worthwhile again only after (1)/(2).
+Runs are now near-bit-reproducible (LCG eviction), which will make the RSP session's
+A/Bs much sharper. BizHawk note: the known libdragon-audio wedge now lands at ~frame
+490-540 (was 421) — same platform limitation, no new failure class.
+
 ## ⚠️⚠️ Empirical update (2026-07-02 overnight session) — THE WALL IS SOUND, NOT THE 68K
 
 A new `[PROFILE] m68k%/snd%` split (af95d16) corrected this plan's central premise: the old
