@@ -54,6 +54,14 @@ endif
 ifdef RSPFM
 CFLAGS += -DMVS64_RSPFM
 endif
+# FM whole-pump batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM on the
+# RSP with RSP-resident dynamic state; the only synchronous wait is the
+# pipeline tail once per audio pump. Requires the rsp_fm machinery. Enable
+# with RSPWP=1; add EXTRA_DEFINES=-DMVS64_RSPWP_VERIFY for the dual-compute
+# bit-exactness gate ([RSPWP] counters).
+ifdef RSPWP
+CFLAGS += -DMVS64_RSPFM -DMVS64_RSPWP
+endif
 
 # NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
 # REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll

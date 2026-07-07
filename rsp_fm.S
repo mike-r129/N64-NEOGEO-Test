@@ -80,6 +80,7 @@
 
     RSPQ_BeginOverlayHeader
         RSPQ_DefineCommand cmd_fm_run, 12    # 0x0: a0=param, a1=out, a2=seq
+        RSPQ_DefineCommand cmd_fm_wp, 16     # 0x1: + a3=resident dyn block
     RSPQ_EndOverlayHeader
 
     RSPQ_EmptySavedState
@@ -123,6 +124,15 @@ EGT_LEFT: .dcb.b 4
 CH_MASK:  .dcb.b 4
 CH_IDX:   .dcb.b 4
 PARAM_PHYS: .dcb.b 4
+# whole-pump mode (cmd_fm_wp): the FM dynamic state chains RSP-side through
+# an RDRAM-resident block (4 x 80B, one per channel: op1_out[2]/mem_value +
+# 4 x {phase,volume,vol_out,state} in RSP slot order S1,S3,S2,S4), overlaid
+# onto each chunk's DMA'd channel block before synthesis and written back
+# after. WP_MODE selects the extra steps; DYNBUF is the staging area.
+WP_MODE:  .dcb.b 4
+DYN_PHYS: .dcb.b 4
+    .align 3                    # DMA target: DMEM address must be 8-aligned
+DYNBUF:   .dcb.b 80
 
     .text
 
@@ -147,7 +157,14 @@ PARAM_PHYS: .dcb.b 4
     # cmd_fm_run
     #############################################################
     .func cmd_fm_run
+cmd_fm_wp:
+    sw a3, %lo(DYN_PHYS)
+    li t0, 1
+    j fm_run_common
+    sw t0, %lo(WP_MODE)
 cmd_fm_run:
+    sw zero, %lo(WP_MODE)
+fm_run_common:
     sll a0, 8                   # strip the rspq command byte
     srl a0, 8
     sw a0, %lo(PARAM_PHYS)
@@ -212,8 +229,110 @@ ch_loop:
     jal DMAIn
     li t0, DMA_SIZE(416, 1)
 
+    # whole-pump: overlay the RSP-resident dynamic state over the (stale)
+    # dynamic fields the CPU packed, then apply the chunk's net key events
+    # and recompute vol_out = tl + volume (exact: the CPU hatches any
+    # SSG-EG use, and this core's key handlers never touch volume).
+    lw t0, %lo(WP_MODE)
+    beqz t0, wp_in_done
+    nop
+    lw t2, %lo(CH_IDX)
+    sll t3, t2, 6
+    sll t4, t2, 4
+    addu t3, t4                 # idx*80
+    lw s0, %lo(DYN_PHYS)
+    addu s0, t3
+    li s4, %lo(DYNBUF)
+    jal DMAIn
+    li t0, DMA_SIZE(80, 1)
+    # channel header: op1_out[0], op1_out[1], mem_value
+    lw t0, %lo(DYNBUF) + 0
+    sw t0, %lo(CHBUF) + 0
+    lw t0, %lo(DYNBUF) + 4
+    sw t0, %lo(CHBUF) + 4
+    lw t0, %lo(DYNBUF) + 8
+    sw t0, %lo(CHBUF) + 8
+    # key-event byte for this channel: HDR+272+idx, 2 bits per slot in RSP
+    # slot order (0=none 1=ON 2=OFF 3=ON_then_OFF)
+    lw t2, %lo(CH_IDX)
+    li t6, %lo(HDR) + 272
+    addu t6, t2
+    lbu t5, 0(t6)
+    li t7, 4                    # slot counter
+    li t8, %lo(DYNBUF) + 16
+    li t9, %lo(CHBUF) + 288
+wp_slot_in:
+    lw t0, 0(t8)                # phase
+    lw t1, 4(t8)                # volume
+    lw t3, 12(t8)               # state (widened to u32 in the dyn block)
+    andi t4, t5, 3
+    beqz t4, wp_apply
+    srl t5, 2
+    li t2, 2
+    beq t4, t2, wp_key_off
+    li t2, 1                    # ON and ON_OFF both restart the phase
+    move t0, zero
+    beq t4, t2, wp_apply
+    li t3, 4                    # ON: state = EG_ATT(4)
+    j wp_apply
+    li t3, 1                    # ON_OFF: state = EG_REL(1), unconditional
+wp_key_off:
+    slt t2, t2, t3              # OFF: only an active slot (state>1) releases
+    beqz t2, wp_apply
+    nop
+    li t3, 1
+wp_apply:
+    sw t0, 0(t9)                # phase
+    sw t1, 4(t9)                # volume
+    lhu t2, 16(t9)              # tl (static, from the fresh CPU pack)
+    addu t2, t1
+    sw t2, 8(t9)                # vol_out = tl + volume
+    sb t3, 28(t9)               # state
+    addiu t7, -1
+    addiu t8, 16
+    bnez t7, wp_slot_in
+    addiu t9, 32
+wp_in_done:
+
     jal fm_chan
     li s1, %lo(CHBUF)
+
+    # whole-pump: write the evolved dynamic state back to the resident block
+    lw t0, %lo(WP_MODE)
+    beqz t0, wp_out_done
+    nop
+    lw t0, %lo(CHBUF) + 0
+    sw t0, %lo(DYNBUF) + 0
+    lw t0, %lo(CHBUF) + 4
+    sw t0, %lo(DYNBUF) + 4
+    lw t0, %lo(CHBUF) + 8
+    sw t0, %lo(DYNBUF) + 8
+    li t7, 4
+    li t8, %lo(DYNBUF) + 16
+    li t9, %lo(CHBUF) + 288
+wp_slot_out:
+    lw t0, 0(t9)
+    sw t0, 0(t8)
+    lw t0, 4(t9)
+    sw t0, 4(t8)
+    lw t0, 8(t9)
+    sw t0, 8(t8)
+    lbu t0, 28(t9)
+    sw t0, 12(t8)
+    addiu t7, -1
+    addiu t8, 16
+    bnez t7, wp_slot_out
+    addiu t9, 32
+    lw t2, %lo(CH_IDX)
+    sll t3, t2, 6
+    sll t4, t2, 4
+    addu t3, t4
+    lw s0, %lo(DYN_PHYS)
+    addu s0, t3
+    li s4, %lo(DYNBUF)
+    jal DMAOut
+    li t0, DMA_SIZE(80, 1)
+wp_out_done:
 
     # echo the updated channel block: out + 1024 + idx*416
     lw t2, %lo(CH_IDX)

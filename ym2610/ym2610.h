@@ -72,6 +72,17 @@ int  YM2610TimerOver(int channel);
 void YM2610Update(int *p);
 void YM2610Update_stream(int length);
 
+#if defined(N64) && defined(MVS64_RSPWP)
+/* Whole-pump deferred FM (WHOLEPUMP-DESIGN.md): the caller (emit) points
+ * dest_base at the uncached AI position of the span BEFORE calling
+ * YM2610Update_stream — deferred chunks write their final samples there at
+ * collect time. YM2610_wp_finish() drains everything in flight and MUST run
+ * before the pump returns its buffer to the AI. */
+extern short *ym2610_wp_dest_base;
+void YM2610_wp_finish(void);
+void YM2610_wp_mark_emitted(void);
+#endif
+
 #ifdef SOUND_TEST
 void YM2610Update_SoundTest(int p);
 #endif

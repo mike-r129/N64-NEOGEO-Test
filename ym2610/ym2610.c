@@ -3414,11 +3414,12 @@ static void rspfm_pm_dp(FM_OPN *OPN, FM_CH *CH, u32 lfo_pm, u32 dp[4]) {
 /* Pack one channel into param block slot j. Returns 0 if the channel must
  * stay on the CPU this chunk (SSG-EG in use, or >8 distinct lfo_pm values).
  * Must run BEFORE any C code mutates the channel this chunk. */
-static int rspfm_pack_chan(FM_OPN *OPN, FM_CH *CH, int j, int n,
+static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
+		int j, int n,
 		const u8 *lfo_pm_arr, u32 panl, u32 panr,
 		int i_memc, int i_om1, int i_om2, int i_oc1,
 		u32 eg_base, u32 eg_end) {
-	rspfm_ch_t * const p = &rspfm_pb.ch[j];
+	rspfm_ch_t * const p = &pbp->ch[j];
 	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
 	int s, i;
 	u16 masks = 0;
@@ -3679,6 +3680,327 @@ static void rspfm_verify_cmp(int n, const s32 *refl, const s32 *refr,
 		rspfm_badchunks++;
 }
 #endif /* MVS64_RSPFM_VERIFY */
+
+#ifndef YM_CHUNK
+#define YM_CHUNK 128
+#endif
+
+#ifdef MVS64_RSPWP
+/* ============================================================================
+ * Whole-pump deferred FM (WHOLEPUMP-DESIGN.md). The FM dynamic state lives
+ * in an RDRAM block owned by the RSP; each chunk command overlays it onto a
+ * freshly-packed static param block, applies the chunk's net key events,
+ * synthesizes with the existing bit-exact core, and chains the state
+ * forward. The CPU never waits per chunk: pending chunks carry their
+ * SSG+ADPCM partial sums and their AI-buffer destination, and are finally
+ * mixed at opportunistic polls or the pump-end force-finish.
+ * ==========================================================================*/
+#define RSPWP_RING 16
+typedef struct { u32 phase; s32 volume; u32 vol_out; u32 state; } rspwp_dslot_t;
+typedef struct {
+	s32 op1_out[2];
+	s32 mem_value;
+	u32 pad;
+	rspwp_dslot_t s[4];   /* RSP slot order S1,S3,S2,S4 */
+} rspwp_dch_t;
+_Static_assert(sizeof(rspwp_dch_t) == 80, "rspwp dyn layout");
+
+static rspwp_dch_t rspwp_dyn[4] __attribute__((aligned(16)));
+static rspfm_param_t rspwp_pbr[RSPWP_RING];
+static rspfm_out_t rspwp_obr[RSPWP_RING];
+
+typedef struct {
+	s32 acc_l[YM_CHUNK], acc_r[YM_CHUNK];   /* SSG+ADPCM+deltaT partial */
+	int n;                                  /* 0 = slot free */
+	u32 seq;
+	int16_t *dest;                          /* uncached AI position */
+#ifdef MVS64_RSPWP_VERIFY
+	s32 ref_l[YM_CHUNK], ref_r[YM_CHUNK];
+	rspwp_dch_t refdyn[4];
+#endif
+} rspwp_pend_t;
+static rspwp_pend_t rspwp_pend[RSPWP_RING];
+static u32 rspwp_seq, rspwp_coll, rspwp_emitted;
+static int rspwp_seeded, rspwp_dead2;
+static u32 rspwp_pack_hatches;
+int16_t *ym2610_wp_dest_base;   /* set by emit() around Update_stream */
+#ifdef MVS64_RSPWP_VERIFY
+static u32 rspwp_chunks, rspwp_badchunks, rspwp_badsamp, rspwp_badstate;
+#endif
+
+static const u8 rspwp_slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
+
+static void rspwp_seed(FM_CH **cch) {
+	int j, s;
+	for (j = 0; j < 4; j++) {
+		const FM_CH * const CH = cch[j];
+		rspwp_dch_t * const d = &rspwp_dyn[j];
+		d->op1_out[0] = CH->op1_out[0];
+		d->op1_out[1] = CH->op1_out[1];
+		d->mem_value = CH->mem_value;
+		d->pad = 0;
+		for (s = 0; s < 4; s++) {
+			const FM_SLOT * const SL = &CH->SLOT[(int) rspwp_slot_names[s]];
+			d->s[s].phase = SL->phase;
+			d->s[s].volume = SL->volume;
+			d->s[s].vol_out = SL->vol_out;
+			d->s[s].state = SL->state;
+		}
+	}
+	data_cache_hit_writeback_invalidate(rspwp_dyn, sizeof(rspwp_dyn));
+	rspwp_seeded = 1;
+}
+
+/* Pull the RSP-resident state back into the CPU structs (hatch/disable
+ * path; pendings must already be drained so the block is final). */
+static void rspwp_adopt(FM_CH **cch) {
+	int j, s;
+	data_cache_hit_invalidate(rspwp_dyn, sizeof(rspwp_dyn));
+	for (j = 0; j < 4; j++) {
+		FM_CH * const CH = cch[j];
+		const rspwp_dch_t * const d = &rspwp_dyn[j];
+		CH->op1_out[0] = d->op1_out[0];
+		CH->op1_out[1] = d->op1_out[1];
+		CH->mem_value = d->mem_value;
+		for (s = 0; s < 4; s++) {
+			FM_SLOT * const SL = &CH->SLOT[(int) rspwp_slot_names[s]];
+			unsigned int out;
+			SL->phase = d->s[s].phase;
+			SL->volume = (s32) d->s[s].volume;
+			SL->state = (u8) d->s[s].state;
+			/* recompute vol_out with the CURRENT ssg/ssgn: an SSG-EG
+			 * enable write may have just tripped the hatch, and its
+			 * set-time recompute used the stale CPU volume */
+			out = SL->tl + (u32) SL->volume;
+			if ((SL->ssg & 0x08) && (SL->ssgn & 2))
+				out ^= ((1 << ENV_BITS) - 1);
+			SL->vol_out = out;
+		}
+		/* pm cache exactly as C would have left it after the last kicked
+		 * pm-active chunk (rspfm_pack_chan refreshed these at pack time) */
+		if (CH->pms) {
+			CH->pm_key = rspfm_pmkey_last[j];
+			CH->pm_dp[0] = rspfm_pmdp_last[j][0];
+			CH->pm_dp[1] = rspfm_pmdp_last[j][1];
+			CH->pm_dp[2] = rspfm_pmdp_last[j][2];
+			CH->pm_dp[3] = rspfm_pmdp_last[j][3];
+		}
+	}
+	rspwp_seeded = 0;
+}
+
+#ifdef MVS64_RSPWP_VERIFY
+static void rspwp_verify_cmp(const rspwp_pend_t *pd, const rspfm_out_t *ob) {
+	static int prints;
+	int i, j, s, bad = 0;
+	for (i = 0; i < pd->n; i++) {
+		if (ob->l[i] != pd->ref_l[i] || ob->r[i] != pd->ref_r[i]) {
+			bad++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPWP] SAMPDIFF seq=%lu i=%d rsp=%ld/%ld c=%ld/%ld\n",
+						(unsigned long) pd->seq, i, (long) ob->l[i],
+						(long) ob->r[i], (long) pd->ref_l[i],
+						(long) pd->ref_r[i]);
+			}
+		}
+	}
+	rspwp_badsamp += (u32) bad;
+	for (j = 0; j < 4; j++) {
+		const rspfm_ch_t * const e = &ob->echo[j];
+		const rspwp_dch_t * const rd = &pd->refdyn[j];
+		for (s = 0; s < 4; s++) {
+			const rspfm_slot_t * const q = &e->slot[s];
+			if (q->phase != rd->s[s].phase
+					|| q->volume != (s32) rd->s[s].volume
+					|| q->vol_out != rd->s[s].vol_out
+					|| q->state != (u8) rd->s[s].state) {
+				bad++;
+				rspwp_badstate++;
+				if (prints < 8) {
+					prints++;
+					debugf("[RSPWP] SLOTSTATE ch%d s%d rsp=%lx/%ld/%lu/%d "
+							"c=%lx/%ld/%lu/%lu\n", j, s,
+							(unsigned long) q->phase, (long) q->volume,
+							(unsigned long) q->vol_out, q->state,
+							(unsigned long) rd->s[s].phase,
+							(long) rd->s[s].volume,
+							(unsigned long) rd->s[s].vol_out,
+							(unsigned long) rd->s[s].state);
+				}
+			}
+		}
+		if (e->op1_out[0] != rd->op1_out[0] || e->op1_out[1] != rd->op1_out[1]
+				|| e->mem_value != rd->mem_value) {
+			bad++;
+			rspwp_badstate++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPWP] CHSTATE ch%d rsp=%ld/%ld/%ld c=%ld/%ld/%ld\n",
+						j, (long) e->op1_out[0], (long) e->op1_out[1],
+						(long) e->mem_value, (long) rd->op1_out[0],
+						(long) rd->op1_out[1], (long) rd->mem_value);
+			}
+		}
+	}
+	if (bad)
+		rspwp_badchunks++;
+}
+#endif
+
+/* Collect the oldest pending chunk: final-mix acc + RSP FM into the AI
+ * destination. block=0: only if the RSP already finished (returns 0 to try
+ * later). block=1: wait, with a timeout that declares the offload dead. */
+static int rspwp_collect(int block) {
+	const int slot = (int) (rspwp_coll % RSPWP_RING);
+	rspwp_pend_t * const pd = &rspwp_pend[slot];
+	rspfm_out_t * const ob = &rspwp_obr[slot];
+	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&ob->seq);
+	int i;
+	if (!pd->n)
+		return 0;
+	if (*seqp != pd->seq) {
+		u32 t0;
+		if (!block)
+			return 0;
+		t0 = TICKS_READ();
+		while (*seqp != pd->seq)
+			if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50))
+				return 0;
+	}
+	/* ob was cache-invalidated before the kick: cached reads are fresh */
+	for (i = 0; i < pd->n; i++) {
+		s32 lt = (pd->acc_l[i] + ob->l[i]) << 1;
+		s32 rt = (pd->acc_r[i] + ob->r[i]) << 1;
+		Limit(lt, MAXOUT, MINOUT);
+		Limit(rt, MAXOUT, MINOUT);
+		((u32 *) pd->dest)[i] = ((u32) (u16) lt << 16) | (u16) (s16) rt;
+	}
+#ifdef MVS64_RSPWP_VERIFY
+	rspwp_chunks++;
+	rspwp_verify_cmp(pd, ob);
+	if ((rspwp_chunks & 1023) == 0)
+		debugf("[RSPWP] chunks=%lu badchunks=%lu badsamp=%lu badstate=%lu "
+				"hatches=%lu\n", (unsigned long) rspwp_chunks,
+				(unsigned long) rspwp_badchunks,
+				(unsigned long) rspwp_badsamp,
+				(unsigned long) rspwp_badstate,
+				(unsigned long) (wp_hatch_count + rspwp_pack_hatches));
+#endif
+	pd->n = 0;
+	rspwp_coll++;
+	return 1;
+}
+
+/* Drain everything in flight (pump end, or before a hatch resync). On
+ * timeout the FM contribution of the stuck chunks is lost (zero-filled
+ * destinations already hold the SSG+ADPCM mix garbage from emit's copy):
+ * declare the offload dead — audio continues on the CPU path. */
+void YM2610_wp_finish(void) {
+	rspwp_emitted = rspwp_seq;
+	while (rspwp_coll < rspwp_seq) {
+		if (!rspwp_collect(1)) {
+			debugf("[RSPWP] TIMEOUT seq=%lu coll=%lu — offload dead\n",
+					(unsigned long) rspwp_seq, (unsigned long) rspwp_coll);
+			rspwp_dead2 = 1;
+			/* drop the stuck chunks; their dests keep the emit copy */
+			while (rspwp_coll < rspwp_seq) {
+				rspwp_pend[rspwp_coll % RSPWP_RING].n = 0;
+				rspwp_coll++;
+			}
+			break;
+		}
+	}
+}
+
+/* Called by emit() right after its play_buffer->AI copy: chunks of this
+ * span may now write their final samples over it. Collecting before that
+ * copy would get clobbered by it (the deferred spans of play_buffer hold
+ * garbage). Also folds in any chunks that finished meanwhile. */
+void YM2610_wp_mark_emitted(void) {
+	rspwp_emitted = rspwp_seq;
+	while (rspwp_coll < rspwp_emitted && rspwp_collect(0))
+		;
+}
+
+/* Kick one deferred chunk. Returns 0 (and trips the hatch) if any channel
+ * can't be packed (SSG-EG in use / >8 distinct lfo_pm). */
+static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
+		const u8 *lfo_pm_arr, const u8 *egt_arr, const u8 *lfo_am_arr,
+		u32 eg_base, int16_t *dest) {
+	static const u8 fmn2[4] = { 1, 2, 4, 5 };
+	const int slot = (int) (rspwp_seq % RSPWP_RING);
+	rspfm_param_t * const pb = &rspwp_pbr[slot];
+	int j;
+	/* opportunistic: fold any finished, already-emitted chunks in */
+	while (rspwp_coll < rspwp_emitted && rspwp_collect(0))
+		;
+	/* ring full? the oldest must complete before its slot is reused. It is
+	 * always from an earlier, fully-emitted span (a span is at most 8
+	 * chunks and the ring holds 16), so collecting it here cannot race
+	 * emit's play_buffer copy. */
+	if (rspwp_seq - rspwp_coll >= RSPWP_RING) {
+		if (rspwp_coll >= rspwp_emitted || !rspwp_collect(1)) {
+			rspwp_dead2 = 1;
+			return 0;
+		}
+	}
+	for (j = 0; j < 4; j++) {
+		FM_CH * const CH = cch[j];
+		const int algo = CH->ALGO & 7;
+		if (!rspfm_pack_chan(pb, OPN, CH, j, n, lfo_pm_arr,
+				OPN->pan[fmn2[j] * 2 + 0], OPN->pan[fmn2[j] * 2 + 1],
+				ccs_memc[algo], ccs_om1[algo], ccs_om2[algo],
+				ccs_oc1[algo], eg_base, OPN->eg_cnt)) {
+			wp_hatch = 1;
+			rspwp_pack_hatches++;
+			return 0;
+		}
+		/* no CPU-side skip knowledge: all slots due, no quiet locks */
+		pb->ch[j].masks = 0x000F;
+		/* net key events since the last shipped chunk, RSP slot order */
+		pb->pad1[j] = (u8) (wp_keyev[j][SLOT1] | (wp_keyev[j][SLOT3] << 2)
+				| (wp_keyev[j][SLOT2] << 4) | (wp_keyev[j][SLOT4] << 6));
+	}
+	memset(wp_keyev, 0, sizeof(wp_keyev));
+	wp_dirty[0] = wp_dirty[1] = wp_dirty[2] = wp_dirty[3] = 0;
+	pb->sinq_phys = PhysicalAddr(sin_tab);
+	pb->tlb_phys = PhysicalAddr(tl_tab_base);
+	pb->n = (u16) n;
+	pb->chmask = 0xF;
+	pb->eg_base = eg_base;
+	memcpy(pb->egt, egt_arr, (size_t) n);
+	memcpy(pb->lfo_am, lfo_am_arr, (size_t) n);
+	rspwp_seq++;
+	rspwp_pend[slot].n = n;
+	rspwp_pend[slot].seq = rspwp_seq;
+	rspwp_pend[slot].dest = dest;
+	data_cache_hit_writeback(pb, sizeof(*pb));
+	data_cache_hit_invalidate(&rspwp_obr[slot], sizeof(rspfm_out_t));
+	rspq_highpri_begin();
+	rspq_write(RSP_FM_OVL_ID, 0x1, PhysicalAddr(pb),
+			PhysicalAddr(&rspwp_obr[slot]), rspwp_pend[slot].seq,
+			PhysicalAddr(rspwp_dyn));
+	rspq_highpri_end();
+	return 1;
+}
+
+/* Ready gate + seed/disable transitions; call at each chunk top. */
+static int rspwp_ok(FM_CH **cch) {
+	if (!rspfm_checked)
+		rspfm_init();
+	if (rspfm_dead || rspwp_dead2 || wp_hatch) {
+		if (rspwp_seeded) {
+			YM2610_wp_finish();
+			rspwp_adopt(cch);
+		}
+		return 0;
+	}
+	if (!rspwp_seeded)
+		rspwp_seed(cch);
+	return 1;
+}
+#endif /* MVS64_RSPWP */
 #endif /* N64 && MVS64_RSPFM */
 
 /*********************************************************************************************/
@@ -3751,6 +4073,15 @@ void YM2610ChangeSamplerate(int rate) {
 void YM2610Reset(void) {
 	int i;
 	FM_OPN *OPN = &YM2610.OPN;
+
+#if defined(N64) && defined(MVS64_RSPWP)
+	/* Reset happens between pumps, so no chunks are in flight; drop the
+	 * RSP-resident state and any accumulated key events — the next chunk
+	 * reseeds from the freshly-reset CPU structs. */
+	rspwp_seeded = 0;
+	memset(wp_keyev, 0, sizeof(wp_keyev));
+	memset(wp_dirty, 0, sizeof(wp_dirty));
+#endif
 
 	/* Reset Prescaler */
 	OPNSetPres(OPN, 6 * 24, 6 * 24, 4 * 2); /* OPN 1/6, SSG 1/4 */
@@ -3981,7 +4312,9 @@ extern Uint16 play_buffer[16384];
 
 /* MVS64: samples per channel-major batch. 64 keeps the per-chunk scratch
  * (~1KB) plus one channel's state inside the VR4300's 8KB dcache. */
-#define YM_CHUNK 128
+#ifndef YM_CHUNK
+#define YM_CHUNK 128   /* also defined earlier for the whole-pump structs */
+#endif
 
 /* Generate samples for one of the YM2610s */
 void YM2610Update_stream(int length) {
@@ -4054,6 +4387,9 @@ void YM2610Update_stream(int length) {
 		const int dtr = (dti == OUTD_RIGHT || dti == OUTD_CENTER);
 		/* out_fm index of the four active OPNB FM channels */
 		static const u8 fmn[4] = { 1, 2, 4, 5 };
+#ifdef MVS64_RSPWP
+		int wp_off = 0;   /* sample offset of this chunk within the call */
+#endif
 
 		while (length > 0) {
 			const int n = length < YM_CHUNK ? length : YM_CHUNK;
@@ -4097,11 +4433,36 @@ void YM2610Update_stream(int length) {
 			YMPROF_A(0, a);
 
 #if defined(N64) && defined(MVS64_RSPFM)
+			int fm_any = 0;
+#ifdef MVS64_RSPWP
+			/* Whole-pump: kick this chunk deferred (RSP-resident state, no
+			 * wait). On any hatch, drain + adopt and fall through to the
+			 * plain CPU path for this and all further chunks. */
+			int wp_this = 0;
+			if (ym2610_wp_dest_base && rspwp_ok(cch)) {
+				wp_this = rspwp_kick_chunk(OPN, cch, n, lfo_pm, egt, lfo_am,
+						eg_base, ym2610_wp_dest_base + wp_off * 2);
+				if (!wp_this)
+					(void) rspwp_ok(cch);   /* hatch: drain + adopt now */
+			} else if (rspwp_seeded) {
+				YM2610_wp_finish();
+				rspwp_adopt(cch);
+			}
+#ifdef MVS64_RSPWP_VERIFY
+			if (wp_this) {
+				rspwp_pend_t * const pdz =
+						&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
+				for (i = 0; i < n; i++) {
+					pdz->ref_l[i] = 0;
+					pdz->ref_r[i] = 0;
+				}
+			}
+#endif
+#else /* !MVS64_RSPWP: per-chunk ship-half path */
 			/* MVS64: ship the eligible FM channels to the RSP now, so it
 			 * synthesizes them underneath the CPU's remaining passes.
 			 * Packing MUST happen before any C code mutates channel state
 			 * this chunk; silent channels stay on the CPU fast path. */
-			int fm_any = 0;
 			if (!rspfm_checked)
 				rspfm_init();
 			if (!rspfm_dead) {
@@ -4126,7 +4487,7 @@ void YM2610Update_stream(int length) {
 					    && CH->op1_out[0] == 0 && CH->op1_out[1] == 0
 					    && CH->mem_value == 0)
 						continue;   /* silent: CPU batch-advances phases */
-					if (rspfm_pack_chan(OPN, CH, j, n, lfo_pm,
+					if (rspfm_pack_chan(&rspfm_pb, OPN, CH, j, n, lfo_pm,
 							OPN->pan[fmn[j] * 2 + 0],
 							OPN->pan[fmn[j] * 2 + 1],
 							ccs_memc[algo], ccs_om1[algo],
@@ -4150,6 +4511,7 @@ void YM2610Update_stream(int length) {
 				}
 			}
 #endif
+#endif /* MVS64_RSPWP */
 #endif
 
 			/* pass 1: FM — each channel replays the same EG tick schedule
@@ -4163,6 +4525,20 @@ void YM2610Update_stream(int length) {
 				s32 *fm_al = acc_l, *fm_ar = acc_r;
 
 #if defined(N64) && defined(MVS64_RSPFM)
+#ifdef MVS64_RSPWP
+				if (wp_this) {
+#ifdef MVS64_RSPWP_VERIFY
+					/* C stays authoritative; synthesize into the pending
+					 * chunk's ref arrays for the deferred 1:1 compare */
+					rspwp_pend_t * const pdv =
+							&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
+					fm_al = pdv->ref_l;
+					fm_ar = pdv->ref_r;
+#else
+					continue;   /* the RSP owns all FM channels this chunk */
+#endif
+				}
+#endif
 				if (fm_any && (rspfm_pb.chmask & (1 << j))) {
 #ifdef MVS64_RSPFM_VERIFY
 					/* C stays authoritative but synthesizes into the ref
@@ -4426,6 +4802,42 @@ void YM2610Update_stream(int length) {
 
 			/* pass 4: mix + output */
 			YMPROF_T(e);
+#ifdef MVS64_RSPWP
+			if (wp_this) {
+				/* Deferred: bank the SSG+ADPCM+deltaT partial with the
+				 * pending chunk; the collect adds the RSP FM, clamps and
+				 * writes the AI destination directly. play_buffer keeps
+				 * garbage for this span (emit's copy of it is overwritten
+				 * at collect, always before the pump returns). */
+				rspwp_pend_t * const pd =
+						&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
+				for (i = 0; i < n; i++) {
+					pd->acc_l[i] = acc_l[i] + (dtl ? (dtb[i] >> 9) : 0);
+					pd->acc_r[i] = acc_r[i] + (dtr ? (dtb[i] >> 9) : 0);
+				}
+				pl += 2 * n;
+#ifdef MVS64_RSPWP_VERIFY
+				/* snapshot the authoritative CPU dynamics as of this
+				 * chunk's end for the deferred state compare */
+				for (j = 0; j < 4; j++) {
+					const FM_CH * const CH = cch[j];
+					rspwp_dch_t * const d = &pd->refdyn[j];
+					int s2;
+					d->op1_out[0] = CH->op1_out[0];
+					d->op1_out[1] = CH->op1_out[1];
+					d->mem_value = CH->mem_value;
+					for (s2 = 0; s2 < 4; s2++) {
+						const FM_SLOT * const SL =
+								&CH->SLOT[(int) rspwp_slot_names[s2]];
+						d->s[s2].phase = SL->phase;
+						d->s[s2].volume = SL->volume;
+						d->s[s2].vol_out = SL->vol_out;
+						d->s[s2].state = SL->state;
+					}
+				}
+#endif
+			} else
+#endif
 			for (i = 0; i < n; i++) {
 				lt = acc_l[i];
 				rt = acc_r[i];
@@ -4444,6 +4856,9 @@ void YM2610Update_stream(int length) {
 			}
 			YMPROF_A(4, e);
 
+#ifdef MVS64_RSPWP
+			wp_off += n;
+#endif
 			length -= n;
 		}
 	}

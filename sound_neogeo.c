@@ -450,7 +450,17 @@ static void emit(int16_t *out, int from, int count) {
 #if defined(SND_HEALTH) && defined(N64)
 	uint32_t _t0 = TICKS_READ();
 #endif
+#if defined(N64) && defined(MVS64_RSPWP)
+	/* Whole-pump deferred FM: deferred chunks write their final samples
+	 * straight into this span at collect time (the play_buffer copy below
+	 * carries garbage for those ranges until then; everything is complete
+	 * before sound_gen_samples returns the buffer — see YM2610_wp_finish). */
+	ym2610_wp_dest_base = out + from * 2;
 	YM2610Update_stream(count);
+	ym2610_wp_dest_base = NULL;
+#else
+	YM2610Update_stream(count);
+#endif
 #ifdef N64
 	// `out` is an UNCACHED AI buffer: every store is a separate RDRAM
 	// transaction, so pack each stereo frame into ONE 32-bit store (big-endian:
@@ -461,6 +471,11 @@ static void emit(int16_t *out, int from, int count) {
 		for (int i = 0; i < count; i++)
 			dst[i] = ((uint32_t)play_buffer[i * 2 + 0] << 16) | play_buffer[i * 2 + 1];
 	}
+#ifdef MVS64_RSPWP
+	/* Only now may this span's deferred chunks land their final samples
+	 * (collecting earlier would be clobbered by the copy above). */
+	YM2610_wp_mark_emitted();
+#endif
 #else
 	for (int i = 0; i < count; i++) {
 		out[(from + i) * 2 + 0] = (int16_t)play_buffer[i * 2 + 0];
@@ -593,6 +608,13 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		if (target > produced) { if (!silent) emit(out, produced, target - produced); produced = target; }
 	}
 	if (produced < nsamples && !silent) emit(out, produced, nsamples - produced);
+
+#if defined(N64) && defined(MVS64_RSPWP)
+	/* The AI consumes this buffer once we return: every deferred FM chunk
+	 * must have landed its final samples by now (pipeline tail wait, the
+	 * only synchronous RSP wait in the whole-pump design). */
+	YM2610_wp_finish();
+#endif
 
 	if (snd_dbg)
 		plat_log("[SND] z80 pc=%04x code=%02x result=%02x timers=%d%d s0=%d\n",
