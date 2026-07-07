@@ -165,6 +165,11 @@ uint32_t profile_hw_io;
 uint32_t profile_dma_load;
 uint32_t profile_m68k;   // ticks inside the 68k core this frame (incl. MMIO)
 uint32_t profile_snd;    // ticks synthesizing audio (Z80+YM2610) this frame
+#ifdef MVS64_PERFCOUNT
+// Draw-bucket split (see emu_render): framebuffer-wait vs command issue vs
+// detach. Diagnostic builds only.
+uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+#endif
 
 static uint64_t m68k_exec(uint64_t clock) {
 	clock /= M68K_CLOCK_DIV;
@@ -308,9 +313,23 @@ uint32_t emu_render(void *arg) {
 	#ifdef N64
 	uint32_t t0 = TICKS_READ();
 	#endif
+	#if defined(N64) && defined(MVS64_PERFCOUNT)
+	// Split the draw bucket: display_get/attach wait vs command issue vs
+	// detach — tells whether draw% is CPU work or RSP/RDP back-pressure.
+	extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+	plat_beginframe();
+	perf_draw_wait = TICKS_DISTANCE(t0, TICKS_READ());
+	uint32_t t1 = TICKS_READ();
+	video_render();
+	perf_draw_issue = TICKS_DISTANCE(t1, TICKS_READ());
+	uint32_t t2 = TICKS_READ();
+	plat_endframe();
+	perf_draw_end = TICKS_DISTANCE(t2, TICKS_READ());
+	#else
 	plat_beginframe();
 	video_render();
 	plat_endframe();
+	#endif
 
 	rom_next_frame();
 
@@ -510,13 +529,21 @@ int main(int argc, char *argv[]) {
 		#ifdef MVS64_PERFCOUNT
 		{
 			// Diagnostic counters (m64k_asm.S / hw_n64.S): executed 68k
-			// instructions, idle-skip fires and TLB exceptions this frame.
+			// instructions, idle-skip fires and TLB exceptions this frame,
+			// plus the draw-bucket split from emu_render (in 0.01%-of-frame
+			// units to stay integer: 100.00% == 10000).
 			extern uint32_t perf_m68k_insns, perf_idle_skips, perf_tlb_faults;
-			framef("[PERF] insns=%lu skips=%lu tlb=%lu\n",
+			extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+			const uint32_t fb = TICKS_PER_SECOND / 60 / 10000;  // ticks per 0.01%
+			framef("[PERF] insns=%lu skips=%lu tlb=%lu dwait=%lu dissue=%lu dend=%lu\n",
 				(unsigned long)perf_m68k_insns,
 				(unsigned long)perf_idle_skips,
-				(unsigned long)perf_tlb_faults);
+				(unsigned long)perf_tlb_faults,
+				(unsigned long)(perf_draw_wait / fb),
+				(unsigned long)(perf_draw_issue / fb),
+				(unsigned long)(perf_draw_end / fb));
 			perf_m68k_insns = perf_idle_skips = perf_tlb_faults = 0;
+			perf_draw_wait = perf_draw_issue = perf_draw_end = 0;
 		}
 		#endif
 		#ifdef MVS64_IDLEPROBE
