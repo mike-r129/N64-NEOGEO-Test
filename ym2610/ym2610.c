@@ -899,6 +899,21 @@ INLINE void FM_BUSY_SET(FM_ST *ST, int busyclock) {
  * whose static params changed and need a re-pack; wp_hatch trips on SSG-EG
  * enable (dynamic ssgn mutation the RSP port excludes -> CPU-only resync). */
 enum { WPK_NONE = 0, WPK_ON = 1, WPK_OFF = 2, WPK_ON_OFF = 3 };
+/* ADPCM defer (WP-M2-lite): the per-chunk RSP ADPCM round trip stays, but
+ * the wait+adopt moves to the NEXT chunk's top, where a whole chunk of CPU
+ * work has already covered the RSP ([RSPWAIT] adpcm was ~11ms/pump paid at
+ * pass 3 with only ~0.4ms of cover). Lockstep-1 keeps rspa_build correct:
+ * it always runs right after the previous chunk was adopted. Channels
+ * keyed on while a chunk is in flight are marked fresh so the late adopt
+ * cannot clobber the key-on reset; end flags are computed EAGERLY at build
+ * time from the (decode-independent) address arithmetic so the Z80 reads
+ * them with exactly the C core's timing. */
+static u8 wpa_fresh, wpb_fresh;
+static u8 rspa_eager_flags;
+static int rspa_prev_pend, rspa_prev_slot, rspa_prev_n, rspa_prev_pidx;
+static u32 rspa_prev_seq;
+static u8 rspa_prev_amask, rspa_prev_rb;
+static s32 rspa_prev_dtl, rspa_prev_dtr;
 static u8 wp_keyev[4][4];   /* [fm chan 0..3 = CH 1,2,4,5][slot 0..3] */
 static u8 wp_dirty[4];
 static u8 wp_hatch;
@@ -2474,6 +2489,9 @@ static void OPNB_ADPCMA_write(int r, int v) {
 					adpcma[c].adpcma_step = 0;
 					adpcma[c].adpcma_out = 0;
 					adpcma[c].flag = 1;
+#if defined(N64) && defined(MVS64_RSPWP)
+					wpa_fresh |= (u8) (1 << c);
+#endif
 
 					/* MVS64: "mapped" = resident OR streamed (pcmsizeA > 0) */
 					if (pcmbufA == NULL && pcmsizeA == 0) {
@@ -2656,6 +2674,9 @@ static void OPNB_ADPCMB_write(ADPCMB *adpcmb, int r, int v) {
 //		if (adpcmb->portstate & 0x20) /* do we access external memory? */
 		{
 			adpcmb->now_addr = adpcmb->start << 1;
+#if defined(N64) && defined(MVS64_RSPWP)
+			wpb_fresh = 1;
+#endif
 			adpcmb->memread = 2; /* two dummy reads needed before accesing external memory via register $08*/
 
 			/* if yes, then let's check if ADPCM memory is mapped and big enough */
@@ -2950,10 +2971,18 @@ _Static_assert(sizeof(rspa_out_t) == 1424, "rspa_out_t size");
  * src_phys + (src_cur & ~7), so a buffer must cover the worst-case cursor
  * (rounded down) + 176. At 11025Hz output: A consumes <= ~110 bytes per
  * 128-sample chunk (fixed 18.5kHz nibble rate), B <= ~325 (delta=0xFFFF). */
-static u8 rspa_srcA[6][352] __attribute__((aligned(16)));
-static u8 rspa_srcB[768] __attribute__((aligned(16)));
-static rspa_param_t rspa_pb;
-static rspa_out_t rspa_ob;
+/* Double-buffered for the WP deferred adopt (chunk k+1's staging and param
+ * must not overwrite what the RSP may still be reading for chunk k). The
+ * non-WP paths keep rspa_cur == 0 and behave exactly as before. */
+static u8 rspa_srcAs[2][6][352] __attribute__((aligned(16)));
+static u8 rspa_srcBs[2][768] __attribute__((aligned(16)));
+static rspa_param_t rspa_pbs[2];
+static rspa_out_t rspa_obs[2];
+static int rspa_cur;
+#define rspa_srcA (rspa_srcAs[rspa_cur])
+#define rspa_srcB (rspa_srcBs[rspa_cur])
+#define rspa_pb (rspa_pbs[rspa_cur])
+#define rspa_ob (rspa_obs[rspa_cur])
 static u32 rspa_seqno;
 static int rspa_dead;   /* poll timeout observed -> permanent C fallback */
 #ifdef MVS64_RSPADPCM_VERIFY
@@ -3026,6 +3055,16 @@ static int rspa_build(int n, int dtl, int dtr) {
 		p->flag_out = 1;
 		rspa_pb.amask |= (u8) (1 << c);
 		any = 1;
+#if defined(MVS64_RSPWP)
+		/* WP defer: the adopt lands one chunk late, but arrival is a pure
+		 * function of the address walk — flag it NOW so a Z80 status read
+		 * between the chunks sees exactly the C core's timing. The late
+		 * adopt re-applies the same values (idempotent). */
+		if (rspa_eager_flags && nib == to_end) {
+			ch->flag = 0;
+			YM2610.adpcm_arrivedEndAddress |= ch->flagMask;
+		}
+#endif
 	}
 	if (dt->portstate & 0x80) {
 		u32 sched = (dt->now_step + (u32) n * dt->step) >> 16;
@@ -3077,19 +3116,31 @@ static void rspa_kick(void) {
 	/* drop any cached rspa_ob lines NOW so no dirty line writes back over the
 	 * RSP's output later; the seq poll below goes through the uncached alias */
 	data_cache_hit_invalidate(&rspa_ob, sizeof(rspa_ob));
+#ifdef MVS64_RSPWP
+	/* Whole-pump: nothing waits synchronously on this command anymore, so
+	 * it rides the standard lowpri queue behind at most ~1-2ms of video —
+	 * well inside the one-chunk adopt cover. The highpri machinery was
+	 * hitting a probabilistic rspq kernel wedge at our ~500 events/s (RSP
+	 * halted at kernel PC 0x18 in display_get, twice, both after minutes
+	 * of clean running). */
+	rspq_write(RSP_AUDIO_OVL_ID, 0x1, PhysicalAddr(&rspa_pb),
+			PhysicalAddr(&rspa_ob), rspa_seqno);
+	rspq_flush();
+#else
 	rspq_highpri_begin();
 	rspq_write(RSP_AUDIO_OVL_ID, 0x1, PhysicalAddr(&rspa_pb),
 			PhysicalAddr(&rspa_ob), rspa_seqno);
 	rspq_highpri_end();
+#endif
 }
 
-static int rspa_wait(void) {
-	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&rspa_ob.seq);
+static int rspa_wait_slot(int slot, u32 seq) {
+	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&rspa_obs[slot].seq);
 	u32 t0 = TICKS_READ();
-	while (*seqp != rspa_seqno) {
+	while (*seqp != seq) {
 		if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50)) {
 			debugf("[RSPADPCM] TIMEOUT seq=%lu got=%lu - disabling RSP ADPCM\n",
-					(unsigned long) rspa_seqno, (unsigned long) *seqp);
+					(unsigned long) seq, (unsigned long) *seqp);
 			rspa_dead = 1;
 			return 0;
 		}
@@ -3103,6 +3154,10 @@ static int rspa_wait(void) {
 	}
 #endif
 	return 1;
+}
+
+static int rspa_wait(void) {
+	return rspa_wait_slot(rspa_cur, rspa_seqno);
 }
 
 /* C decode of a channel subset, exactly like the classic pass 3 (used for the
@@ -3136,16 +3191,17 @@ static void rspa_c_decode(int n, u8 amask, int b_too,
 
 /* Adopt the RSP results: fold the contribution arrays into the chunk
  * accumulators and write the echoed states back into the live structs. */
-static void rspa_adopt(int n, s32 *accl, s32 *accr) {
+static void rspa_adopt_slot(int slot, int n, s32 *accl, s32 *accr,
+		u8 skipa, u8 skipb) {
 	int c, i;
 	for (i = 0; i < n; i++) {
-		accl[i] += rspa_ob.l[i];
-		accr[i] += rspa_ob.r[i];
+		accl[i] += rspa_obs[slot].l[i];
+		accr[i] += rspa_obs[slot].r[i];
 	}
 	for (c = 0; c < 6; c++) {
-		const rspa_cha_t * const e = &rspa_ob.echo.a[c];
+		const rspa_cha_t * const e = &rspa_obs[slot].echo.a[c];
 		ADPCMA * const ch = &YM2610.adpcma[c];
-		if (!(rspa_pb.amask & (1 << c)))
+		if (!(rspa_pbs[slot].amask & (1 << c)) || (skipa & (1 << c)))
 			continue;
 		ch->now_addr = e->now_addr;
 		ch->now_step = e->now_step;
@@ -3156,8 +3212,8 @@ static void rspa_adopt(int n, s32 *accl, s32 *accr) {
 		if (!e->flag_out)
 			ch->flag = 0;
 	}
-	if (rspa_pb.bflags & 1) {
-		const rspa_chb_t * const e = &rspa_ob.echo.b;
+	if ((rspa_pbs[slot].bflags & 1) && !skipb) {
+		const rspa_chb_t * const e = &rspa_obs[slot].echo.b;
 		ADPCMB * const dt = &YM2610.adpcmb;
 		dt->now_addr = e->now_addr;
 		dt->now_step = e->now_step;
@@ -3171,7 +3227,11 @@ static void rspa_adopt(int n, s32 *accl, s32 *accr) {
 			dt->PCM_BSY = 0;
 		}
 	}
-	YM2610.adpcm_arrivedEndAddress |= (u8) rspa_ob.arrived;
+	YM2610.adpcm_arrivedEndAddress |= (u8) rspa_obs[slot].arrived;
+}
+
+static void rspa_adopt(int n, s32 *accl, s32 *accr) {
+	rspa_adopt_slot(rspa_cur, n, accl, accr, 0, 0);
 }
 
 #ifdef MVS64_RSPADPCM_VERIFY
@@ -3714,6 +3774,7 @@ typedef struct {
 	int n;                                  /* 0 = slot free */
 	u32 seq;
 	int16_t *dest;                          /* uncached AI position */
+	u8 adpcm_pend;                          /* deferred ADPCM not folded yet */
 #ifdef MVS64_RSPWP_VERIFY
 	s32 ref_l[YM_CHUNK], ref_r[YM_CHUNK];
 	rspwp_dch_t refdyn[4];
@@ -3791,6 +3852,45 @@ static void rspwp_adopt(FM_CH **cch) {
 	rspwp_seeded = 0;
 }
 
+#if defined(MVS64_RSPADPCM) && !defined(MVS64_RSPADPCM_VERIFY)
+/* WP-M2-lite: fold + adopt the previous chunk's deferred ADPCM (see the
+ * comment at wpa_fresh). Runs at each chunk top and at pump finish. */
+static void rspwp_adpcm_finish_prev(void) {
+	rspwp_pend_t *pp;
+	int i, ps;
+	if (!rspa_prev_pend)
+		return;
+	rspa_prev_pend = 0;
+	ps = rspa_prev_slot;
+	pp = &rspwp_pend[rspa_prev_pidx];
+	if (rspa_wait_slot(ps, rspa_prev_seq)) {
+		/* fold l/r into the pending chunk and write the echoed state back,
+		 * skipping channels keyed on after this chunk was packed */
+		rspa_adopt_slot(ps, rspa_prev_n, pp->acc_l, pp->acc_r,
+				wpa_fresh, wpb_fresh);
+	} else {
+		/* timeout (rspa_dead now set): nothing was adopted, so the CPU
+		 * state is still pre-chunk and the C decoders reproduce it */
+		ADPCMB * const dt = &YM2610.adpcmb;
+		rspa_c_decode(rspa_prev_n, rspa_prev_amask, 0,
+				pp->acc_l, pp->acc_r, NULL);
+		if (rspa_prev_rb) {
+			for (i = 0; i < rspa_prev_n; i++) {
+				const s32 v = (dt->portstate & 0x80)
+						? OPNB_ADPCMB_CALC(dt) : 0;
+				if (rspa_prev_dtl)
+					pp->acc_l[i] += v >> 9;
+				if (rspa_prev_dtr)
+					pp->acc_r[i] += v >> 9;
+			}
+		}
+	}
+	pp->adpcm_pend = 0;
+}
+#else
+static void rspwp_adpcm_finish_prev(void) { }
+#endif
+
 #ifdef MVS64_RSPWP_VERIFY
 static void rspwp_verify_cmp(const rspwp_pend_t *pd, const rspfm_out_t *ob) {
 	static int prints;
@@ -3861,6 +3961,11 @@ static int rspwp_collect(int block) {
 	int i;
 	if (!pd->n)
 		return 0;
+	if (pd->adpcm_pend) {
+		if (!block)
+			return 0;
+		rspwp_adpcm_finish_prev();
+	}
 	if (*seqp != pd->seq) {
 		u32 t0;
 		if (!block)
@@ -3917,6 +4022,7 @@ static int rspwp_collect(int block) {
  * declare the offload dead — audio continues on the CPU path. */
 void YM2610_wp_finish(void) {
 	rspwp_ship();
+	rspwp_adpcm_finish_prev();
 	rspwp_emitted = rspwp_seq;
 #ifdef RSPWAIT_PROF
 	{
@@ -4013,6 +4119,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	rspwp_pend[slot].n = n;
 	rspwp_pend[slot].seq = rspwp_seq;
 	rspwp_pend[slot].dest = dest;
+	rspwp_pend[slot].adpcm_pend = 0;
 	data_cache_hit_writeback(pb, sizeof(*pb));
 	data_cache_hit_invalidate(&rspwp_obr[slot], sizeof(rspfm_out_t));
 	rspwp_ship_slot = slot;
@@ -4030,11 +4137,12 @@ static void rspwp_ship(void) {
 	if (slot < 0)
 		return;
 	rspwp_ship_slot = -1;
-	rspq_highpri_begin();
+	/* lowpri: see rspa_kick — deferred commands need no priority and the
+	 * highpri path wedged the rspq kernel probabilistically */
 	rspq_write(RSP_FM_OVL_ID, 0x1, PhysicalAddr(&rspwp_pbr[slot]),
 			PhysicalAddr(&rspwp_obr[slot]), rspwp_pend[slot].seq,
 			PhysicalAddr(rspwp_dyn));
-	rspq_highpri_end();
+	rspq_flush();
 }
 
 /* Ready gate + seed/disable transitions; call at each chunk top. */
@@ -4133,6 +4241,9 @@ void YM2610Reset(void) {
 	rspwp_seeded = 0;
 	memset(wp_keyev, 0, sizeof(wp_keyev));
 	memset(wp_dirty, 0, sizeof(wp_dirty));
+	rspa_prev_pend = 0;
+	wpa_fresh = 0;
+	wpb_fresh = 0;
 #endif
 
 	/* Reset Prescaler */
@@ -4455,6 +4566,12 @@ void YM2610Update_stream(int length) {
 			 * touch ADPCM state. Results are collected in pass 3 below. */
 			int rsp_any = 0;
 			u8 ramask = 0, rb = 0;
+#ifdef MVS64_RSPWP
+			/* WP-M2-lite: the previous chunk's ADPCM folds + adopts here,
+			 * with a whole chunk of CPU work behind it as cover; this
+			 * chunk's ADPCM kick happens after the FM prepare below. */
+			rspwp_adpcm_finish_prev();
+#else
 			if (!rspa_dead) {
 				rsp_any = rspa_build(n, dtl, dtr);
 				if (rsp_any) {
@@ -4463,6 +4580,7 @@ void YM2610Update_stream(int length) {
 					rspa_kick();
 				}
 			}
+#endif
 #endif
 #if defined(N64) && defined(MVS64_RSPWP)
 			/* Ship the PREVIOUS chunk's deferred FM command now, right
@@ -4523,6 +4641,36 @@ void YM2610Update_stream(int length) {
 					pdz->ref_l[i] = 0;
 					pdz->ref_r[i] = 0;
 				}
+			}
+#endif
+#if defined(MVS64_RSPADPCM) && !defined(MVS64_RSPADPCM_VERIFY)
+			/* ADPCM defer-kick: flip staging buffers, build from the
+			 * (just-adopted, current) CPU state with eager end flags, and
+			 * leave the wait to the next chunk top / pump finish. When the
+			 * FM path hatched (wp_this==0) the whole chunk falls back to
+			 * plain C ADPCM via ramask==0 in pass 3. */
+			if (wp_this && !rspa_dead) {
+				rspa_cur ^= 1;
+				rspa_eager_flags = 1;
+				rsp_any = rspa_build(n, dtl, dtr);
+				rspa_eager_flags = 0;
+				if (rsp_any) {
+					ramask = rspa_pb.amask;
+					rb = (u8) (rspa_pb.bflags & 1);
+					rspa_kick();
+					rspa_prev_pend = 1;
+					rspa_prev_slot = rspa_cur;
+					rspa_prev_seq = rspa_seqno;
+					rspa_prev_n = n;
+					rspa_prev_pidx = (int) ((rspwp_seq - 1) % RSPWP_RING);
+					rspa_prev_amask = ramask;
+					rspa_prev_rb = rb;
+					rspa_prev_dtl = dtl;
+					rspa_prev_dtr = dtr;
+					rspwp_pend[rspa_prev_pidx].adpcm_pend = 1;
+				}
+				wpa_fresh = 0;
+				wpb_fresh = 0;
 			}
 #endif
 #else /* !MVS64_RSPWP: per-chunk ship-half path */
@@ -4767,6 +4915,7 @@ void YM2610Update_stream(int length) {
 								? OPNB_ADPCMB_CALC(dt) : 0;
 				}
 				rspa_c_decode(n, (u8) ~ramask, 0, acc_l, acc_r, NULL);
+#ifndef MVS64_RSPWP
 				if (rsp_any) {
 					if (rspa_wait()) {
 						rspa_adopt(n, acc_l, acc_r);
@@ -4776,6 +4925,7 @@ void YM2610Update_stream(int length) {
 						rspa_c_decode(n, ramask, rb, acc_l, acc_r, dtb);
 					}
 				}
+#endif
 			}
 #endif
 #else
