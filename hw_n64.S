@@ -658,12 +658,15 @@ mvs64_asm_io_read16:
 	j tlbcallhandler_standard
 
 mvs64_asm_io_write:
-	beq k1, 0x2FFFF0, asm_pbrom_bankno_w
-	beq k1, 0x300001, asm_watchdog_w
-	beq k1, 0x3C0000, asm_lspc_vram_addr_w
+	# Ordered by measured in-game frequency: the LSPC VRAM data port takes
+	# hundreds of hits per frame (SCB uploads), then the address port,
+	# palette, modulo; watchdog/pbrom-bank are per-frame singletons.
 	beq k1, 0x3C0002, asm_lspc_vram_data_w
-	beq k1, 0x3C0004, asm_lspc_vram_modulo_w
+	beq k1, 0x3C0000, asm_lspc_vram_addr_w
 	bge k1, 0x400000, asm_video_palette_w
+	beq k1, 0x3C0004, asm_lspc_vram_modulo_w
+	beq k1, 0x300001, asm_watchdog_w
+	beq k1, 0x2FFFF0, asm_pbrom_bankno_w
 	j tlbcallhandler_standard
 
 asm_watchdog_w:
@@ -804,7 +807,7 @@ asm_pbrom_bankno_w:
 	add k1, t6
 	and k1, 0xFFFFFF
 	srl k1, 6
-	ori k1, 3    # global, valid
+	ori k1, (3<<3) | 3    # cacheable-noncoherent, global, valid
 	mtc0 k1, C0_ENTRYLO0; 	nop; nop
 
 	# write back the new TLB entry
