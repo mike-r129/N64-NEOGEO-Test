@@ -168,7 +168,12 @@ uint8_t* sprite_cache_insert(SpriteCache *c, uint32_t key) {
 // The actual number of sprites that will be removed depend on the cache
 // status.
 void sprite_cache_pop(SpriteCache *c) {
-	int bidx = rand() & (c->num_buckets-1);
+	// Deterministic scatter (PLAN rank 7): rand() here made eviction — and
+	// therefore CROM reload DMA — differ run to run, adding noise to perf
+	// A/Bs. An LCG gives the same anti-systematic scatter, reproducibly.
+	static uint32_t lcg = 0x2545F491;
+	lcg = lcg * 1664525u + 1013904223u;
+	int bidx = (lcg >> 16) & (c->num_buckets-1);
 
 	int cutoff = c->cur_tick - c->tick_cutoff;
 	int n = 0;
@@ -183,7 +188,8 @@ void sprite_cache_pop(SpriteCache *c) {
 			c->num_sprites--;
 			b->sprite = NULL;
 			LOG("[CACHE] evicted (tick:%d cutoff:%d)\n", (int)b->last_tick, (int)c->tick_cutoff);
-			bidx = rand() & (c->num_buckets-1);
+			lcg = lcg * 1664525u + 1013904223u;
+			bidx = (lcg >> 16) & (c->num_buckets-1);
 		}
 
 		n++;
