@@ -31,9 +31,25 @@
    sprite walk + sprite_cache hash + uncached rspq writes; no RSP/RDP back-pressure. Diffuse —
    the 2x lever there is moving the SCB walk to the RSP, not micro-trims.
 
-5. Landed: chan_calc_stream (1f6dbff) — algorithm-specialized FM channel calc with local
-   connection routing (the s32* connect stores defeated TBAA and forced per-sample state
-   reloads). WAV byte-identical gate. N64 effect: measure via ymprof3/fmfix builds.
+5. Landed: chan_calc_stream — FM channel calc with LOCAL index-routed sums (the s32*
+   connect stores defeated TBAA and forced per-sample state reloads). Two lessons in one:
+   the first attempt (always_inline x8 algorithm specialization, 1f6dbff) was WAV-exact but
+   **40% slower** on N64 — 8 inlined copies of the sample loop blew the 16KB icache (fmms
+   722→1022; even SSG rose 68→90 from cross-pass eviction). The single-body rework (54f72bc,
+   runtime algo + u8 routing tables + local s[5]) measures fmms 722→~685. Net fps effect
+   small — FM cost is mostly intrinsic arithmetic + EG replay on a 93MHz in-order CPU.
+
+6. **Session result (final-auto, ares 300s):** real fight 17.5 → **21.5 fps median**
+   (clock ≈ 2.75s per game second, was ~3.4s); menus 40-42 median, peaks ~60. Next
+   step-change levers, in order: (1) RSP YM2610 offload (snd is 54% of wall; the
+   integerized, chunked, channel-major core is now shaped for it), (2) draw 33% — move the
+   SCB walk/sprite issue to the RSP (it is pure CPU command issue, dwait~0), (3) m68k
+   residual 70% (1.2k TLB faults/frame ≈ 13%, interpreter ~106 cyc/insn: dcache-dominated).
+
+7. BizHawk check (2026-07-06, per protocol): the play build wedges BizHawk-Mupen at ~frame
+   421 deterministically — the KNOWN libdragon-audio platform limitation (see memory
+   bizhawk-mupen-verdict), reproduced identically by stock libdragon audio ROMs. Not a
+   regression signal; ares remains the pre-hardware gate (full boot→menus→fight validated).
 
 ## ⚠️⚠️ Empirical update (2026-07-02 overnight session) — THE WALL IS SOUND, NOT THE 68K
 
