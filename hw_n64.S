@@ -25,12 +25,23 @@
 .endm
 
 	.section .sdata
+#ifdef MVS64_PERFCOUNT
+# Per-frame TLB-exception count (read+reset by emu.c's [PERF] print).
+	.globl perf_tlb_faults
+perf_tlb_faults: .long 0
+#endif
 
 	.set noreorder
 	.set noat
 	.text
 mvs_tlbhandler:
 	PROFILE_START
+#ifdef MVS64_PERFCOUNT
+	la k0, perf_tlb_faults
+	lw k1, 0(k0)
+	addiu k1, 1
+	sw k1, 0(k0)
+#endif
 	# Check whether the faulting address is at address 0xFFxxxxxx, which is
 	# where the m68k memory map is TLB-mapped. Otherwise, go to the standard
 	# exception handler.

@@ -507,6 +507,18 @@ int main(int argc, char *argv[]) {
 			#else
 			(uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
 			#endif
+		#ifdef MVS64_PERFCOUNT
+		{
+			// Diagnostic counters (m64k_asm.S / hw_n64.S): executed 68k
+			// instructions, idle-skip fires and TLB exceptions this frame.
+			extern uint32_t perf_m68k_insns, perf_idle_skips, perf_tlb_faults;
+			framef("[PERF] insns=%lu skips=%lu tlb=%lu\n",
+				(unsigned long)perf_m68k_insns,
+				(unsigned long)perf_idle_skips,
+				(unsigned long)perf_tlb_faults);
+			perf_m68k_insns = perf_idle_skips = perf_tlb_faults = 0;
+		}
+		#endif
 		#ifdef MVS64_IDLEPROBE
 		{
 			extern uint32_t idle_probe_found;

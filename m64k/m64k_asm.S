@@ -34,6 +34,15 @@
 
      .section .sdata
 pc_diff:      .long 0
+#ifdef MVS64_PERFCOUNT
+# Per-frame diagnostic counters (read+reset by emu.c's [PERF] print):
+# executed 68k instructions and idle-skip fires. Diagnostic builds only —
+# the dispatch loop increment costs ~3 insns/instruction.
+    .globl perf_m68k_insns
+perf_m68k_insns: .long 0
+    .globl perf_idle_skips
+perf_idle_skips: .long 0
+#endif
 #ifdef MVS64_IDLEPROBE
 # Idle-spin probe: detects a branch/jump target hit many times CONSECUTIVELY
 # (a true wait-for-IRQ spin) vs a bounded backward loop (memcpy/DBRA). The PC
@@ -404,6 +413,11 @@ _m64k_asmrun:
 ALIGN(main_loop):
     blez m_cycles, main_loop_exit
      lhu opcode, 0(m_pc)
+#ifdef MVS64_PERFCOUNT
+    lw t1, perf_m68k_insns
+    addiu t1, 1
+    sw t1, perf_m68k_insns
+#endif
     #if M64K_CONFIG_ADDRERR
     sw opcode, M64K_OFF_IR(ctx)
     #endif
@@ -2601,6 +2615,11 @@ jmp_exec:
     beq m_pc, 0xFF00FC02, idle_skip   # samsho2 secondary vblank wait
     j main_loop
 idle_skip:
+#ifdef MVS64_PERFCOUNT
+    lw t0, perf_idle_skips
+    addiu t0, 1
+    sw t0, perf_idle_skips
+#endif
     li m_cycles, 0
     j main_loop
 
