@@ -881,12 +881,59 @@ INLINE void FM_BUSY_SET(FM_ST *ST, int busyclock) {
 #define FM_BUSY_CLEAR(ST) {}
 #endif
 
+#if defined(N64) && defined(MVS64_RSPWP)
+/* MVS64 whole-pump FM offload (WHOLEPUMP-DESIGN.md): the FM dynamic state
+ * lives on the RSP, so key transitions must reach it as events. Writes only
+ * happen between Update_stream calls (= between shipped chunks), so the NET
+ * effect of any key-write sequence on a slot since the last shipped chunk
+ * collapses exactly to one of four codes (no synthesis runs in between):
+ *   ON      -> {phase=0, state=ATT}          (unconditional)
+ *   OFF     -> {if (state>REL) state=REL}    (conditional ON THE RSP: the
+ *              slot may have decayed to OFF mid-chunk, which the CPU can't
+ *              see; FM_KEYOFF's state>REL test must run against the
+ *              RSP-resident value)
+ *   ON_OFF  -> {phase=0, state=REL}          (unconditional: ON forced ATT,
+ *              so the following OFF's test was true by construction)
+ * The key flag itself stays CPU-authoritative (FM_KEYON/OFF gate on it),
+ * which is what makes the net-code automaton exact. wp_dirty marks channels
+ * whose static params changed and need a re-pack; wp_hatch trips on SSG-EG
+ * enable (dynamic ssgn mutation the RSP port excludes -> CPU-only resync). */
+enum { WPK_NONE = 0, WPK_ON = 1, WPK_OFF = 2, WPK_ON_OFF = 3 };
+static u8 wp_keyev[4][4];   /* [fm chan 0..3 = CH 1,2,4,5][slot 0..3] */
+static u8 wp_dirty[4];
+static u8 wp_hatch;
+static u32 wp_hatch_count;
+/* YM2610 FM channel index (1,2,4,5) -> whole-pump channel slot, else -1 */
+static const s8 wp_chmap[6] = { -1, 0, 1, -1, 2, 3 };
+
+INLINE void wp_track_key(FM_CH *CH, int s, int on) {
+	const int c = (int)(CH - YM2610.CH);
+	const int j = (c >= 0 && c < 6) ? wp_chmap[c] : -1;
+	if (j < 0)
+		return;
+	if (on)
+		wp_keyev[j][s] = WPK_ON;
+	else
+		wp_keyev[j][s] = (wp_keyev[j][s] == WPK_ON) ? WPK_ON_OFF : WPK_OFF;
+}
+
+INLINE void wp_mark_dirty(int c) {
+	const int j = (c >= 0 && c < 6) ? wp_chmap[c] : -1;
+	if (j >= 0)
+		wp_dirty[j] = 1;
+}
+#else
+#define wp_track_key(CH, s, on) ((void)0)
+#define wp_mark_dirty(c) ((void)0)
+#endif
+
 INLINE void FM_KEYON(FM_CH *CH, int s) {
 	FM_SLOT *SLOT = &CH->SLOT[s];
 	if (!SLOT->key) {
 		SLOT->key = 1;
 		SLOT->phase = 0; /* restart Phase Generator */
 		SLOT->state = EG_ATT; /* phase -> Attack */
+		wp_track_key(CH, s, 1);
 	}
 }
 
@@ -896,6 +943,7 @@ INLINE void FM_KEYOFF(FM_CH *CH, int s) {
 		SLOT->key = 0;
 		if (SLOT->state > EG_REL)
 			SLOT->state = EG_REL;/* phase -> Release */
+		wp_track_key(CH, s, 0);
 	}
 }
 
@@ -1828,6 +1876,11 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 
 	SLOT = &(CH->SLOT[OPN_SLOT(r)]);
 
+	/* MVS64 whole-pump: every OPNWriteReg case changes static channel
+	 * params (rates/levels/freq/algo/pan) the RSP-resident copy must
+	 * refresh from; key events and LFO are tracked elsewhere. */
+	wp_mark_dirty(c);
+
 	switch (r & 0xf0) {
 	case 0x30: /* DET , MUL */
 		set_det_mul(&OPN->ST, CH, SLOT, v);
@@ -1856,6 +1909,16 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 
 	case 0x90: /* SSG-EG */
 
+#if defined(N64) && defined(MVS64_RSPWP)
+		/* SSG-EG enable mutates ssgn during synthesis, which the RSP FM
+		 * port excludes — trip the hatch (resync to CPU synthesis). Never
+		 * expected for samsho2; counted so a trigger is visible. */
+		if (v & 0x08) {
+			if (!wp_hatch)
+				wp_hatch_count++;
+			wp_hatch = 1;
+		}
+#endif
 		SLOT->ssg = v & 0x0f;
 		SLOT->ssgn = (v & 0x04) >> 1; /* bit 1 in ssgn = attack */
 		/* MVS64: keep vol_out coherent (EG_OFF slots are skipped in
