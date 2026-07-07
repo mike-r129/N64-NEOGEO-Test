@@ -2604,15 +2604,28 @@ jmp_exec:
     sw m_pc, idle_probe_found          # record the spinning PC for the C side to print
 2:
 #endif
-    beq m_pc, 0xFF001FE2, idle_skip   # mslug
-    beq m_pc, 0xFFC18714, idle_skip   # Universe BIOS vblank wait
     # samsho2 vblank-wait spins: "clr.b $100A30; <here>: tst.b $100A30; beq <here>"
     # — pure side-effect-free polls of a flag the game's VBlank IRQ sets. Verified
     # via the in-match idle probe (0x00142C is the dominant in-game spin). Skipping
     # them fast-forwards the dead wait to the next scheduled IRQ. (See PLAN-OPTIMIZATION.md
     # rank 1/2; the general fix is a data-driven per-game table.)
-    beq m_pc, 0xFF00142C, idle_skip   # samsho2 main vblank wait
-    beq m_pc, 0xFF00FC02, idle_skip   # samsho2 secondary vblank wait
+    #
+    # The constants MUST be materialized with lui (sign-extending) so their
+    # 64-bit register value matches the map_m68k result: mmap_mask is loaded
+    # with lui, so m_pc is the SIGN-extended 0xFFFFFFFF_FFxxxxxx. Writing
+    # "beq m_pc, 0xFF00142C" makes GAS emit a ZERO-extended li+dsll+ori
+    # (0x00000000_FF00142C), and the 64-bit beq can then never be equal —
+    # which kept this whole skip list dead since it was introduced.
+    lui t0, 0xFF00
+    ori t1, t0, 0x142C
+    beq m_pc, t1, idle_skip           # samsho2 main vblank wait (hottest)
+    ori t1, t0, 0xFC02
+    beq m_pc, t1, idle_skip           # samsho2 secondary vblank wait
+    ori t1, t0, 0x1FE2
+    beq m_pc, t1, idle_skip           # mslug
+    lui t1, 0xFFC1
+    ori t1, 0x8714
+    beq m_pc, t1, idle_skip           # Universe BIOS vblank wait
     j main_loop
 idle_skip:
 #ifdef MVS64_PERFCOUNT
