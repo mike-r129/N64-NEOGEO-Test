@@ -294,8 +294,87 @@ wp_apply:
     addiu t9, 32
 wp_in_done:
 
+    # (whole-pump only) silent-channel fast path, the RSP mirror of the CPU
+    # rule: four slots parked in EG_OFF at quiet-locked attenuation with
+    # decayed feedback history contribute exact zero and cannot change state
+    # this chunk — only the phase counters advance. This is the difference
+    # between ~4 and ~1-2 fully synthesized channels per chunk in-game, and
+    # the RSP is the pipeline bottleneck ([RSPWAIT] adpcm≈11ms/pump without
+    # it). Runs after key events: a key-on this chunk fails the state test.
+    lw t0, %lo(WP_MODE)
+    beqz t0, wp_synth
+    nop
+    lw t0, %lo(CHBUF) + 0
+    lw t1, %lo(CHBUF) + 4
+    or t0, t1
+    lw t1, %lo(CHBUF) + 8
+    or t0, t1
+    bnez t0, wp_synth           # feedback/MEM history not decayed
+    li t7, 4
+    li t9, %lo(CHBUF) + 288
+wp_sil_chk:
+    lbu t1, 28(t9)              # state must be EG_OFF(0)
+    bnez t1, wp_synth
+    lw t1, 8(t9)                # vol_out must be quiet-locked (>= 832)
+    sltiu t2, t1, 832
+    bnez t2, wp_synth
+    addiu t7, -1
+    bnez t7, wp_sil_chk
+    addiu t9, 32
+    # silent: batch phase advance only
+    lhu t6, %lo(HDR) + 8        # n
+    lbu t0, %lo(CHBUF) + 27     # pms_mask
+    bnez t0, wp_sil_pm
+    li t7, 4
+    li t8, %lo(CHBUF) + 32      # dp[0][s]
+    li t9, %lo(CHBUF) + 288
+wp_sil_nopm:
+    lw t0, 0(t8)
+    move t3, t6
+    MULU t1, t0, t3, t2
+    lw t2, 0(t9)
+    addu t2, t1
+    sw t2, 0(t9)
+    addiu t7, -1
+    addiu t8, 4
+    bnez t7, wp_sil_nopm
+    addiu t9, 32
+    j wp_synth_done
+    nop
+wp_sil_pm:
+    # per-sample dp[pmidx[i]] phase advance (same tables the synthesis
+    # path uses, so the phase trajectory is identical)
+    li t4, %lo(CHBUF) + 160     # pmidx[]
+wp_sil_pm_loop:
+    lbu t5, 0(t4)
+    sll t5, 4
+    addiu t5, %lo(CHBUF) + 32
+    lw t0, 0(t5)
+    lw t1, %lo(CHBUF) + 288 + 0
+    addu t1, t0
+    sw t1, %lo(CHBUF) + 288 + 0
+    lw t0, 4(t5)
+    lw t1, %lo(CHBUF) + 288 + 32
+    addu t1, t0
+    sw t1, %lo(CHBUF) + 288 + 32
+    lw t0, 8(t5)
+    lw t1, %lo(CHBUF) + 288 + 64
+    addu t1, t0
+    sw t1, %lo(CHBUF) + 288 + 64
+    lw t0, 12(t5)
+    lw t1, %lo(CHBUF) + 288 + 96
+    addu t1, t0
+    sw t1, %lo(CHBUF) + 288 + 96
+    addiu t6, -1
+    bnez t6, wp_sil_pm_loop
+    addiu t4, 1
+    j wp_synth_done
+    nop
+
+wp_synth:
     jal fm_chan
     li s1, %lo(CHBUF)
+wp_synth_done:
 
     # whole-pump: write the evolved dynamic state back to the resident block
     lw t0, %lo(WP_MODE)

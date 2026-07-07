@@ -3721,6 +3721,8 @@ typedef struct {
 } rspwp_pend_t;
 static rspwp_pend_t rspwp_pend[RSPWP_RING];
 static u32 rspwp_seq, rspwp_coll, rspwp_emitted;
+static int rspwp_ship_slot = -1;
+static void rspwp_ship(void);
 static int rspwp_seeded, rspwp_dead2;
 static u32 rspwp_pack_hatches;
 int16_t *ym2610_wp_dest_base;   /* set by emit() around Update_stream */
@@ -3867,8 +3869,21 @@ static int rspwp_collect(int block) {
 		while (*seqp != pd->seq)
 			if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50))
 				return 0;
+#ifdef RSPWAIT_PROF
+		{
+			u32 w = (u32) TICKS_DISTANCE(t0, TICKS_READ());
+			rspwait_fm += w;
+			if (w > rspwait_fm_max)
+				rspwait_fm_max = w;
+		}
+#endif
 	}
 	/* ob was cache-invalidated before the kick: cached reads are fresh */
+#if defined(MVS64_YMPROF) && defined(N64)
+	{
+		extern uint32_t ym_prof[5];
+		uint32_t _ct0 = TICKS_READ();
+#endif
 	for (i = 0; i < pd->n; i++) {
 		s32 lt = (pd->acc_l[i] + ob->l[i]) << 1;
 		s32 rt = (pd->acc_r[i] + ob->r[i]) << 1;
@@ -3876,6 +3891,10 @@ static int rspwp_collect(int block) {
 		Limit(rt, MAXOUT, MINOUT);
 		((u32 *) pd->dest)[i] = ((u32) (u16) lt << 16) | (u16) (s16) rt;
 	}
+#if defined(MVS64_YMPROF) && defined(N64)
+		ym_prof[4] += TICKS_DISTANCE(_ct0, TICKS_READ());
+	}
+#endif
 #ifdef MVS64_RSPWP_VERIFY
 	rspwp_chunks++;
 	rspwp_verify_cmp(pd, ob);
@@ -3897,7 +3916,26 @@ static int rspwp_collect(int block) {
  * destinations already hold the SSG+ADPCM mix garbage from emit's copy):
  * declare the offload dead — audio continues on the CPU path. */
 void YM2610_wp_finish(void) {
+	rspwp_ship();
 	rspwp_emitted = rspwp_seq;
+#ifdef RSPWAIT_PROF
+	{
+		static u32 wp_pumps;
+		if ((++wp_pumps & 127) == 0) {
+			debugf("[RSPWAIT] wpblock=%lums max=%luus adpcm=%lums max=%luus"
+					" /128pumps\n",
+					(unsigned long) (rspwait_fm / (TICKS_PER_SECOND / 1000)),
+					(unsigned long) (rspwait_fm_max
+							/ (TICKS_PER_SECOND / 1000000)),
+					(unsigned long) (rspwait_adpcm
+							/ (TICKS_PER_SECOND / 1000)),
+					(unsigned long) (rspwait_adpcm_max
+							/ (TICKS_PER_SECOND / 1000000)));
+			rspwait_fm = rspwait_fm_max = 0;
+			rspwait_adpcm = rspwait_adpcm_max = 0;
+		}
+	}
+#endif
 	while (rspwp_coll < rspwp_seq) {
 		if (!rspwp_collect(1)) {
 			debugf("[RSPWP] TIMEOUT seq=%lu coll=%lu — offload dead\n",
@@ -3977,12 +4015,26 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	rspwp_pend[slot].dest = dest;
 	data_cache_hit_writeback(pb, sizeof(*pb));
 	data_cache_hit_invalidate(&rspwp_obr[slot], sizeof(rspfm_out_t));
+	rspwp_ship_slot = slot;
+	return 1;
+}
+
+/* Ship the prepared chunk command. Split from the pack so the caller can
+ * order it AFTER the synchronous per-chunk ADPCM collect: the ADPCM command
+ * then only ever queues behind the PREVIOUS chunk's FM command, which has
+ * the whole inter-chunk CPU stretch to drain — instead of this chunk's
+ * ADPCM wait paying for this chunk's FM compute (measured: snd 121->146,
+ * fps 29.3->20.8 with the kick at chunk top). */
+static void rspwp_ship(void) {
+	const int slot = rspwp_ship_slot;
+	if (slot < 0)
+		return;
+	rspwp_ship_slot = -1;
 	rspq_highpri_begin();
-	rspq_write(RSP_FM_OVL_ID, 0x1, PhysicalAddr(pb),
+	rspq_write(RSP_FM_OVL_ID, 0x1, PhysicalAddr(&rspwp_pbr[slot]),
 			PhysicalAddr(&rspwp_obr[slot]), rspwp_pend[slot].seq,
 			PhysicalAddr(rspwp_dyn));
 	rspq_highpri_end();
-	return 1;
 }
 
 /* Ready gate + seed/disable transitions; call at each chunk top. */
@@ -4412,6 +4464,19 @@ void YM2610Update_stream(int length) {
 				}
 			}
 #endif
+#if defined(N64) && defined(MVS64_RSPWP)
+			/* Ship the PREVIOUS chunk's deferred FM command now, right
+			 * after this chunk's ADPCM kick: the ADPCM command sits ahead
+			 * of it in the highpri queue, so pass 3's rspa_wait never pays
+			 * for FM compute, while the FM command still gets this whole
+			 * chunk's CPU stretch to drain. (Shipping at pass-3-end instead
+			 * hit an rspq wedge: highpri fired into idle-halt/video windows
+			 * — RSP CRASH in display_get after ~30s. Keeping the highpri
+			 * writes back-to-back at chunk top is the pattern the ADPCM
+			 * offload has proven for weeks.) The last chunk of a call is
+			 * shipped by the next call or by YM2610_wp_finish. */
+			rspwp_ship();
+#endif
 
 			/* pass 0: per-sample shared schedules (LFO position, EG ticks) */
 			YMPROF_T(a);
@@ -4439,6 +4504,7 @@ void YM2610Update_stream(int length) {
 			 * wait). On any hatch, drain + adopt and fall through to the
 			 * plain CPU path for this and all further chunks. */
 			int wp_this = 0;
+			YMPROF_T(k);
 			if (ym2610_wp_dest_base && rspwp_ok(cch)) {
 				wp_this = rspwp_kick_chunk(OPN, cch, n, lfo_pm, egt, lfo_am,
 						eg_base, ym2610_wp_dest_base + wp_off * 2);
@@ -4448,6 +4514,7 @@ void YM2610Update_stream(int length) {
 				YM2610_wp_finish();
 				rspwp_adopt(cch);
 			}
+			YMPROF_A(1, k);
 #ifdef MVS64_RSPWP_VERIFY
 			if (wp_this) {
 				rspwp_pend_t * const pdz =
