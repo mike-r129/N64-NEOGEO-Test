@@ -45,9 +45,13 @@ CFLAGS += $(EXTRA_DEFINES)
 ifndef ADPCM_CPU
 CFLAGS += -DMVS64_RSPADPCM
 endif
-# FM synthesis offload (rsp_fm.S + ym2610.c rspfm_* glue): default ON.
-# Disable with make ... FM_CPU=1 to force the C synthesis path.
-ifndef FM_CPU
+# FM synthesis offload (rsp_fm.S + ym2610.c rspfm_* glue): default OFF.
+# The port is bit-exact (300s dual-compute gate, 35840 chunks, 0 mismatches)
+# but measured NET-NEGATIVE when collected synchronously: the CPU idles for
+# the RSP compute time ([RSPWAIT] fm~2.4ms/chunk, q=0), and a 2-channel
+# CPU/RSP split still loses ~4fps to per-chunk glue overhead. Needs the
+# cross-pump deferred-collect architecture to pay off. Enable with RSPFM=1.
+ifdef RSPFM
 CFLAGS += -DMVS64_RSPFM
 endif
 

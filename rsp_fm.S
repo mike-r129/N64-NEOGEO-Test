@@ -46,7 +46,12 @@
 #   +25  u8 fb             (feedback shift; 0 = no feedback)
 #   +26  u8 ams            (AM depth shift for this channel)
 #   +27  u8 pms_mask       (0xFF = use pmidx[], 0 = always dp[0])
-#   +28  u32 pad
+#   +28  u16 masks: bit s   = slot s may be EG-due this chunk (else its
+#                             envelope/state provably cannot change: skip)
+#                  bit 8+s  = slot s is quiet-locked (vol_out >= ENV_QUIET
+#                             and never due: its operator output is 0 for
+#                             the whole chunk; skip env+op entirely)
+#   +30  u16 pad
 #   +32  u32 dp[8][4]      phase deltas per pm index, slot order S1,S3,S2,S4
 #   +160 u8 pmidx[128]     per-sample dp index (garbage if pms_mask=0)
 #   +288 slot blocks x4, 32 bytes each, memory order S1,S3,S2,S4:
@@ -149,8 +154,17 @@ cmd_fm_run:
     move s5, a1
     move s6, a2
 
+    # start stamp: out+2692 = seq (queue-latency vs compute diagnostics).
+    # SEQW word 0 stays 0 here; the final DMA at the end writes it = seq.
+    sw zero, %lo(SEQW)
+    sw s6, %lo(SEQW) + 4
+    li s4, %lo(SEQW)
+    addiu s0, s5, 2688
+    jal DMAOut
+    li t0, DMA_SIZE(8, 1)
+
     # header in
-    move s0, a0
+    lw s0, %lo(PARAM_PHYS)
     li s4, %lo(HDR)
     jal DMAIn
     li t0, DMA_SIZE(288, 1)
@@ -295,84 +309,86 @@ op_calc:
     .endfunc
 
     #############################################################
-    # eg_tick — advance the envelope of all four slots for one EG
-    # count (cnt in s7). No SSG-EG (CPU never ships such channels).
-    #  clobbers t0..t9
+    # EG_SLOT — advance one slot's envelope for the EG count in s7,
+    # skipped entirely when the CPU proved it cannot be due this
+    # chunk (s2 due bit). No SSG-EG (CPU never ships such channels).
+    # \off = slot byte offset (0/32/64/96), \bit = due-mask bit.
+    # Clobbers t0..t8. Slot fields relative to s1 (CHBUF).
     #############################################################
-    .func eg_tick
-eg_tick:
-    li t9, %lo(CHBUF) + 288     # slot cursor (S1,S3,S2,S4)
-egs_loop:
-    lbu t0, 28(t9)              # state (0=OFF 1=REL 2=SUS 3=DEC 4=ATT)
-    beqz t0, egs_next
-    addu t1, t9, t0
-    lbu t2, 19(t1)              # sh[state-1]
+    .macro EG_SLOT off, bit
+    andi t0, s2, \bit
+    beqz t0, 6f
+    nop
+    lbu t0, 316+\off (s1)       # state (0=OFF 1=REL 2=SUS 3=DEC 4=ATT)
+    beqz t0, 6f
+    addu t1, s1, t0
+    lbu t2, 307+\off (t1)       # sh[state-1]  (sh[] at slot+20)
     li t3, 1
     sllv t3, t3, t2
     addiu t3, -1
     and t3, s7, t3
-    bnez t3, egs_next           # not due at this eg count
+    bnez t3, 6f                 # not due at this eg count
     nop
-    lbu t4, 23(t1)              # sel[state-1]
+    lbu t4, 311+\off (t1)       # sel[state-1] (sel[] at slot+24)
     srlv t5, s7, t2
     andi t5, 7
     addu t4, t5
     lbu t4, %lo(EG_INC)(t4)     # inc
-    lw t5, 4(t9)                # volume
+    lw t5, 292+\off (s1)        # volume
     li t6, 4
-    beq t0, t6, eg_att
+    beq t0, t6, 4f              # EG_ATT
     li t6, 3
-    beq t0, t6, eg_dec
+    beq t0, t6, 3f              # EG_DEC
     li t6, 2
-    beq t0, t6, eg_sus
+    beq t0, t6, 2f              # EG_SUS
     nop
-eg_rel:
+    # EG_REL
     addu t5, t4
     slti t6, t5, 1023           # C: volume >= MAX_ATT_INDEX (1023)
-    bnez t6, eg_out
+    bnez t6, 7f
     nop
     li t5, 1023
-    b eg_out
-    sb zero, 28(t9)             # state = EG_OFF
-eg_sus:
+    b 7f
+    sb zero, 316+\off (s1)      # state = EG_OFF
+2:  # EG_SUS
     addu t5, t4
     slti t6, t5, 1023
-    bnez t6, eg_out
+    bnez t6, 7f
     nop
-    b eg_out
+    b 7f
     li t5, 1023                 # clamp, state unchanged
-eg_dec:
+3:  # EG_DEC
     addu t5, t4
-    lhu t6, 18(t9)              # sl
+    lhu t6, 306+\off (s1)       # sl (slot+18)
     slt t6, t5, t6
-    bnez t6, eg_out
+    bnez t6, 7f
     nop
     li t6, 2
-    b eg_out
-    sb t6, 28(t9)               # state = EG_SUS
-eg_att:
-    # volume += (~volume * inc) >> 4
+    b 7f
+    sb t6, 316+\off (s1)        # state = EG_SUS
+4:  # EG_ATT: volume += (~volume * inc) >> 4
     nor t6, t5, zero
     MULU t7, t6, t4, t8
     sra t7, 4
     addu t5, t7
-    bgtz t5, eg_out
+    bgtz t5, 7f
     nop
     move t5, zero
     li t6, 3
-    sb t6, 28(t9)               # state = EG_DEC
-eg_out:
-    sw t5, 4(t9)                # volume
-    lhu t6, 16(t9)              # tl
+    sb t6, 316+\off (s1)        # state = EG_DEC
+7:  sw t5, 292+\off (s1)        # volume
+    lhu t6, 304+\off (s1)       # tl (slot+16)
     addu t6, t5
-    sw t6, 8(t9)                # vol_out = tl + volume
-egs_next:
-    li t0, %lo(CHBUF) + 288 + 3*32
-    beq t9, t0, egs_done
-    nop
-    b egs_loop
-    addiu t9, 32
-egs_done:
+    sw t6, 296+\off (s1)        # vol_out = tl + volume
+6:
+    .endm
+
+    .func eg_tick
+eg_tick:
+    EG_SLOT 0, 0x1
+    EG_SLOT 32, 0x2
+    EG_SLOT 64, 0x4
+    EG_SLOT 96, 0x8
     jr ra
     nop
     .endfunc
@@ -386,6 +402,7 @@ fm_chan:
     lw a3, 0(s1)                # op1_out[0]
     lw s3, 4(s1)                # op1_out[1]
     lw s4, 8(s1)                # mem_value
+    lhu s2, 28(s1)              # masks: due (bits 0-3) | quiet-locked (8-11)
     lw v0, 288(s1)              # phase S1
     lw v1, 320(s1)              # phase S3
     lw k0, 352(s1)              # phase S2
@@ -399,7 +416,11 @@ fm_sample:
     # ----- EG ticks for this sample -----
     lbu t0, %lo(HDR) + 16 (a0)  # egt[i]
     beqz t0, fm_eg_done
+    andi t1, s2, 0xF            # due mask (delay slot, both paths)
+    bnez t1, fm_eg_loop
     nop
+    b fm_eg_done
+    addu s7, t0                 # no due-able slot: just advance the counter
 fm_eg_loop:
     sw t0, %lo(EGT_LEFT)
     addiu s7, 1                 # cnt++
@@ -441,31 +462,41 @@ fm_eg_done:
     addu t2, a3
     sw t2, %lo(SBUF)(t1)        # s[i_om1] += op1_out[0]
 2:  move s3, zero               # op1_out[1] = 0
+    andi t0, s2, 0x100          # S1 quiet-locked: output 0 all chunk
+    bnez t0, fm_slot3
+    nop
     lw t3, 296(s1)              # S1 vol_out (288+8)
+    beqz a2, 3f                 # no AM this sample
+    move t1, t3
     lbu t4, 317(s1)             # S1 amflag (288+29)
     subu t4, zero, t4
     and t4, a2
     addu t1, t3, t4             # env
-    slti t5, t1, 832
+3:  slti t5, t1, 832
     beqz t5, fm_slot3
     nop
     lbu t6, 25(s1)              # fb
-    beqz t6, 3f
+    beqz t6, 4f
     move t2, zero               # !FB -> pm = 0
     sllv t2, t8, t6             # pm = out << FB
-3:  move t0, v0
+4:  move t0, v0
     jal op_calc
     nop
     move s3, t0                 # op1_out[1]
 
 fm_slot3:
     # ----- SLOT 3 (M2): s[i_om2] += op(phase3, env, s[M2]<<15) -----
+    andi t0, s2, 0x200
+    bnez t0, fm_slot2
+    nop
     lw t3, 328(s1)              # S3 vol_out (320+8)
+    beqz a2, 3f
+    move t1, t3
     lbu t4, 349(s1)             # S3 amflag
     subu t4, zero, t4
     and t4, a2
     addu t1, t3, t4
-    slti t5, t1, 832
+3:  slti t5, t1, 832
     beqz t5, fm_slot2
     nop
     lw t2, %lo(SBUF) + 0        # s[M2]
@@ -481,12 +512,17 @@ fm_slot3:
 
 fm_slot2:
     # ----- SLOT 2 (C1): s[i_oc1] += op(phase2, env, s[C1]<<15) -----
+    andi t0, s2, 0x400
+    bnez t0, fm_slot4
+    nop
     lw t3, 360(s1)              # S2 vol_out (352+8)
+    beqz a2, 3f
+    move t1, t3
     lbu t4, 381(s1)             # S2 amflag
     subu t4, zero, t4
     and t4, a2
     addu t1, t3, t4
-    slti t5, t1, 832
+3:  slti t5, t1, 832
     beqz t5, fm_slot4
     nop
     lw t2, %lo(SBUF) + 4        # s[C1]
@@ -502,12 +538,17 @@ fm_slot2:
 
 fm_slot4:
     # ----- SLOT 4 (C2): s[CAR] += op(phase4, env, s[C2]<<15) -----
+    andi t0, s2, 0x800
+    bnez t0, fm_mem
+    nop
     lw t3, 392(s1)              # S4 vol_out (384+8)
+    beqz a2, 3f
+    move t1, t3
     lbu t4, 413(s1)             # S4 amflag
     subu t4, zero, t4
     and t4, a2
     addu t1, t3, t4
-    slti t5, t1, 832
+3:  slti t5, t1, 832
     beqz t5, fm_mem
     nop
     lw t2, %lo(SBUF) + 8        # s[C2]

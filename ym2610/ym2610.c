@@ -2815,6 +2815,15 @@ INLINE s32 OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
  * every chunk, and [RSPADPCM] telemetry reports the mismatch counters (the
  * gate is ZERO mismatches over a long ares run).
  * ==========================================================================*/
+/* Wait-stall telemetry for the RSP offloads (AUTOINPUT/RSPWAITPROF builds):
+ * cumulative ticks blocked on each seq poll + worst single wait, printed
+ * every 256 FM chunks — so a stall source is measured, not guessed. */
+#if defined(N64) && (defined(MVS64_AUTOINPUT) || defined(MVS64_RSPWAITPROF))
+#define RSPWAIT_PROF 1
+static u32 rspwait_fm, rspwait_fm_max, rspwait_adpcm, rspwait_adpcm_max;
+static u32 rspwait_chunks;
+#endif
+
 #if defined(N64) && defined(MVS64_RSPADPCM)
 #include <libdragon.h>
 #include <stddef.h>
@@ -3022,6 +3031,14 @@ static int rspa_wait(void) {
 			return 0;
 		}
 	}
+#ifdef RSPWAIT_PROF
+	{
+		u32 d = (u32) TICKS_DISTANCE(t0, TICKS_READ());
+		rspwait_adpcm += d;
+		if (d > rspwait_adpcm_max)
+			rspwait_adpcm_max = d;
+	}
+#endif
 	return 1;
 }
 
@@ -3224,7 +3241,8 @@ typedef struct {
 	s32 maskL, maskR;
 	u8 i_memc, i_om1, i_om2, i_oc1;
 	u8 algo5, fb, ams, pms_mask;
-	u32 pad0;
+	u16 masks;       /* bit s: slot may be EG-due; bit 8+s: quiet-locked */
+	u16 pad0;
 	u32 dp[8][4];    /* phase deltas per pm index, slot order S1,S3,S2,S4 */
 	u8 pmidx[128];
 	rspfm_slot_t slot[4];   /* memory order S1,S3,S2,S4 */
@@ -3335,14 +3353,36 @@ static void rspfm_pm_dp(FM_OPN *OPN, FM_CH *CH, u32 lfo_pm, u32 dp[4]) {
  * Must run BEFORE any C code mutates the channel this chunk. */
 static int rspfm_pack_chan(FM_OPN *OPN, FM_CH *CH, int j, int n,
 		const u8 *lfo_pm_arr, u32 panl, u32 panr,
-		int i_memc, int i_om1, int i_om2, int i_oc1) {
+		int i_memc, int i_om1, int i_om2, int i_oc1,
+		u32 eg_base, u32 eg_end) {
 	rspfm_ch_t * const p = &rspfm_pb.ch[j];
 	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
 	int s, i;
+	u16 masks = 0;
 
 	for (s = 0; s < 4; s++)
 		if (CH->SLOT[s].ssg & 0x08)
 			return 0;
+
+	/* Per-slot exact-skip masks. A slot is EG-due only at counter values
+	 * that are multiples of 2^sh; whether (eg_base, eg_end] contains one is
+	 * (eg_base>>sh) != (eg_end>>sh). A never-due slot cannot change volume,
+	 * state OR sh this chunk (transitions only happen on due ticks), so the
+	 * RSP may skip it per tick. A never-due slot already at >= ENV_QUIET is
+	 * quiet-locked: env = vol_out + AM only grows, so its operator output
+	 * is exactly 0 for the whole chunk. */
+	for (s = 0; s < 4; s++) {
+		const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
+		int due = 0;
+		if (SL->state != EG_OFF) {
+			const u8 sh = SL->eg_shv[SL->state];
+			due = (eg_base >> sh) != (eg_end >> sh);
+		}
+		if (due)
+			masks |= (u16) (1 << s);
+		else if (SL->vol_out >= ENV_QUIET)
+			masks |= (u16) (0x100 << s);
+	}
 
 	if (CH->pms) {
 		/* map each sample's lfo_pm to a dp table index (<= 8 distinct) */
@@ -3393,6 +3433,7 @@ static int rspfm_pack_chan(FM_OPN *OPN, FM_CH *CH, int j, int n,
 	p->algo5 = (CH->ALGO & 7) == 5;
 	p->fb = CH->FB;
 	p->ams = CH->ams;
+	p->masks = masks;
 
 	for (s = 0; s < 4; s++) {
 		const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
@@ -3435,9 +3476,26 @@ static void rspfm_kick(int n, u32 eg_base, const u8 *egt_arr,
 	rspq_highpri_end();
 }
 
+#ifdef RSPWAIT_PROF
+static u32 rspwait_fm_q;
+#endif
+
 static int rspfm_wait(void) {
 	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&rspfm_ob.seq);
 	u32 t0 = TICKS_READ();
+#ifdef RSPWAIT_PROF
+	/* queue latency first: the ucode DMAs a start stamp (= seq) into the
+	 * pad word right after seq the moment the command begins executing */
+	{
+		volatile u32 * const startp =
+				(volatile u32 *) UncachedAddr(&rspfm_ob.pad[0]);
+		while (*startp != rspfm_seqno) {
+			if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50))
+				break;   /* fall through to the seq loop's timeout path */
+		}
+		rspwait_fm_q += (u32) TICKS_DISTANCE(t0, TICKS_READ());
+	}
+#endif
 	while (*seqp != rspfm_seqno) {
 		if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50)) {
 			debugf("[RSPFM] TIMEOUT seq=%lu got=%lu - disabling FM offload\n",
@@ -3446,6 +3504,25 @@ static int rspfm_wait(void) {
 			return 0;
 		}
 	}
+#ifdef RSPWAIT_PROF
+	{
+		u32 d = (u32) TICKS_DISTANCE(t0, TICKS_READ());
+		rspwait_fm += d;
+		if (d > rspwait_fm_max)
+			rspwait_fm_max = d;
+		rspwait_chunks++;
+		if ((rspwait_chunks & 255) == 0) {
+			debugf("[RSPWAIT] fm=%lums max=%luus q=%lums adpcm=%lums max=%luus /256ch\n",
+					(unsigned long) (rspwait_fm / (TICKS_PER_SECOND / 1000)),
+					(unsigned long) (rspwait_fm_max / (TICKS_PER_SECOND / 1000000)),
+					(unsigned long) (rspwait_fm_q / (TICKS_PER_SECOND / 1000)),
+					(unsigned long) (rspwait_adpcm / (TICKS_PER_SECOND / 1000)),
+					(unsigned long) (rspwait_adpcm_max / (TICKS_PER_SECOND / 1000000)));
+			rspwait_fm = rspwait_adpcm = rspwait_fm_q = 0;
+			rspwait_fm_max = rspwait_adpcm_max = 0;
+		}
+	}
+#endif
 	return 1;
 }
 
@@ -3965,8 +4042,14 @@ void YM2610Update_stream(int length) {
 			if (!rspfm_checked)
 				rspfm_init();
 			if (!rspfm_dead) {
+				/* Ship at most HALF the active channels: the CPU synthesizes
+				 * its share between the kick and the collect, so RSP and CPU
+				 * run in parallel on different channels. Shipping everything
+				 * was measured NET-NEGATIVE: the CPU just idled for the whole
+				 * RSP compute time (~2.4ms/chunk, [RSPWAIT] q=0). */
+				int shipped = 0;
 				rspfm_pb.chmask = 0;
-				for (j = 0; j < 4; j++) {
+				for (j = 0; j < 4 && shipped < 2; j++) {
 					FM_CH * const CH = cch[j];
 					const int algo = CH->ALGO & 7;
 					if (CH->SLOT[SLOT1].state == EG_OFF
@@ -3984,8 +4067,11 @@ void YM2610Update_stream(int length) {
 							OPN->pan[fmn[j] * 2 + 0],
 							OPN->pan[fmn[j] * 2 + 1],
 							ccs_memc[algo], ccs_om1[algo],
-							ccs_om2[algo], ccs_oc1[algo]))
+							ccs_om2[algo], ccs_oc1[algo],
+							eg_base, OPN->eg_cnt)) {
 						rspfm_pb.chmask |= (u8) (1 << j);
+						shipped++;
+					}
 				}
 				if (rspfm_pb.chmask) {
 					fm_any = 1;
