@@ -51,6 +51,18 @@
    bizhawk-mupen-verdict), reproduced identically by stock libdragon audio ROMs. Not a
    regression signal; ares remains the pre-hardware gate (full boot→menus→fight validated).
 
+## ✅ RSP TIER, STEP 1 LANDED (2026-07-08 overnight) — ADPCM on the RSP
+
+The first structural lever is in (see BUILDS-2026-07-08.md): YM2610 ADPCM-A (6ch) +
+ADPCM-B decode runs on the RSP (`rsp_audio.S` rspq overlay), kicked at the top of each
+synthesis chunk so it decodes underneath the CPU's FM/SSG passes. Gated bit-exact by a
+300s ares dual-compute run (35840 chunks, 0 mismatches) + PC WAV byte-identity.
+**In-fight: 22.0 → 26.3 fps median; snd 135% → 119%; cpu 244% → 226%.** Default ON
+(`ADPCM_CPU=1` reverts). Remaining structural levers, in order: (1) FM synthesis on the
+RSP — snd ~119% is now nearly all FM+Z80+SSG, but tl_tab (26KB) exceeds DMEM so it needs
+table restructuring, a full session of its own; (2) RSP draw-issue offload (draw ~33%);
+(3) m68k residual (rank-4 fast paths, ~67%).
+
 ## ✅ SCOPE CLOSED (2026-07-07 overnight) — CPU-side plan complete
 
 Every remaining ranked item is now landed, measured-neutral-but-kept, or closed with
