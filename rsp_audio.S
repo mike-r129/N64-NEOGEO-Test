@@ -3,17 +3,60 @@
 # Design notes (why this overlay looks the way it does):
 #  - Commands are MONOLITHIC: each command DMAs in everything it needs and DMAs
 #    out everything it produced. No state is kept in DMEM between commands, so
-#    there is no RSPQ_BeginSavedState block: rspq may interleave rsp_video
-#    commands (which clobber the overlay data/bss area on the switch) between
-#    any two audio commands without corrupting us.
-#  - The CPU side (ym2610.c / platform_n64.c) builds a parameter block in RDRAM
+#    there is no saved-state block: rspq may interleave rsp_video commands
+#    (which reload the overlay data/bss area on the switch) between any two
+#    audio commands without corrupting us.
+#  - The CPU side (ym2610.c rspa_* glue) builds a parameter block in RDRAM
 #    (cache-written-back) and polls an uncached sequence word at the END of the
-#    output block. A single DMAOut writes RDRAM in ascending order, so when the
-#    final word is visible the whole block is.
+#    output block. The sequence word is written by the FINAL (synchronous) DMA,
+#    so when it is visible the whole output block is.
+#  - The decode is a bit-exact port of OPNB_ADPCMA_calc_chan / OPNB_ADPCMB_CALC
+#    from ym2610.c, restricted to the LINEAR case: the CPU pre-stages exactly
+#    the source bytes each channel will consume this chunk (the address stream
+#    is deterministic - it does not depend on the decoded data) and falls back
+#    to the C decoder for a whole chunk when ADPCM-B could hit its limit-wrap /
+#    repeat-restart paths. ADPCM-A end-of-sample and ADPCM-B end-stop ARE
+#    handled here (they are the common case).
+#  - All multiplies are scalar shift-add loops (the SU has no multiply; the
+#    VU's clamping semantics are easy to get subtly wrong). Every product here
+#    either fits in 32 bits or is used modulo 2^32 in a sum whose exact value
+#    fits (ADPCM-B interpolator), so shift-add is exact. The RSP has head room:
+#    this whole overlay is hidden behind the CPU's FM synthesis pass.
 #
-# 0x0 cmd_adpcm_test: DMA-in `size` bytes from a0, add 1 to each byte, DMA-out
-#     to a1. Boot-time self-test that the overlay is registered, commands
-#     dispatch, and both DMA directions work.
+# Commands:
+#  0x0 cmd_adpcm_test: DMA-in bytes from a0, add 1 to each, DMA-out to a1.
+#      Boot self-test (overlay registered, dispatch + both DMA directions OK).
+#  0x1 cmd_adpcm_run:  decode one chunk (up to 128 samples).
+#      a0 = param block RDRAM physical (see PARAM LAYOUT below)
+#      a1 = output block RDRAM physical (see OUT LAYOUT below)
+#      a2 = sequence number to write at out+1412 when done
+#
+# PARAM LAYOUT (384 bytes, mirrored in ym2610.c rspa_param_t):
+#   +0   u32 jedi_phys      RDRAM physical of jedi_table[49*16] (s16)
+#   +4   u16 n              samples this chunk (1..128)
+#   +6   u8  amask          bit c = ADPCM-A channel c active
+#   +7   u8  bflags         bit 0 = ADPCM-B active on RSP
+#   +8   pad to 16
+#   +16  A channel c at +16 + c*48:
+#     +0  u32 now_addr   +4  u32 now_step   +8  u32 step   +12 u32 end_x2m
+#     +16 s32 acc        +20 s32 astep      +24 s32 aout
+#     +28 u8 now_data    +29 u8 flagMask    +30 u8 vol_mul +31 u8 vol_shift
+#     +32 s32 maskL      +36 s32 maskR      (0 or -1 pan routing masks)
+#     +40 u32 src_phys   +44 u16 src_cur    +46 u8 flag_out (in: 1) +47 pad
+#   +304 B channel (64 bytes):
+#     +0  u32 now_addr   +4  u32 now_step   +8  u32 step   +12 u32 end_x2
+#     +16 s32 acc        +20 s32 adpcmd     +24 s32 prev_acc  +28 s32 volume
+#     +32 s32 maskL      +36 s32 maskR
+#     +40 u32 src_phys   +44 u16 src_cur    +46 u8 now_data +47 u8 flag_out
+#     +48 s32 adpcml(out) +52 u8 eosbit     +53 pad to 64
+#   +368 pad to 384
+#
+# OUT LAYOUT (1424 bytes, mirrored in ym2610.c rspa_out_t):
+#   +0    s32 l[128]     per-sample L contribution (A summed + B folded)
+#   +512  s32 r[128]
+#   +1024 updated param block echo (384 bytes; CPU reads back state fields)
+#   +1408 u32 arrived    (flag bits to OR into adpcm_arrivedEndAddress)
+#   +1412 u32 seq        (written LAST - CPU poll target)
 
 #include <rsp_queue.inc>
 
@@ -21,18 +64,57 @@
 
     RSPQ_BeginOverlayHeader
         RSPQ_DefineCommand cmd_adpcm_test, 12   # 0x0: a0=src, a1=dst, a2=size
+        RSPQ_DefineCommand cmd_adpcm_run, 12    # 0x1: a0=param, a1=out, a2=seq
     RSPQ_EndOverlayHeader
 
     RSPQ_EmptySavedState
 
+    .align 3
+# ADPCM-B "Forecast to next Forecast" table (x adpcmd / 8)
+BDEC1: .half 1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15
+# ADPCM-B "delta to next delta" table (x adpcmd / 64)
+BDEC2: .half 57, 57, 57, 57, 77, 102, 128, 153, 57, 57, 57, 57, 77, 102, 128, 153
+# ADPCM-A step_inc table (indexed by nibble & 7)
+STEP_INC: .half -16, -16, -16, -16, 32, 80, 112, 144
+
     .bss
     .align 4
-TEST_BUF: .dcb.b 128
+PARAM_BUF: .dcb.b 384
+JEDI_BUF:  .dcb.b 1568
+ACC_L:     .dcb.b 256      # ACC_R MUST be ACC_L+256 (code uses fixed offset)
+ACC_R:     .dcb.b 256
+SRC_BUF:   .dcb.b 192      # 176-byte source slice + alignment slack
+TEST_BUF:  .dcb.b 128
+    .align 3
+ARRIVED:   .dcb.b 4        # SEQ MUST follow ARRIVED (final 8-byte DMA)
+SEQ_OUT:   .dcb.b 4
+RA_SAVE:   .dcb.b 4
+CUR_SAVE:  .dcb.b 4
+CH_MASK:   .dcb.b 4
+CH_PTR:    .dcb.b 4
 
     .text
 
     #############################################################
-    # cmd_adpcm_test — echo/transform self-test
+    # MULU: dst = mcand * mult, exact mod 2^32, for mult >= 0.
+    # Clobbers mcand, mult and one scratch reg. mult==0 -> dst=0.
+    #############################################################
+    .macro MULU dst, mcand, mult, tmp
+    move \dst, zero
+    beqz \mult, 9f
+    nop
+8:  andi \tmp, \mult, 1
+    subu \tmp, zero, \tmp
+    and  \tmp, \tmp, \mcand
+    addu \dst, \dst, \tmp
+    srl  \mult, \mult, 1
+    bnez \mult, 8b
+    sll  \mcand, \mcand, 1
+9:
+    .endm
+
+    #############################################################
+    # cmd_adpcm_test - echo/transform self-test
     #   a0: RDRAM source (8-byte aligned)
     #   a1: RDRAM destination (8-byte aligned)
     #   a2: transfer size, pre-encoded by the CPU as DMA_SIZE(len, 1)
@@ -40,6 +122,8 @@ TEST_BUF: .dcb.b 128
     #############################################################
     .func cmd_adpcm_test
 cmd_adpcm_test:
+    sll a0, 8                   # strip the rspq command byte from arg word 0
+    srl a0, 8
     move s0, a0
     li s4, %lo(TEST_BUF)
     jal DMAIn
@@ -63,4 +147,458 @@ cmd_adpcm_test:
 
     j RSPQ_Loop
     nop
+    .endfunc
+
+    #############################################################
+    # cmd_adpcm_run - decode one chunk
+    #   a0 = param RDRAM physical, a1 = out RDRAM physical, a2 = seq
+    #
+    # Register map (main):
+    #   s5 = out_phys   s6 = seq   s7 = out byte offset of current
+    #   64-sample half   s8 = samples remaining   s2 = nh (this half)
+    #############################################################
+    .func cmd_adpcm_run
+cmd_adpcm_run:
+    sll a0, 8                   # strip the rspq command byte from arg word 0
+    srl a0, 8
+    move s5, a1
+    move s6, a2
+
+    # param block in
+    move s0, a0
+    li s4, %lo(PARAM_BUF)
+    jal DMAIn
+    li t0, DMA_SIZE(384, 1)
+
+    # jedi table in
+    lw s0, %lo(PARAM_BUF) + 0
+    li s4, %lo(JEDI_BUF)
+    jal DMAIn
+    li t0, DMA_SIZE(1568, 1)
+
+    sw zero, %lo(ARRIVED)
+
+    lhu s8, %lo(PARAM_BUF) + 4
+    move s7, zero
+
+half_loop:
+    # nh = min(64, samples remaining)
+    li s2, 64
+    slt t0, s8, s2
+    beqz t0, 1f
+    nop
+    move s2, s8
+1:
+    # zero the accumulators (always the full 64 entries; tails just use fewer)
+    li t0, %lo(ACC_L)
+    li t1, 64
+2:  sw zero, 0(t0)
+    sw zero, 256(t0)
+    addiu t1, -1
+    bnez t1, 2b
+    addiu t0, 4
+
+    # ADPCM-A channels
+    lbu t0, %lo(PARAM_BUF) + 6
+    sw t0, %lo(CH_MASK)
+    li t0, %lo(PARAM_BUF) + 16
+    sw t0, %lo(CH_PTR)
+ch_loop:
+    lw t0, %lo(CH_MASK)
+    andi t1, t0, 1
+    srl t0, 1
+    sw t0, %lo(CH_MASK)
+    beqz t1, ch_next
+    lw s1, %lo(CH_PTR)
+    jal adpcm_a_chan
+    nop
+ch_next:
+    lw t0, %lo(CH_PTR)
+    addiu t0, 48
+    sw t0, %lo(CH_PTR)
+    li t1, %lo(PARAM_BUF) + 16 + 6*48
+    bne t0, t1, ch_loop
+    nop
+
+    # ADPCM-B
+    lbu t0, %lo(PARAM_BUF) + 7
+    andi t0, 1
+    beqz t0, no_b
+    nop
+    jal adpcm_b_chan
+    li s1, %lo(PARAM_BUF) + 304
+no_b:
+
+    # DMA the accumulator halves out: L -> out+s7, R -> out+512+s7
+    sll t4, s2, 2               # nh*4 bytes
+    addiu t4, 7
+    srl t4, 3
+    sll t4, 3                   # round up to multiple of 8
+    addiu t4, -1                # DMA_SIZE(len, 1)
+    li s4, %lo(ACC_L)
+    addu s0, s5, s7
+    jal DMAOut
+    move t0, t4
+    li s4, %lo(ACC_R)
+    addu s0, s5, s7
+    addiu s0, 512
+    jal DMAOut
+    move t0, t4
+
+    addiu s7, 256
+    subu s8, s2
+    bnez s8, half_loop
+    nop
+
+    # echo the (state-updated) param block to out+1024
+    li s4, %lo(PARAM_BUF)
+    addiu s0, s5, 1024
+    jal DMAOut
+    li t0, DMA_SIZE(384, 1)
+
+    # arrived + seq, the FINAL 8 bytes at out+1408 (CPU polls seq)
+    sw s6, %lo(SEQ_OUT)
+    li s4, %lo(ARRIVED)
+    addiu s0, s5, 1408
+    jal DMAOut
+    li t0, DMA_SIZE(8, 1)
+
+    j RSPQ_Loop
+    nop
+    .endfunc
+
+    #############################################################
+    # adpcm_a_chan - decode s2 samples of one ADPCM-A channel,
+    # accumulating into ACC_L/ACC_R. s1 = channel param DMEM ptr.
+    #
+    # Mirrors OPNB_ADPCMA_calc_chan exactly, including:
+    #  - end-of-sample: contribution 0 for that sample and the rest
+    #    of the chunk, aout NOT recomputed, state frozen (C's early
+    #    return + the "i < n && ch->flag" loop guard).
+    #  - 12-bit signed accumulator wrap after every nibble.
+    #  - aout = ((s16)acc * vol_mul) >> vol_shift & ~3, recomputed
+    #    only on samples that consumed nibbles.
+    #
+    # Regs: t8=now_addr t7=now_step t6=step t5=end_x2m t4=acc
+    #       t3=astep s3=aout a3=now_data k0=vol_mul k1=vol_shift
+    #       v0=maskL v1=maskR t9=0x1FFFFF a0=src ptr a1=acc ptr
+    #       a2=nibble count s0=sample counter t0-t2=scratch
+    #############################################################
+    .func adpcm_a_chan
+adpcm_a_chan:
+    sw ra, %lo(RA_SAVE)
+    lbu t0, 46(s1)              # flag_out: 0 = ended in an earlier half
+    beqz t0, a_ret
+    nop
+
+    # source slice: DMA 176 bytes from src_phys + (src_cur & ~7)
+    lhu t0, 44(s1)
+    sw t0, %lo(CUR_SAVE)
+    srl t1, t0, 3
+    sll t1, 3
+    lw s0, 40(s1)
+    addu s0, t1
+    li s4, %lo(SRC_BUF)
+    jal DMAIn
+    li t0, DMA_SIZE(176, 1)
+
+    lw t0, %lo(CUR_SAVE)
+    andi t0, 7
+    addiu a0, t0, %lo(SRC_BUF)  # a0 = DMEM addr of next source byte
+
+    lw t8, 0(s1)
+    lw t7, 4(s1)
+    lw t6, 8(s1)
+    lw t5, 12(s1)
+    lw t4, 16(s1)
+    lw t3, 20(s1)
+    lw s3, 24(s1)
+    lbu a3, 28(s1)
+    lbu k0, 30(s1)
+    lbu k1, 31(s1)
+    lw v0, 32(s1)
+    lw v1, 36(s1)
+    lui t9, 0x1F
+    ori t9, 0xFFFF              # 0x1FFFFF: YM2610 compares 21 addr bits
+    move s0, s2
+    li a1, %lo(ACC_L)
+
+a_sample:
+    addu t7, t6                 # now_step += step
+    srl a2, t7, 16
+    beqz a2, a_emit             # no nibble this sample: contribute old aout
+    andi t7, 0xFFFF
+
+a_nib:
+    and t0, t8, t9              # end check (21 bits)
+    beq t0, t5, a_end_hit
+    andi t1, t8, 1
+    bnez t1, a_odd
+    nop
+    lbu a3, 0(a0)               # even nibble: fetch next source byte
+    addiu a0, 1
+    srl t2, a3, 4
+    b a_have
+    andi t2, 0xF
+a_odd:
+    andi t2, a3, 0xF
+a_have:
+    addiu t8, 1                 # now_addr++
+
+    addu t0, t3, t2             # jedi_table[astep + data]
+    sll t0, 1
+    lh t1, %lo(JEDI_BUF)(t0)
+    addu t4, t1
+    sll t4, 20                  # 12-bit signed wrap
+    sra t4, 20
+
+    andi t0, t2, 7              # astep += step_inc[data & 7], clamp [0,768]
+    sll t0, 1
+    lh t1, %lo(STEP_INC)(t0)
+    addu t3, t1
+    bgez t3, 1f
+    nop
+    move t3, zero
+1:  slti t0, t3, 769
+    bnez t0, 2f
+    addiu a2, -1
+    li t3, 768
+2:  bnez a2, a_nib
+    nop
+
+    # aout = (acc * vol_mul) >> vol_shift & ~3   (acc is 12-bit signed)
+    move t0, zero
+    move t1, t4
+    move a2, k0
+    beqz a2, 4f
+    nop
+3:  andi t2, a2, 1
+    subu t2, zero, t2
+    and t2, t1
+    addu t0, t2
+    srl a2, 1
+    bnez a2, 3b
+    sll t1, 1
+4:  srav t0, t0, k1
+    srl t0, 2
+    sll t0, 2                   # & ~3
+    move s3, t0
+
+a_emit:
+    and t0, s3, v0
+    lw t1, 0(a1)
+    addu t1, t0
+    sw t1, 0(a1)
+    and t0, s3, v1
+    lw t1, 256(a1)
+    addu t1, t0
+    sw t1, 256(a1)
+    addiu a1, 4
+    addiu s0, -1
+    bnez s0, a_sample
+    nop
+
+a_store:
+    sw t8, 0(s1)
+    sw t7, 4(s1)
+    sw t4, 16(s1)
+    sw t3, 20(s1)
+    sw s3, 24(s1)
+    sb a3, 28(s1)
+    # src_cur = (saved cur & ~7) + bytes consumed from SRC_BUF
+    lw t0, %lo(CUR_SAVE)
+    srl t0, 3
+    sll t0, 3
+    li t1, %lo(SRC_BUF)
+    subu t1, a0, t1
+    addu t0, t1
+    sh t0, 44(s1)
+a_ret:
+    lw ra, %lo(RA_SAVE)
+    jr ra
+    nop
+
+a_end_hit:
+    # flag=0, arrived |= flagMask; this sample and the rest contribute 0
+    sb zero, 46(s1)
+    lbu t0, 29(s1)
+    lw t1, %lo(ARRIVED)
+    or t1, t0
+    b a_store
+    sw t1, %lo(ARRIVED)
+    .endfunc
+
+    #############################################################
+    # adpcm_b_chan - decode s2 samples of the ADPCM-B (deltaT)
+    # channel, folding (adpcml >> 9) into ACC_L/ACC_R (the same
+    # value pass 4 would have added from dtb[]). s1 = param ptr.
+    #
+    # Mirrors OPNB_ADPCMB_CALC restricted to the linear case (the
+    # CPU already guaranteed limit-wrap / repeat-restart cannot
+    # happen this chunk). End-stop: portstate=0 (flag_out=0),
+    # adpcml=0, prev_acc=0, contribution 0 from that sample on.
+    #
+    # Regs: t8=now_addr t7=now_step t6=step t5=end_x2 t4=acc
+    #       t3=adpcmd s3=prev_acc a3=now_data k0=volume k1=adpcml
+    #       v0=maskL v1=maskR t9=0x1FFFFFF a0=src ptr a1=acc ptr
+    #       a2=nibble count s0=sample counter t0-t2,s4=scratch
+    #############################################################
+    .func adpcm_b_chan
+adpcm_b_chan:
+    sw ra, %lo(RA_SAVE)
+    lbu t0, 47(s1)              # flag_out: 0 = stopped in an earlier half
+    beqz t0, b_ret
+    nop
+
+    lhu t0, 44(s1)
+    sw t0, %lo(CUR_SAVE)
+    srl t1, t0, 3
+    sll t1, 3
+    lw s0, 40(s1)
+    addu s0, t1
+    li s4, %lo(SRC_BUF)
+    jal DMAIn
+    li t0, DMA_SIZE(176, 1)
+
+    lw t0, %lo(CUR_SAVE)
+    andi t0, 7
+    addiu a0, t0, %lo(SRC_BUF)
+
+    lw t8, 0(s1)
+    lw t7, 4(s1)
+    lw t6, 8(s1)
+    lw t5, 12(s1)
+    lw t4, 16(s1)
+    lw t3, 20(s1)
+    lw s3, 24(s1)
+    lw k0, 28(s1)               # volume
+    lw v0, 32(s1)
+    lw v1, 36(s1)
+    lbu a3, 46(s1)
+    lui t9, 0x1FF
+    ori t9, 0xFFFF              # 0x1FFFFFF: 24+1 bit address wrap
+    move s0, s2
+    li a1, %lo(ACC_L)
+
+b_sample:
+    addu t7, t6
+    srl a2, t7, 16
+    beqz a2, b_interp
+    andi t7, 0xFFFF
+
+b_nib:
+    beq t8, t5, b_end_hit       # end-stop check (exact compare)
+    andi t1, t8, 1
+    bnez t1, b_odd
+    nop
+    lbu a3, 0(a0)
+    addiu a0, 1
+    b b_have
+    srl t2, a3, 4
+b_odd:
+    andi t2, a3, 0xF
+b_have:
+    addiu t8, 1
+    and t8, t9                  # now_addr &= (1<<25)-1
+    move s3, t4                 # prev_acc = acc
+
+    # acc += BDEC1[data] * adpcmd / 8 (C truncating division), clamp +-32767
+    sll t0, t2, 1
+    lh t1, %lo(BDEC1)(t0)
+    move s4, t3
+    MULU t0, t1, s4, k1         # t0 = BDEC1[data] * adpcmd (k1 scratch)
+    sra k1, t0, 31
+    andi k1, 7
+    addu t0, k1
+    sra t0, 3
+    addu t4, t0
+    li k1, 32767
+    slt t0, k1, t4
+    beqz t0, 1f
+    nop
+    move t4, k1
+1:  li k1, -32768
+    slt t0, t4, k1
+    beqz t0, 2f
+    nop
+    move t4, k1
+2:
+    # adpcmd = adpcmd * BDEC2[data] / 64, clamp [127, 24576]
+    sll t0, t2, 1
+    lh t1, %lo(BDEC2)(t0)
+    move s4, t1                 # multiplier = table value (<= 153)
+    move t1, t3                 # multiplicand = adpcmd
+    MULU t0, t1, s4, k1
+    srl t3, t0, 6
+    li k1, 24576
+    slt t0, k1, t3
+    beqz t0, 3f
+    nop
+    move t3, k1
+3:  li k1, 127
+    slt t0, t3, k1
+    beqz t0, 4f
+    addiu a2, -1
+    move t3, k1
+4:  bnez a2, b_nib
+    nop
+
+b_interp:
+    # adpcml = (((prev<<16) + (acc-prev)*now_step) >> 16) * volume
+    subu t1, t4, s3
+    move s4, t7
+    MULU t0, t1, s4, k1         # (acc-prev)*now_step, exact mod 2^32
+    sll t2, s3, 16
+    addu t0, t2
+    sra t0, 16
+    move t1, t0
+    move s4, k0
+    MULU t0, t1, s4, k1         # * volume
+    move k1, t0                 # adpcml
+
+    sra t0, k1, 9               # pass-4 fold: dtb[i] >> 9
+    and t2, t0, v0
+    lw t1, 0(a1)
+    addu t1, t2
+    sw t1, 0(a1)
+    and t2, t0, v1
+    lw t1, 256(a1)
+    addu t1, t2
+    sw t1, 256(a1)
+    addiu a1, 4
+    addiu s0, -1
+    bnez s0, b_sample
+    nop
+
+b_store:
+    sw t8, 0(s1)
+    sw t7, 4(s1)
+    sw t4, 16(s1)
+    sw t3, 20(s1)
+    sw s3, 24(s1)
+    sb a3, 46(s1)
+    sw k1, 48(s1)
+    lw t0, %lo(CUR_SAVE)
+    srl t0, 3
+    sll t0, 3
+    li t1, %lo(SRC_BUF)
+    subu t1, a0, t1
+    addu t0, t1
+    sh t0, 44(s1)
+b_ret:
+    lw ra, %lo(RA_SAVE)
+    jr ra
+    nop
+
+b_end_hit:
+    # EOS: arrived |= eosbit, portstate off, adpcml = prev_acc = 0,
+    # contribution 0 from this sample on
+    lbu t0, 52(s1)
+    lw t1, %lo(ARRIVED)
+    or t1, t0
+    sw t1, %lo(ARRIVED)
+    sb zero, 47(s1)
+    move k1, zero
+    b b_store
+    move s3, zero
     .endfunc

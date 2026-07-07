@@ -2306,8 +2306,9 @@ static int step_inc[8] = { -1 * 16, -1 * 16, -1 * 16, -1 * 16, 2 * 16, 5 * 16, 7
 		* 16, 9 * 16 };
 
 /* speedup purposes only */
-/* MVS64: narrowed from int — max |value| = 15*steps[48]/8 = 2910. */
-static s16 jedi_table[49 * 16];
+/* MVS64: narrowed from int — max |value| = 15*steps[48]/8 = 2910.
+ * 16-aligned so the RSP ADPCM offload can DMA it into DMEM. */
+static s16 jedi_table[49 * 16] __attribute__((aligned(16)));
 
 static void OPNB_ADPCMA_init_table(void) {
 	int step, nib;
@@ -2797,6 +2798,387 @@ INLINE s32 OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
 	return adpcmb->adpcml;
 }
 
+/* ============================================================================
+ * MVS64: RSP ADPCM offload (-DMVS64_RSPADPCM, N64 only).
+ *
+ * The ADPCM source-address stream is deterministic (it does not depend on the
+ * decoded data), so per chunk the CPU can stage exactly the source bytes each
+ * channel will consume (through the existing streamed v.rom windows), hand the
+ * RSP a parameter block, and read back per-sample L/R contribution arrays plus
+ * the updated channel states. rsp_audio.S is a bit-exact port of the two
+ * decoders above, restricted to the linear case; ADPCM-B chunks that could hit
+ * the limit-wrap or repeat-restart paths fall back to the C decoder for that
+ * chunk (rare), as does any channel whose staging would overflow.
+ *
+ * -DMVS64_RSPADPCM_VERIFY: dual-compute gate. The C decoders stay
+ * authoritative; the RSP result is compared per sample and per state field
+ * every chunk, and [RSPADPCM] telemetry reports the mismatch counters (the
+ * gate is ZERO mismatches over a long ares run).
+ * ==========================================================================*/
+#if defined(N64) && defined(MVS64_RSPADPCM)
+#include <libdragon.h>
+#include <stddef.h>
+
+extern uint32_t RSP_AUDIO_OVL_ID;
+
+/* These mirror the PARAM/OUT layouts in rsp_audio.S exactly (natural field
+ * alignment gives the byte offsets the ucode uses; asserts below verify). */
+typedef struct {
+	u32 now_addr, now_step, step, end_x2m;
+	s32 acc, astep, aout;
+	u8 now_data, flagMask, vol_mul, vol_shift;
+	s32 maskL, maskR;
+	u32 src_phys;
+	u16 src_cur;
+	u8 flag_out, pad0;
+} rspa_cha_t;
+
+typedef struct {
+	u32 now_addr, now_step, step, end_x2;
+	s32 acc, adpcmd, prev_acc, volume;
+	s32 maskL, maskR;
+	u32 src_phys;
+	u16 src_cur;
+	u8 now_data, flag_out;
+	s32 adpcml;
+	u8 eosbit;
+	u8 pad[11];
+} rspa_chb_t;
+
+typedef struct __attribute__((aligned(16))) {
+	u32 jedi_phys;
+	u16 n;
+	u8 amask, bflags;
+	u8 pad0[8];
+	rspa_cha_t a[6];
+	rspa_chb_t b;
+	u8 pad1[16];
+} rspa_param_t;
+
+typedef struct __attribute__((aligned(16))) {
+	s32 l[128];
+	s32 r[128];
+	rspa_param_t echo;
+	u32 arrived;
+	u32 seq;
+	u8 pad[8];
+} rspa_out_t;
+
+_Static_assert(sizeof(rspa_cha_t) == 48, "rspa_cha_t layout");
+_Static_assert(sizeof(rspa_chb_t) == 64, "rspa_chb_t layout");
+_Static_assert(sizeof(rspa_param_t) == 384, "rspa_param_t layout");
+_Static_assert(offsetof(rspa_param_t, a) == 16, "rspa A offset");
+_Static_assert(offsetof(rspa_param_t, b) == 304, "rspa B offset");
+_Static_assert(offsetof(rspa_out_t, echo) == 1024, "rspa echo offset");
+_Static_assert(offsetof(rspa_out_t, arrived) == 1408, "rspa arrived offset");
+_Static_assert(offsetof(rspa_out_t, seq) == 1412, "rspa seq offset");
+_Static_assert(sizeof(rspa_out_t) == 1424, "rspa_out_t size");
+
+/* Source staging. The RSP DMAs fixed 176-byte slices from
+ * src_phys + (src_cur & ~7), so a buffer must cover the worst-case cursor
+ * (rounded down) + 176. At 11025Hz output: A consumes <= ~110 bytes per
+ * 128-sample chunk (fixed 18.5kHz nibble rate), B <= ~325 (delta=0xFFFF). */
+static u8 rspa_srcA[6][352] __attribute__((aligned(16)));
+static u8 rspa_srcB[768] __attribute__((aligned(16)));
+static rspa_param_t rspa_pb;
+static rspa_out_t rspa_ob;
+static u32 rspa_seqno;
+static int rspa_dead;   /* poll timeout observed -> permanent C fallback */
+#ifdef MVS64_RSPADPCM_VERIFY
+static u32 rspa_chunks, rspa_badchunks, rspa_badsamp, rspa_badstate;
+#endif
+
+/* Stage the source bytes one channel will consume this chunk: the bytes at
+ * the even addresses in [now_addr, now_addr+nib-1], i.e. byte addresses
+ * starting at (now_addr+1)>>1. Returns the byte count. */
+static u32 rspa_stage(int win, u32 now_addr, u32 nib, u8 *dst,
+		const u8 *resident, u32 size) {
+	u32 a0b = (now_addr + 1) >> 1;
+	u32 cnt = nib ? ((now_addr + nib + 1) >> 1) - a0b : 0;
+	u32 k;
+	for (k = 0; k < cnt; k++) {
+		u32 a = a0b + k;
+		dst[k] = (a < size) ? (resident ? resident[a]
+		                                : ym2610_vrom_fetch(win, a)) : 0;
+	}
+	if (cnt)
+		data_cache_hit_writeback(dst, (cnt + 15) & ~(u32)15);
+	return cnt;
+}
+
+/* Build the param block from live YM2610 state (called BEFORE the C decoders
+ * touch anything this chunk). Returns nonzero if the RSP has work. */
+static int rspa_build(int n, int dtl, int dtr) {
+	int any = 0, c;
+	ADPCMB * const dt = &YM2610.adpcmb;
+	static int jedi_synced;
+	if (!jedi_synced) {
+		data_cache_hit_writeback(jedi_table, sizeof(jedi_table));
+		jedi_synced = 1;
+	}
+	rspa_pb.jedi_phys = PhysicalAddr(jedi_table);
+	rspa_pb.n = (u16) n;
+	rspa_pb.amask = 0;
+	rspa_pb.bflags = 0;
+	for (c = 0; c < 6; c++) {
+		ADPCMA * const ch = &YM2610.adpcma[c];
+		rspa_cha_t * const p = &rspa_pb.a[c];
+		u32 sched, to_end, nib, cnt;
+		int pi;
+		if (!ch->flag)
+			continue;
+		sched = (ch->now_step + (u32) n * ch->step) >> 16;
+		to_end = ((ch->end << 1) - ch->now_addr) & ((1u << 21) - 1);
+		nib = sched < to_end ? sched : to_end;
+		cnt = nib ? ((ch->now_addr + nib + 1) >> 1)
+		            - ((ch->now_addr + 1) >> 1) : 0;
+		if (cnt > sizeof(rspa_srcA[0]) - 176)
+			continue;   /* staging overflow (nonstandard rate) -> C fallback */
+		rspa_stage(c, ch->now_addr, nib, rspa_srcA[c], pcmbufA, pcmsizeA);
+		p->now_addr = ch->now_addr;
+		p->now_step = ch->now_step;
+		p->step = ch->step;
+		p->end_x2m = (ch->end << 1) & ((1u << 21) - 1);
+		p->acc = ch->adpcma_acc;
+		p->astep = ch->adpcma_step;
+		p->aout = ch->adpcma_out;
+		p->now_data = ch->now_data;
+		p->flagMask = ch->flagMask;
+		p->vol_mul = (u8) ch->vol_mul;
+		p->vol_shift = ch->vol_shift;
+		pi = (int) (ch->pan - out_adpcma);
+		p->maskL = (pi == OUTD_LEFT || pi == OUTD_CENTER) ? -1 : 0;
+		p->maskR = (pi == OUTD_RIGHT || pi == OUTD_CENTER) ? -1 : 0;
+		p->src_phys = PhysicalAddr(rspa_srcA[c]);
+		p->src_cur = 0;
+		p->flag_out = 1;
+		rspa_pb.amask |= (u8) (1 << c);
+		any = 1;
+	}
+	if (dt->portstate & 0x80) {
+		u32 sched = (dt->now_step + (u32) n * dt->step) >> 16;
+		u32 na = dt->now_addr;
+		u32 lim = dt->limit << 1, end = dt->end << 1;
+		u32 nib, cnt;
+		int linear = 1;
+		/* the RSP handles only the linear walk + end-stop; fall back for a
+		 * chunk that could hit the limit-wrap or repeat-restart paths */
+		if (lim >= na && lim <= na + sched)
+			linear = 0;
+		if ((dt->portstate & 0x10) && end >= na && end <= na + sched)
+			linear = 0;
+		if (na + sched + 2 >= (1u << 25))
+			linear = 0;
+		nib = sched;
+		if (!(dt->portstate & 0x10) && end >= na && end - na < nib)
+			nib = end - na;
+		cnt = nib ? ((na + nib + 1) >> 1) - ((na + 1) >> 1) : 0;
+		if (linear && cnt <= sizeof(rspa_srcB) - 176) {
+			rspa_chb_t * const p = &rspa_pb.b;
+			rspa_stage(6, na, nib, rspa_srcB, pcmbufB, pcmsizeB);
+			p->now_addr = na;
+			p->now_step = dt->now_step;
+			p->step = dt->step;
+			p->end_x2 = end;
+			p->acc = dt->acc;
+			p->adpcmd = dt->adpcmd;
+			p->prev_acc = dt->prev_acc;
+			p->volume = dt->volume;
+			p->maskL = dtl ? -1 : 0;
+			p->maskR = dtr ? -1 : 0;
+			p->src_phys = PhysicalAddr(rspa_srcB);
+			p->src_cur = 0;
+			p->now_data = dt->now_data;
+			p->flag_out = 1;
+			p->adpcml = dt->adpcml;
+			p->eosbit = dt->status_change_EOS_bit;
+			rspa_pb.bflags = 1;
+			any = 1;
+		}
+	}
+	return any;
+}
+
+static void rspa_kick(void) {
+	rspa_seqno++;
+	data_cache_hit_writeback(&rspa_pb, sizeof(rspa_pb));
+	/* drop any cached rspa_ob lines NOW so no dirty line writes back over the
+	 * RSP's output later; the seq poll below goes through the uncached alias */
+	data_cache_hit_invalidate(&rspa_ob, sizeof(rspa_ob));
+	rspq_highpri_begin();
+	rspq_write(RSP_AUDIO_OVL_ID, 0x1, PhysicalAddr(&rspa_pb),
+			PhysicalAddr(&rspa_ob), rspa_seqno);
+	rspq_highpri_end();
+}
+
+static int rspa_wait(void) {
+	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&rspa_ob.seq);
+	u32 t0 = TICKS_READ();
+	while (*seqp != rspa_seqno) {
+		if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50)) {
+			debugf("[RSPADPCM] TIMEOUT seq=%lu got=%lu - disabling RSP ADPCM\n",
+					(unsigned long) rspa_seqno, (unsigned long) *seqp);
+			rspa_dead = 1;
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* C decode of a channel subset, exactly like the classic pass 3 (used for the
+ * per-chunk fallbacks, the timeout path, and the verify reference). */
+static void rspa_c_decode(int n, u8 amask, int b_too,
+		s32 *accl, s32 *accr, s32 *dtb_arr) {
+	int i, j;
+	ADPCMB * const dt = &YM2610.adpcmb;
+	if (b_too) {
+		for (i = 0; i < n; i++)
+			dtb_arr[i] = (dt->portstate & 0x80) ? OPNB_ADPCMB_CALC(dt) : 0;
+	}
+	for (j = 0; j < 6; j++) {
+		ADPCMA * const ch = &YM2610.adpcma[j];
+		if (!(amask & (1 << j)) || !ch->flag)
+			continue;
+		{
+			const int pi = (int) (ch->pan - out_adpcma);
+			const int al = (pi == OUTD_LEFT || pi == OUTD_CENTER);
+			const int ar = (pi == OUTD_RIGHT || pi == OUTD_CENTER);
+			for (i = 0; i < n && ch->flag; i++) {
+				const s32 o = OPNB_ADPCMA_calc_chan(ch);
+				if (al)
+					accl[i] += o;
+				if (ar)
+					accr[i] += o;
+			}
+		}
+	}
+}
+
+/* Adopt the RSP results: fold the contribution arrays into the chunk
+ * accumulators and write the echoed states back into the live structs. */
+static void rspa_adopt(int n, s32 *accl, s32 *accr) {
+	int c, i;
+	for (i = 0; i < n; i++) {
+		accl[i] += rspa_ob.l[i];
+		accr[i] += rspa_ob.r[i];
+	}
+	for (c = 0; c < 6; c++) {
+		const rspa_cha_t * const e = &rspa_ob.echo.a[c];
+		ADPCMA * const ch = &YM2610.adpcma[c];
+		if (!(rspa_pb.amask & (1 << c)))
+			continue;
+		ch->now_addr = e->now_addr;
+		ch->now_step = e->now_step;
+		ch->adpcma_acc = e->acc;
+		ch->adpcma_step = e->astep;
+		ch->adpcma_out = e->aout;
+		ch->now_data = e->now_data;
+		if (!e->flag_out)
+			ch->flag = 0;
+	}
+	if (rspa_pb.bflags & 1) {
+		const rspa_chb_t * const e = &rspa_ob.echo.b;
+		ADPCMB * const dt = &YM2610.adpcmb;
+		dt->now_addr = e->now_addr;
+		dt->now_step = e->now_step;
+		dt->acc = e->acc;
+		dt->adpcmd = e->adpcmd;
+		dt->prev_acc = e->prev_acc;
+		dt->adpcml = e->adpcml;
+		dt->now_data = e->now_data;
+		if (!e->flag_out) {
+			dt->portstate = 0;
+			dt->PCM_BSY = 0;
+		}
+	}
+	YM2610.adpcm_arrivedEndAddress |= (u8) rspa_ob.arrived;
+}
+
+#ifdef MVS64_RSPADPCM_VERIFY
+/* Compare the RSP output against the (authoritative) C results.
+ * refl/refr are the C per-sample contributions of the RSP-covered channels;
+ * arr0/arr1 are adpcm_arrivedEndAddress before/after the C decode of those
+ * channels. Counts mismatches; prints details for the first few. */
+static void rspa_verify_cmp(int n, const s32 *refl, const s32 *refr,
+		u8 arr0, u8 arr1) {
+	int i, c, bad = 0;
+	static int prints;
+	for (i = 0; i < n; i++) {
+		if (rspa_ob.l[i] != refl[i] || rspa_ob.r[i] != refr[i]) {
+			bad++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPADPCM] SAMPDIFF chunk=%lu i=%d rsp=%ld/%ld c=%ld/%ld\n",
+						(unsigned long) rspa_chunks, i,
+						(long) rspa_ob.l[i], (long) rspa_ob.r[i],
+						(long) refl[i], (long) refr[i]);
+			}
+		}
+	}
+	rspa_badsamp += (u32) bad;
+	for (c = 0; c < 6; c++) {
+		const rspa_cha_t * const e = &rspa_ob.echo.a[c];
+		const ADPCMA * const ch = &YM2610.adpcma[c];
+		if (!(rspa_pb.amask & (1 << c)))
+			continue;
+		if (e->now_addr != ch->now_addr || e->now_step != ch->now_step
+				|| e->acc != ch->adpcma_acc || e->astep != ch->adpcma_step
+				|| e->aout != ch->adpcma_out || e->now_data != ch->now_data
+				|| (e->flag_out ? 1 : 0) != (ch->flag ? 1 : 0)) {
+			bad++;
+			rspa_badstate++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPADPCM] ASTATE ch%d rsp=%lx/%lx/%ld/%ld/%ld/%x/%d "
+						"c=%lx/%lx/%ld/%ld/%ld/%x/%d\n", c,
+						(unsigned long) e->now_addr, (unsigned long) e->now_step,
+						(long) e->acc, (long) e->astep, (long) e->aout,
+						e->now_data, e->flag_out,
+						(unsigned long) ch->now_addr, (unsigned long) ch->now_step,
+						(long) ch->adpcma_acc, (long) ch->adpcma_step,
+						(long) ch->adpcma_out, ch->now_data, ch->flag ? 1 : 0);
+			}
+		}
+	}
+	if (rspa_pb.bflags & 1) {
+		const rspa_chb_t * const e = &rspa_ob.echo.b;
+		const ADPCMB * const dt = &YM2610.adpcmb;
+		if (e->now_addr != dt->now_addr || e->now_step != dt->now_step
+				|| e->acc != dt->acc || e->adpcmd != dt->adpcmd
+				|| e->prev_acc != dt->prev_acc || e->adpcml != dt->adpcml
+				|| e->now_data != dt->now_data
+				|| (e->flag_out ? 1 : 0) != ((dt->portstate & 0x80) ? 1 : 0)) {
+			bad++;
+			rspa_badstate++;
+			if (prints < 8) {
+				prints++;
+				debugf("[RSPADPCM] BSTATE rsp=%lx/%lx/%ld/%ld/%ld/%ld/%x/%d "
+						"c=%lx/%lx/%ld/%ld/%ld/%ld/%x/%d\n",
+						(unsigned long) e->now_addr, (unsigned long) e->now_step,
+						(long) e->acc, (long) e->adpcmd, (long) e->prev_acc,
+						(long) e->adpcml, e->now_data, e->flag_out,
+						(unsigned long) dt->now_addr, (unsigned long) dt->now_step,
+						(long) dt->acc, (long) dt->adpcmd, (long) dt->prev_acc,
+						(long) dt->adpcml, dt->now_data,
+						(dt->portstate & 0x80) ? 1 : 0);
+			}
+		}
+	}
+	if ((u8) (arr0 | (u8) rspa_ob.arrived) != arr1) {
+		bad++;
+		rspa_badstate++;
+		if (prints < 8) {
+			prints++;
+			debugf("[RSPADPCM] ARRIVED rsp=%x arr0=%x arr1=%x\n",
+					(unsigned) rspa_ob.arrived, arr0, arr1);
+		}
+	}
+	if (bad)
+		rspa_badchunks++;
+}
+#endif /* MVS64_RSPADPCM_VERIFY */
+#endif /* N64 && MVS64_RSPADPCM */
+
 /*********************************************************************************************/
 
 /* YM2610(OPNB) */
@@ -3176,6 +3558,22 @@ void YM2610Update_stream(int length) {
 			u8 lfo_am[YM_CHUNK], lfo_pm[YM_CHUNK], egt[YM_CHUNK];
 			s32 acc_l[YM_CHUNK], acc_r[YM_CHUNK], dtb[YM_CHUNK];
 			const u32 eg_base = OPN->eg_cnt;
+#if defined(N64) && defined(MVS64_RSPADPCM) && !defined(MVS64_RSPADPCM_VERIFY)
+			/* MVS64: kick the RSP ADPCM decode for this chunk NOW so it runs
+			 * underneath the CPU's FM/SSG passes. Building the param block
+			 * here is equivalent to building it at pass 3: passes 0-2 never
+			 * touch ADPCM state. Results are collected in pass 3 below. */
+			int rsp_any = 0;
+			u8 ramask = 0, rb = 0;
+			if (!rspa_dead) {
+				rsp_any = rspa_build(n, dtl, dtr);
+				if (rsp_any) {
+					ramask = rspa_pb.amask;
+					rb = (u8) (rspa_pb.bflags & 1);
+					rspa_kick();
+				}
+			}
+#endif
 
 			/* pass 0: per-sample shared schedules (LFO position, EG ticks) */
 			YMPROF_T(a);
@@ -3281,6 +3679,91 @@ void YM2610Update_stream(int length) {
 			 * OFF mid-chunk — end of sample — never ON, so the per-sample
 			 * guards match the old loop exactly) */
 			YMPROF_T(d);
+#if defined(N64) && defined(MVS64_RSPADPCM)
+#ifdef MVS64_RSPADPCM_VERIFY
+			{
+				/* verify mode is synchronous: build+kick here, then shadow-
+				 * compare the RSP result against the authoritative C decode */
+				int rsp_any = 0;
+				u8 ramask, rb;
+				if (!rspa_dead)
+					rsp_any = rspa_build(n, dtl, dtr);
+				ramask = rsp_any ? rspa_pb.amask : 0;
+				rb = rsp_any ? (u8) (rspa_pb.bflags & 1) : 0;
+				if (rsp_any)
+					rspa_kick();
+				{
+					/* C stays authoritative; the RSP result is shadow-compared */
+					static s32 refl[YM_CHUNK], refr[YM_CHUNK];
+					u8 arr0, arr1;
+					for (i = 0; i < n; i++) {
+						refl[i] = 0;
+						refr[i] = 0;
+					}
+					/* channels NOT on the RSP decode straight into the chunk */
+					rspa_c_decode(n, (u8) ~ramask, !rb, acc_l, acc_r, dtb);
+					arr0 = YM2610.adpcm_arrivedEndAddress;
+					/* RSP-covered channels decode into the reference arrays,
+					 * deltaT folded exactly like the ucode folds it */
+					if (rb) {
+						for (i = 0; i < n; i++) {
+							const s32 v = (dt->portstate & 0x80)
+									? OPNB_ADPCMB_CALC(dt) : 0;
+							dtb[i] = 0;
+							if (dtl)
+								refl[i] += v >> 9;
+							if (dtr)
+								refr[i] += v >> 9;
+						}
+					}
+					rspa_c_decode(n, ramask, 0, refl, refr, NULL);
+					arr1 = YM2610.adpcm_arrivedEndAddress;
+					for (i = 0; i < n; i++) {
+						acc_l[i] += refl[i];
+						acc_r[i] += refr[i];
+					}
+					if (rsp_any) {
+						rspa_chunks++;
+						if (rspa_wait())
+							rspa_verify_cmp(n, refl, refr, arr0, arr1);
+						else
+							rspa_badchunks++;
+						if ((rspa_chunks & 1023) == 0)
+							debugf("[RSPADPCM] chunks=%lu badchunks=%lu "
+									"badsamp=%lu badstate=%lu\n",
+									(unsigned long) rspa_chunks,
+									(unsigned long) rspa_badchunks,
+									(unsigned long) rspa_badsamp,
+									(unsigned long) rspa_badstate);
+					}
+				}
+			}
+#else
+			/* pipelined: the RSP was kicked at the top of the chunk and has
+			 * been decoding underneath passes 0-2; do the C leftovers (chunk
+			 * fallbacks), then collect */
+			{
+				if (rb) {
+					for (i = 0; i < n; i++)
+						dtb[i] = 0;   /* folded into l/r on the RSP */
+				} else {
+					for (i = 0; i < n; i++)
+						dtb[i] = (dt->portstate & 0x80)
+								? OPNB_ADPCMB_CALC(dt) : 0;
+				}
+				rspa_c_decode(n, (u8) ~ramask, 0, acc_l, acc_r, NULL);
+				if (rsp_any) {
+					if (rspa_wait()) {
+						rspa_adopt(n, acc_l, acc_r);
+					} else {
+						/* timeout: no state was adopted, so the C decoders
+						 * can still run this chunk from the pre-RSP state */
+						rspa_c_decode(n, ramask, rb, acc_l, acc_r, dtb);
+					}
+				}
+			}
+#endif
+#else
 			for (i = 0; i < n; i++)
 				dtb[i] = (dt->portstate & 0x80) ? OPNB_ADPCMB_CALC(dt) : 0;
 			for (j = 0; j < 6; j++) {
@@ -3300,6 +3783,7 @@ void YM2610Update_stream(int length) {
 					}
 				}
 			}
+#endif
 			YMPROF_A(3, d);
 
 			/* pass 4: mix + output */
