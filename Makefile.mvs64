@@ -37,6 +37,15 @@ obj_makerom = $(src_makerom:%.c=$(BUILD_DIR)/%.o)
 CFLAGS += -Wno-unused-function
 CFLAGS += $(EXTRA_DEFINES)
 
+# RSP ADPCM offload (rsp_audio.S + ym2610.c rspa_* glue): default ON.
+# The YM2610 ADPCM-A/B decoders run on the RSP pipelined under the CPU's FM
+# pass (gated bit-exact vs the C core; ares 300s dual-compute run, 35840
+# chunks, 0 mismatches; in-fight fps 22.0 -> 26.3). Disable with
+# make ... ADPCM_CPU=1 to force the C decoders (debug/fallback).
+ifndef ADPCM_CPU
+CFLAGS += -DMVS64_RSPADPCM
+endif
+
 # NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
 # REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll
 # bloat thrashes the VR4300's 16KB icache in the synthesis loop. Keep -O2.
