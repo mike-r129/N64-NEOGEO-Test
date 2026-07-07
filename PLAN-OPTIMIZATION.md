@@ -51,6 +51,19 @@
    bizhawk-mupen-verdict), reproduced identically by stock libdragon audio ROMs. Not a
    regression signal; ares remains the pre-hardware gate (full boot→menus→fight validated).
 
+## ❌ RSP TIER, STEP 2 CLOSED WITH MEASUREMENT (2026-07-08 night 2) — FM-on-RSP parked
+
+The FM port is bit-exact (rsp_fm.S; two 300s dual-compute gates, 0 mismatches) but
+NET-NEGATIVE in every collection strategy measured: ship-4 sync 12.6 fps ([RSPWAIT]
+fm≈2.4ms/chunk, q=0 → pure compute stall the CPU cannot overlap), exact skip masks
+no change (fight channels keep slots live), ship-2 split 21.8 (glue > saving),
+cross-pump deferred collect 21.25 (samsho2's driver writes YM regs every tick, so
+sync-on-touch fires immediately; branch fm-defer-experiment), ADPCM-only+defer 20.25.
+Full table in BUILDS-2026-07-08.md. The C FM path (~1.1ms/chunk/channel, dcache-
+resident narrowed tables) is the bar; a future attempt needs whole-pump batching
+with RSP-resident state. Remaining viable levers: RSP draw-issue offload (draw ~33%),
+m68k rank-4 residual, and the deeper Z80/m68k structural work.
+
 ## ✅ RSP TIER, STEP 1 LANDED (2026-07-08 overnight) — ADPCM on the RSP
 
 The first structural lever is in (see BUILDS-2026-07-08.md): YM2610 ADPCM-A (6ch) +
