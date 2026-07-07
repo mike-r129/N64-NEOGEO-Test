@@ -4,6 +4,37 @@
 > Goal: raise framerate toward 60fps **without frameskip** and **without deviating from the
 > original arcade experience** (cycle timing, audio sync, input feel must stay intact).
 
+## ⚠️⚠️⚠️ Empirical update (2026-07-06, branch perf-fps) — IDLE-SKIP NEVER FIRED; FM SYNTH IS THE WALL
+
+1. **The idle-skip list was dead code from day one** (so the 2026-06-19 "idle-skip is flat
+   in-match" finding below is wrong). `beq m_pc, 0xFF00142C`-style compares made GAS emit the
+   constants ZERO-extended (li+dsll+ori = 0x00000000_FF00142C) while map_m68k produces
+   SIGN-extended pointers (0xFFFFFFFF_FF00142C): the 64-bit beq could never match. Proven by
+   ELF disassembly + a new `-DMVS64_PERFCOUNT` counter (skips=0 across a full 300s run).
+   Fixed in fa10101 (explicit lui/ori). Result: in-fight skips=2/frame, executed 68k insns
+   16.9k→7.8-10.8k/frame, m68k 93%→70%, **real-fight fps 17.5→21.4 median**; menus ~40, peaks 60.
+   The samsho2 spin (tst.b $100A30/beq .-8 @0x142C) was 39% of ALL in-match instructions.
+
+2. **Run-content divergence:** guest content is NOT reproducible across ares runs (the
+   68k↔Z80 handshake is wall-speed-sensitive → menu/fight timing shifts). Compare only
+   content-matched windows: PROFILE PC 003200/0031fe + SNDRMS rms>0 = a real fight.
+   The 2026-07-02 "17.5fps in-match" numbers were real fights and remain the valid baseline.
+
+3. **In-fight split after the fix:** cpu ~247%, **snd ~137% (54% of ALL wall time)**,
+   m68k ~70% (10.7k insns, 1.2k TLB faults, ~106 host cyc/insn), draw ~33%, io ~8%.
+   YMPROF: **FM 722ms / ADPCM 220 / SSG 70 / EG 11 / mix 18 per ~2.4s interval — FM synthesis
+   is the single biggest cost in the whole emulator (~30% of wall)**. Since audio is
+   real-time, frame_wall = non_snd/(1−r): every non-snd saving is amplified ~2.2x, and true
+   60fps needs BOTH r cut ~2-3x (RSP offload) and non_snd ≤ ~8ms.
+
+4. **draw 33% is pure CPU command issue** (PERFCOUNT dwait 0.2% / dissue 32.2% / dend 0.1%):
+   sprite walk + sprite_cache hash + uncached rspq writes; no RSP/RDP back-pressure. Diffuse —
+   the 2x lever there is moving the SCB walk to the RSP, not micro-trims.
+
+5. Landed: chan_calc_stream (1f6dbff) — algorithm-specialized FM channel calc with local
+   connection routing (the s32* connect stores defeated TBAA and forced per-sample state
+   reloads). WAV byte-identical gate. N64 effect: measure via ymprof3/fmfix builds.
+
 ## ⚠️⚠️ Empirical update (2026-07-02 overnight session) — THE WALL IS SOUND, NOT THE 68K
 
 A new `[PROFILE] m68k%/snd%` split (af95d16) corrected this plan's central premise: the old
