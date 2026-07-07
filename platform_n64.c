@@ -32,8 +32,35 @@ void plat_log(const char *fmt, ...) {
 
 volatile int N64_FRAME = 0;
 uint32_t RSP_OVL_ID = 0;
+uint32_t RSP_AUDIO_OVL_ID = 0;
 
 DEFINE_RSP_UCODE(rsp_video);
+DEFINE_RSP_UCODE(rsp_audio);
+
+// Boot-time self-test of the audio RSP overlay: round-trip a small buffer
+// through cmd_adpcm_test (DMA in, +1 every byte, DMA out). Proves overlay
+// registration, command dispatch and both DMA directions before the ADPCM
+// offload ever runs. One [RSPAUDIO] line either way.
+static void rsp_audio_selftest(void) {
+    static uint8_t src[64] __attribute__((aligned(16)));
+    static uint8_t dst[64] __attribute__((aligned(16)));
+    for (int i = 0; i < 64; i++) { src[i] = (uint8_t)(i * 3 + 7); dst[i] = 0; }
+    data_cache_hit_writeback_invalidate(src, sizeof(src));
+    data_cache_hit_writeback_invalidate(dst, sizeof(dst));
+    rspq_write(RSP_AUDIO_OVL_ID, 0x0, PhysicalAddr(src), PhysicalAddr(dst),
+               64 - 1 /* DMA_SIZE(64, 1) */);
+    rspq_wait();
+    data_cache_hit_invalidate(dst, sizeof(dst));
+    int bad = -1;
+    for (int i = 0; i < 64; i++) {
+        if (dst[i] != (uint8_t)(src[i] + 1)) { bad = i; break; }
+    }
+    if (bad < 0)
+        debugf("[RSPAUDIO] selftest OK\n");
+    else
+        debugf("[RSPAUDIO] selftest FAIL at %d: got %02x want %02x\n",
+               bad, dst[bad], (uint8_t)(src[bad] + 1));
+}
 
 uint8_t keystate[256];
 
@@ -142,8 +169,10 @@ void plat_init(int audiofreq, int fps) {
     rdpq_init();
     // rdpq_debug_start();
 
-    // Register our custom RSP overlay into the RSP queue engine
+    // Register our custom RSP overlays into the RSP queue engine
     RSP_OVL_ID = rspq_overlay_register(&rsp_video);
+    RSP_AUDIO_OVL_ID = rspq_overlay_register(&rsp_audio);
+    rsp_audio_selftest();
 
     audio_init(audiofreq, AI_NUM_BUFFERS);
     // ORDER MATTERS: register the callback BEFORE the priming write. The AI
