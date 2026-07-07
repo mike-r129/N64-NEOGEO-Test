@@ -1,5 +1,40 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## ✅/❌ DRAW TIER MEASURED (2026-07-07 day session) — the fix layer was the lever, not the RSP
+
+[PERF2] fine profiling split the in-fight draw 33% into: **fix layer 15.5%**
+(all 40x28=1120 cells drawn every frame — the map is full of nonzero blank
+tile codes), sprite walk 7.2%, crom hash lookups 5.9%, rspq writes only 2.7%.
+
+- ✅ **Fix-layer empty-tile skip (21230e5): in-fight 22.9 → 29.3 fps median**
+  (content-matched music fights, rms>0 + PC filter). Tiles that decode to all
+  index-0 pixels can never touch the screen (color 0 alpha forced 0 in every
+  palette); emptiness is ROM-stable per SROM bank, learned on first sight
+  (srom_tile_empty). PC pixel gate: 21/21 screenshots byte-identical.
+- ❌ **Batched draw records (CPU arena + RSP replay loop): NET-NEGATIVE, reverted.**
+  Cached-arena appends pay a write-allocate dcache miss per line (rspq bucket
+  292→531); adding CACHE 0xD create-dirty-exclusive made the whole system
+  WORSE (fps 20.2, snd/m68k +10%): a 7-12KB per-frame streaming write sweep
+  through the 8KB direct-mapped dcache evicts every other subsystem's hot
+  data. The uncached rspq_write design pollutes nothing and is already
+  near-optimal — same lesson class as -O3/-Os icache results.
+- ❌ **Direct-mapped L1 in front of the crom hash: NET-NEGATIVE, reverted**
+  (cache bucket 565→815). The robin-hood table at 31% load averages ~1.2
+  probes; an L1 adds a guaranteed extra dcache miss + 16KB of table pressure.
+- ⚠ **Latent hazard noted for ANY deferred-consumption draw scheme** (batch
+  records or SCB-walk-on-RSP): a mid-frame forced cache eviction can recycle
+  a pixel slot an in-flight record still references. Needs a syncpoint guard
+  on the forced-evict path.
+
+**In-fight state after this session: ~29.3 fps median; split snd ~121 /
+m68k ~66 / draw ~23 (fix 6.3, walk 7.2, cache 5.7, rspq 2.9) / io ~6.**
+Remaining draw levers are small (walk-on-RSP ≈ +2-3 fps for a full ucode
+project). The dominant remaining lever is snd ~121% → **FM whole-pump
+batching with RSP-resident state** (see fm-rsp-economics memory): CPU
+journals YM writes per chunk, one RSP command per pump replays
+writes+synthesis, collect deferred to the next pump. The bit-exact FM ucode
+(rsp_fm.S) already exists.
+
 > Produced 2026-06-19 by an 8-expert parallel audit (analyze → adversarial-verify → synthesize).
 > Goal: raise framerate toward 60fps **without frameskip** and **without deviating from the
 > original arcade experience** (cycle timing, audio sync, input feel must stay intact).
