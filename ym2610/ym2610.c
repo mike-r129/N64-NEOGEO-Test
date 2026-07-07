@@ -1389,6 +1389,96 @@ INLINE void chan_calc(FM_OPN *OPN, FM_CH *CH, u32 lfo_am, u32 lfo_pm) {
 	}
 }
 
+/* MVS64: algorithm-specialized chan_calc for the stream (chunked) path.
+ * Identical dataflow to chan_calc(), but the operator connection targets —
+ * which setup_connection() encodes as s32* pointers into the m2/c1/c2/mem
+ * globals and out_fm[] — are resolved at compile time into LOCALS (algo is
+ * a compile-time constant at every call site below). The pointer stores in
+ * chan_calc() defeat type-based alias analysis: after every "*connect +="
+ * the compiler must assume any s32 in the program may have changed and
+ * reloads channel state per sample — measured as the bulk of FM cost
+ * in-game (fmms ~722ms per 2.4s interval, ~2/3 of the whole YM2610).
+ * Bit-exact: same operations on the same values in the same order; only
+ * the storage location of the per-sample intermediate sums changes (they
+ * were per-sample-zeroed globals). Returns the carrier sum, i.e. exactly
+ * what chan_calc() left in out_fm[ch] for this sample.
+ * Connection map per algorithm (from setup_connection):
+ *   om1 (M1 out):  0,3,4,6->c1  1->mem  2->c2  5->special  7->carrier
+ *   om2 (M2 out):  0..4->c2    5,6,7->carrier
+ *   oc1 (C1 out):  0..3->mem   4..7->carrier
+ *   memc(restore): 0,1,2,5->m2  3->c2   4,6,7->mem (dummy)
+ *   SLOT4 always -> carrier. */
+static inline __attribute__((always_inline))
+s32 chan_calc_stream(FM_OPN *OPN, FM_CH *CH, u32 lfo_am, u32 lfo_pm,
+		const int algo) {
+	unsigned int eg_out;
+	u32 AM = lfo_am >> CH->ams;
+	s32 lm2 = 0, lc1 = 0, lc2 = 0, lmem = 0, car = 0;
+
+	/* *CH->mem_connect = CH->mem_value (restore delayed MEM sample) */
+	switch (algo) {
+	case 0: case 1: case 2: case 5: lm2 = CH->mem_value; break;
+	case 3: lc2 = CH->mem_value; break;
+	default: lmem = CH->mem_value; break;   /* 4/6/7: parked, kept exact */
+	}
+
+	/* SLOT 1 (M1, feedback) */
+	{
+		s32 out = CH->op1_out[0] + CH->op1_out[1];
+		CH->op1_out[0] = CH->op1_out[1];
+
+		switch (algo) {
+		case 0: case 3: case 4: case 6: lc1 += CH->op1_out[0]; break;
+		case 1: lmem += CH->op1_out[0]; break;
+		case 2: lc2 += CH->op1_out[0]; break;
+		case 5: lmem = lc1 = lc2 = CH->op1_out[0]; break; /* connect1==0 */
+		case 7: car += CH->op1_out[0]; break;
+		}
+
+		CH->op1_out[1] = 0;
+		eg_out = volume_calc(&CH->SLOT[SLOT1]);
+		if (eg_out < ENV_QUIET) {
+			if (!CH->FB)
+				out = 0;
+			CH->op1_out[1] = op_calc1(CH->SLOT[SLOT1].phase, eg_out,
+					(out << CH->FB));
+		}
+	}
+
+	/* SLOT 3 (M2) */
+	eg_out = volume_calc(&CH->SLOT[SLOT3]);
+	if (eg_out < ENV_QUIET) {
+		s32 o = op_calc(CH->SLOT[SLOT3].phase, eg_out, lm2);
+		if (algo <= 4) lc2 += o; else car += o;
+	}
+
+	/* SLOT 2 (C1) */
+	eg_out = volume_calc(&CH->SLOT[SLOT2]);
+	if (eg_out < ENV_QUIET) {
+		s32 o = op_calc(CH->SLOT[SLOT2].phase, eg_out, lc1);
+		if (algo <= 3) lmem += o; else car += o;
+	}
+
+	/* SLOT 4 (C2) */
+	eg_out = volume_calc(&CH->SLOT[SLOT4]);
+	if (eg_out < ENV_QUIET)
+		car += op_calc(CH->SLOT[SLOT4].phase, eg_out, lc2);
+
+	/* store current MEM */
+	CH->mem_value = lmem;
+
+	/* update phase counters AFTER output calculations */
+	if (CH->pms) {
+		update_phase_lfo(OPN, CH, lfo_pm);
+	} else {
+		CH->SLOT[SLOT1].phase += CH->SLOT[SLOT1].Incr;
+		CH->SLOT[SLOT2].phase += CH->SLOT[SLOT2].Incr;
+		CH->SLOT[SLOT3].phase += CH->SLOT[SLOT3].Incr;
+		CH->SLOT[SLOT4].phase += CH->SLOT[SLOT4].Incr;
+	}
+	return car;
+}
+
 /* update phase increment and envelope generator */INLINE void refresh_fc_eg_slot(
 		FM_SLOT *SLOT, int fc, int kc) {
 	int ksr;
@@ -3098,7 +3188,6 @@ void YM2610Update_stream(int length) {
 			YMPROF_T(b);
 			for (j = 0; j < 4; j++) {
 				FM_CH * const CH = cch[j];
-				s32 * const fmo = &out_fm[fmn[j]];
 				const u32 panl = OPN->pan[fmn[j] * 2 + 0];
 				const u32 panr = OPN->pan[fmn[j] * 2 + 1];
 				u32 cnt = eg_base;
@@ -3145,19 +3234,34 @@ void YM2610Update_stream(int length) {
 					continue;
 				}
 
-				for (i = 0; i < n; i++) {
-					u32 t = egt[i];
-					s32 o;
-					while (t--) {
-						cnt++;
-						advance_eg_channel(cnt, &CH->SLOT[SLOT1]);
-					}
-					*fmo = 0;
-					chan_calc(OPN, CH, lfo_am[i], lfo_pm[i]);
-					o = *fmo >> 1; /* the shift right was verified on real chip */
-					acc_l[i] += o & (s32) panl;
-					acc_r[i] += o & (s32) panr;
+				/* Dispatch once per chunk on the (register-write-stable)
+				 * algorithm so chan_calc_stream's connection routing is a
+				 * compile-time constant inside each sample loop. */
+#define FM_CHUNK_LOOP(ALGO) \
+				for (i = 0; i < n; i++) { \
+					u32 t = egt[i]; \
+					s32 o; \
+					while (t--) { \
+						cnt++; \
+						advance_eg_channel(cnt, &CH->SLOT[SLOT1]); \
+					} \
+					o = chan_calc_stream(OPN, CH, lfo_am[i], \
+							lfo_pm[i], ALGO) >> 1; \
+					/* the shift right was verified on real chip */ \
+					acc_l[i] += o & (s32) panl; \
+					acc_r[i] += o & (s32) panr; \
 				}
+				switch (CH->ALGO & 7) {
+				case 0: FM_CHUNK_LOOP(0); break;
+				case 1: FM_CHUNK_LOOP(1); break;
+				case 2: FM_CHUNK_LOOP(2); break;
+				case 3: FM_CHUNK_LOOP(3); break;
+				case 4: FM_CHUNK_LOOP(4); break;
+				case 5: FM_CHUNK_LOOP(5); break;
+				case 6: FM_CHUNK_LOOP(6); break;
+				case 7: FM_CHUNK_LOOP(7); break;
+				}
+#undef FM_CHUNK_LOOP
 			}
 			YMPROF_A(1, b);
 
