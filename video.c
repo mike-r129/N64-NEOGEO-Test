@@ -107,6 +107,14 @@ static void render_sprites(void) {
 
 		if (sh == 0) continue;
 		if (sx >= 320 && sx+sw <= 512) continue;
+		// Coarse Y-cull (PLAN rank 11): every tile drawn below has
+		// ssy in [sy, sy+sh) and passes the per-tile visibility test
+		// "ssy < 224 || ssy+ssh > 512". If the whole sprite span lies in
+		// the hidden band [224, 512], no tile can pass — skip the tile
+		// walk entirely. Exactly equivalent to the per-tile checks (pure
+		// speedup, pixel-identical by construction); chain bookkeeping
+		// (sx += sw) already happened above.
+		if (sy >= 224 && sy + sh <= 512) continue;
 
 		// debugf("[VIDEO] sprite snum:%d xc:%04x yc:%04x zc:%04x pos:%d,%d sh:%d chain:%d repeat:%d tmap:%04x:%04x\n", snum, xc, yc, zc, sx, sy, sh, (yc & 0x40), repeat_tiles, tmap[0], tmap[1]);
 
@@ -214,6 +222,11 @@ void video_render(void) {
 	render_end();
 }
 
+// Set on every palette write / bank switch; consumed by the N64 render_begin
+// to skip the per-frame 8KB writeback + RSP color conversion when the palette
+// is unchanged. Starts dirty so the first frame always converts.
+uint8_t mvs64_palette_dirty = 1;
+
 void video_palette_w(uint32_t address, uint32_t val, int sz) {
 	if (sz == 4) {
 		video_palette_w(address+0, val >> 16, 2);
@@ -226,6 +239,7 @@ void video_palette_w(uint32_t address, uint32_t val, int sz) {
 	address /= 2;
 	address += PALETTE_RAM_BANK;
 	PALETTE_RAM[address] = val;
+	mvs64_palette_dirty = 1;
 }
 
 uint32_t video_palette_r(uint32_t address, int sz) {

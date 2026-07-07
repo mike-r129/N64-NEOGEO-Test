@@ -720,6 +720,8 @@ asm_video_palette_w:
 	la k0, PALETTE_RAM
 	addu k1, k0
 	sh value, 0(k1)
+	li k0, 1
+	sb k0, %gprel(mvs64_palette_dirty)(gp)   # render_begin: reconvert
 	jr ra
 
 asm_pbrom_bankno_r8:

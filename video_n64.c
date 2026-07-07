@@ -217,9 +217,16 @@ static void render_begin_fix(void) {
 static void render_end_fix(void) {}
 
 static void render_begin(void) {
-	data_cache_hit_writeback(PALETTE_RAM + PALETTE_RAM_BANK, 4096*2);
-	for (int i=0; i<4096 / 0x400; i++) {
-		rsp_pal_convert(PALETTE_RAM + PALETTE_RAM_BANK + i*0x400, PALETTE_RAM_EMU + i*0x400);
+	// Reconvert the palette only when it changed since the last frame
+	// (writes via the asm/C MMIO handlers or a bank switch set the flag).
+	// PALETTE_RAM_EMU persists in RDRAM between frames otherwise.
+	extern uint8_t mvs64_palette_dirty;
+	if (mvs64_palette_dirty) {
+		mvs64_palette_dirty = 0;
+		data_cache_hit_writeback(PALETTE_RAM + PALETTE_RAM_BANK, 4096*2);
+		for (int i=0; i<4096 / 0x400; i++) {
+			rsp_pal_convert(PALETTE_RAM + PALETTE_RAM_BANK + i*0x400, PALETTE_RAM_EMU + i*0x400);
+		}
 	}
 
 	uint16_t bkg = color_convert(PALETTE_RAM[PALETTE_RAM_BANK+0xFFF]) | 1;
