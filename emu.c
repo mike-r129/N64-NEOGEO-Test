@@ -291,6 +291,7 @@ uint32_t emu_render(void *arg) {
 			skip++;
 			if (skip < MAX_SKIP) {
 				debugf("[RENDER] skip frame\n");
+				plat_audio_pump();   // audio pumps once per frame regardless
 				return FRAME_CLOCK;
 			}
 			debugf("[RENDER] max skip\n");
@@ -305,6 +306,9 @@ uint32_t emu_render(void *arg) {
 	if (CONFIG_FRAMESKIP_MODE == 1) {
 		if (g_frame & 1) {
 			debugf("[RENDER] skip frame\n");
+			#ifdef N64
+			plat_audio_pump();   // audio pumps once per frame regardless
+			#endif
 			return FRAME_CLOCK;
 		}
 	}
@@ -335,6 +339,17 @@ uint32_t emu_render(void *arg) {
 
 	#ifdef N64
 	render_time = TICKS_DISTANCE(t0, TICKS_READ());
+
+	// Pump the audio HERE, right after the frame's draw commands were
+	// issued — not at the end of the main loop. The whole-pump offload
+	// bursts ~12-16ms of RSP work per pump; pumped at loop end, that
+	// burst was still draining when the NEXT frame's render (this event,
+	// at line 24) issued its commands, and the CPU ate it as rspq
+	// back-pressure (measured 60-76% of the frame in fights, tiles/frame
+	// constant). Pumped here, the RSP finishes the (fast) video queue
+	// first and chews the audio under the remaining ~90% of the frame's
+	// 68k work, so the next render meets a drained queue.
+	plat_audio_pump();
 	#endif
 
 	return FRAME_CLOCK;
@@ -490,11 +505,13 @@ int main(int argc, char *argv[]) {
 		#endif
 
 		#ifdef N64
-		// Drive the AI directly: fill every free AI buffer on demand so audio
-		// plays at the true 44100 Hz wall-clock rate, decoupled from the (slow)
-		// 68k frame loop. sound_gen_samples() is rate-agnostic; the AI DMA is the
-		// real-time clock master. See plat_audio_pump() in platform_n64.c.
-		plat_audio_pump();
+		// The audio pump moved into emu_render (right after the draw
+		// commands are issued): pumped here at loop end, the RSP audio
+		// burst was still draining when the next frame's render issued
+		// its commands, and the CPU ate it as rspq back-pressure. See
+		// the comment in emu_render; sound_gen_samples() is rate-
+		// agnostic and the pump is wall-clock driven, so the phase
+		// shift within the frame does not affect audio timing.
 		#endif
 
 		#ifndef N64
