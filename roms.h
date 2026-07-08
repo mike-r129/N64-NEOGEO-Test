@@ -24,6 +24,11 @@ uint8_t* srom_get_sprite(int spritenum);
 // Learns lazily on first sight of each tile; reset by srom_set_bank.
 bool srom_tile_empty(int spritenum);
 
+// Same fact for sprite (C-ROM) tiles: all index-0 pixels can never touch
+// the screen (alpha-compare kills them in every palette). Learns lazily on
+// first fetch; reset by crom_set_bank.
+bool crom_tile_empty(int spritenum);
+
 void srom_set_bank(int bank);  // 0 = fixed (BIOS), 1 = game
 
 void pbrom_cache_init(void);

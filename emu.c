@@ -550,18 +550,19 @@ int main(int argc, char *argv[]) {
 			// walk = sprite pass minus cache lookups minus rspq issue.
 			extern uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
 			extern uint32_t perf_dr_cache, perf_dr_rspq;
-			extern uint32_t perf_dr_tiles, perf_dr_cells;
-			framef("[PERF2] begin=%lu spr=%lu (cache=%lu rspq=%lu) fix=%lu tiles=%lu cells=%lu\n",
+			extern uint32_t perf_dr_tiles, perf_dr_cells, perf_dr_empty;
+			framef("[PERF2] begin=%lu spr=%lu (cache=%lu rspq=%lu) fix=%lu tiles=%lu cells=%lu empty=%lu\n",
 				(unsigned long)(perf_dr_begin / fb),
 				(unsigned long)(perf_dr_sprites / fb),
 				(unsigned long)(perf_dr_cache / fb),
 				(unsigned long)(perf_dr_rspq / fb),
 				(unsigned long)(perf_dr_fix / fb),
 				(unsigned long)perf_dr_tiles,
-				(unsigned long)perf_dr_cells);
+				(unsigned long)perf_dr_cells,
+				(unsigned long)perf_dr_empty);
 			perf_dr_begin = perf_dr_sprites = perf_dr_fix = 0;
 			perf_dr_cache = perf_dr_rspq = 0;
-			perf_dr_tiles = perf_dr_cells = 0;
+			perf_dr_tiles = perf_dr_cells = perf_dr_empty = 0;
 		}
 		#endif
 		#ifdef MVS64_IDLEPROBE

@@ -118,6 +118,33 @@ uint8_t* srom_get_sprite(int spritenum) {
 	return pix;
 }
 
+// Empty-tile knowledge for the sprite (C) ROM — the render_sprites analogue
+// of srom_tile_empty above. An all-index-0 tile is fully transparent in
+// every palette (pal_convert forces color 0 alpha to 0 and the sprite path
+// draws with alpha-compare on), and tile pixel data is immutable ROM, so
+// emptiness is a stable per-tile fact: learn it on the first fetch, then
+// skip the cache lookup AND the RSP/RDP draw forever. samsho2's dense
+// sprite-background stages issue 8-10k tiles/frame at up to ~100% of the
+// frame budget; [PERF2] empty= reports how many draws this removes.
+#define CROM_MAX_TILES (1u << 18)   // 32MB of C-ROM; samsho2 uses 2^17
+static uint8_t crom_known[CROM_MAX_TILES/8];
+static uint8_t crom_emptyb[CROM_MAX_TILES/8];
+
+bool crom_tile_empty(int spritenum) {
+	unsigned sn = (unsigned)spritenum & crom_mask;
+	if (sn >= crom_num_tiles) sn = crom_num_tiles-1;
+	int byte = sn >> 3, bit = 1 << (sn & 7);
+	if (!(crom_known[byte] & bit)) {
+		const uint8_t *pix = crom_get_sprite((int)sn);
+		uint32_t acc = 0;
+		for (int i=0; i<8*16; i+=4)
+			acc |= *(const uint32_t*)(pix + i);
+		crom_known[byte] |= bit;
+		if (acc == 0) crom_emptyb[byte] |= bit;
+	}
+	return (crom_emptyb[byte] & bit) != 0;
+}
+
 uint8_t* crom_get_sprite(int spritenum) {
 	spritenum &= crom_mask;
 	if (spritenum >= crom_num_tiles) spritenum = crom_num_tiles-1;
@@ -191,6 +218,12 @@ void crom_set_bank(int bank) {
 
 	sprite_cache_reset(&crom_cache);
 	crom_num_tiles = len / (8*16);
+	assertf(crom_num_tiles <= CROM_MAX_TILES, "CROM too large: %d tiles",
+		crom_num_tiles);
+
+	// Tile numbers refer to the new bank now: relearn emptiness.
+	memset(crom_known, 0, sizeof(crom_known));
+	memset(crom_emptyb, 0, sizeof(crom_emptyb));
 
 	// Calculate mask based on next power of two
 	len /= 8*16;

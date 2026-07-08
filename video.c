@@ -56,6 +56,7 @@ static uint16_t PALETTE_RAM_EMU[4*1024];
 uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
 uint32_t perf_dr_cache, perf_dr_rspq;
 uint32_t perf_dr_tiles, perf_dr_cells;
+uint32_t perf_dr_empty;   /* sprite tiles skipped as known-empty */
 #define DRAW_PERF 1
 #endif
 
@@ -204,6 +205,16 @@ static void render_sprites(void) {
 							else if (tc & 4) { tnum &= ~3; tnum |= aa & 3; }
 						}
 
+						// Skip tiles known to decode to all-transparent
+						// pixels — the sprite-layer analogue of the fix
+						// skip above (ROM-stable fact, learned on first
+						// fetch; pixel-identical by construction: index-0
+						// pixels never pass the alpha compare).
+						if (crom_tile_empty(tnum)) {
+#ifdef DRAW_PERF
+							perf_dr_empty++;
+#endif
+						} else
 						// Draw the tile
 						draw_sprite(tnum, palnum, sx, ssy, sw, ssh, tc&1, tc&2);
 					}

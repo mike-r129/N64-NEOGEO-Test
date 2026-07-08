@@ -35,10 +35,26 @@ static int fix_last_palnum = -1;
 static int pal_slot_cache[16];
 
 static void draw_sprite(int spritenum, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
+#ifdef DRAW_PERF
+	// Fine split of the sprite pass (walk = spr - cache - rspq): the cache
+	// bucket is crom_get_sprite (hash walk + cart DFS on miss), the rspq
+	// bucket is the command write INCLUDING any queue back-pressure stall.
+	uint32_t _c0 = TICKS_READ();
+#endif
 	uint8_t *src = crom_get_sprite(spritenum);
+#ifdef DRAW_PERF
+	perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
+	perf_dr_tiles++;
+#endif
 
 	if (RSP_SPRITES) {
+#ifdef DRAW_PERF
+		uint32_t _r0 = TICKS_READ();
 		rsp_sprite_draw(src, palnum, x0, y0, sw, sh, flipx, flipy);
+		perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
+#else
+		rsp_sprite_draw(src, palnum, x0, y0, sw, sh, flipx, flipy);
+#endif
 		return;
 	}
 
