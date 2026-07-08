@@ -54,12 +54,16 @@ endif
 ifdef RSPFM
 CFLAGS += -DMVS64_RSPFM
 endif
-# FM whole-pump batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM on the
-# RSP with RSP-resident dynamic state; the only synchronous wait is the
-# pipeline tail once per audio pump. Requires the rsp_fm machinery. Enable
-# with RSPWP=1; add EXTRA_DEFINES=-DMVS64_RSPWP_VERIFY for the dual-compute
-# bit-exactness gate ([RSPWP] counters).
-ifdef RSPWP
+# Whole-pump audio batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM AND
+# ADPCM on the RSP with RSP-resident dynamic state, cross-pump output
+# deferral in plat_audio_pump. Default ON since full WP-M2 (2026-07-08):
+# same-source 600s ares A/B, content-matched fight buckets, roughly DOUBLES
+# in-fight fps (19.2->35.9, 17.2->31.5, 16.5->26.4, 14.3->21.6 across spr
+# density buckets; snd 150-310% -> 51-64%). Bit-exactness gate green (300s,
+# 40960 chunks, 0 mismatches FM+ADPCM, 0 hatches). Disable with WP_OFF=1;
+# add EXTRA_DEFINES=-DMVS64_RSPWP_VERIFY for the dual-compute gate
+# ([RSPWP] counters).
+ifndef WP_OFF
 CFLAGS += -DMVS64_RSPFM -DMVS64_RSPWP
 endif
 
