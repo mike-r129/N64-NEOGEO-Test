@@ -6,6 +6,14 @@
 #define SR_MASK    0xA71F
 #define CCR_MASK   0x1F
 
+# The inline fast paths replicate the generic paths' cycle charges exactly at
+# TIMING_ACCURACY<=0. The >=1 penalty fixups (cyc_move_penalty, the .l
+# reg-direct quirks, etc.) are NOT replicated, so accuracy>=1 builds compile
+# the fast paths out and use the generic implementations everywhere.
+#if defined(M64K_FASTPATHS) && (M64K_CONFIG_TIMING_ACCURACY >= 1)
+#undef M64K_FASTPATHS
+#endif
+
 # When set to 1, most MIPS registers will be set to random values at start.
 # This is useful when running the testsuite, to verify that the code does not
 # depend on the initial values of the registers.
@@ -1265,6 +1273,13 @@ invalid_opmode:
 OP(addq): OP(subq):
     andi t0, opcode, 3<<6
     beq t0, 3<<6, op_scc
+#ifdef M64K_FASTPATHS
+    # ADDQ/SUBQ #imm,Dn fast path; An destinations (no flags, always long)
+    # and memory EAs stay generic. Accuracy-0 charges: quick table, EA-reg
+    # column (4 for .b/.w, 8 for .l).
+    andi t0, opcode, 0x38
+    beqz t0, addq_fast
+#endif
     set_rmw_cyctable rmw_cyctable_quick
     use_cycles_opmask (7<<3)|(3<<6), (1<<3)|(2<<6), -2   # 2 fewer cycles if EA is An/long
     use_cycles_opmask (7<<3)|(3<<6), (1<<3)|(1<<6), +4   # 4 more cycles if EA is An/word
@@ -1295,18 +1310,219 @@ op_subq_rmwimpl:
     nop
     .set reorder
 
+#ifdef M64K_FASTPATHS
+addq_fast:
+    srl t0, opcode, 9                  # immediate: bits 11:9, 0 means 8
+    addi t0, -1
+    andi t0, 7
+    addi t0, 1
+    andi t2, opcode, 7                 # destination Dn
+    sll t2, 2
+    add t2, ctx
+    andi t1, opcode, 0x100             # bit 8: 0 = ADDQ, 1 = SUBQ
+    bnez t1, subq_f
+    andi t3, opcode, 0xC0
+    beqz t3, addq_f_byte
+    xori t1, t3, 0x40
+    beqz t1, addq_f_word
+addq_f_long:                           # addq.l #,Dn (8 cycles)
+    lwu t1, M64K_OFF_DREGS(t2)
+    daddu result, t0, t1
+    move flag_zc, result
+    dsrl flag_x, flag_zc, 32
+    sll t0, 0
+    sll t1, 0
+    daddu flag_nv, t0, t1
+    sw result, M64K_OFF_DREGS(t2)
+    use_cycles 8
+    dispatch_next
+addq_f_word:                           # addq.w #,Dn (4 cycles)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    daddu flag_nv, t0, t1
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 4
+    dispatch_next
+addq_f_byte:                           # addq.b #,Dn (4 cycles)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 24
+    dsrl flag_x, flag_zc, 32
+    sll t0, 24
+    sll t1, 24
+    daddu flag_nv, t0, t1
+    sb result, M64K_OFF_DREGS+3(t2)
+    use_cycles 4
+    dispatch_next
+subq_f:
+    andi t3, opcode, 0xC0
+    beqz t3, subq_f_byte
+    xori t1, t3, 0x40
+    beqz t1, subq_f_word
+subq_f_long:                           # subq.l #,Dn (8 cycles)
+    lwu t1, M64K_OFF_DREGS(t2)
+    dsubu result, t1, t0
+    move flag_zc, result
+    dsrl flag_x, flag_zc, 32
+    sll t0, 0
+    sll t1, 0
+    dsubu flag_nv, t1, t0
+    sw result, M64K_OFF_DREGS(t2)
+    use_cycles 8
+    dispatch_next
+subq_f_word:                           # subq.w #,Dn (4 cycles)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    dsubu flag_nv, t1, t0
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 4
+    dispatch_next
+subq_f_byte:                           # subq.b #,Dn (4 cycles)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 24
+    dsrl flag_x, flag_zc, 32
+    sll t0, 24
+    sll t1, 24
+    dsubu flag_nv, t1, t0
+    sb result, M64K_OFF_DREGS+3(t2)
+    use_cycles 4
+    dispatch_next
+#endif
+
 OP(addi):
     lax rmw_op, op_add_rmwimpl
     jal_and_j decode_imm, rmw_eadst
 op_subi:  # (same cacheline)
     lax rmw_op, op_sub_rmwimpl
     jal_and_j decode_imm, rmw_eadst
+#ifdef M64K_FASTPATHS
+# CMPI #imm,Dn fast path: CMP flags (no X), no writeback. The flag code is an
+# exact inline copy of op_cmp_rmwimpl with rmw_bitsize folded. Accuracy-0
+# charges: cmpi table, EA-reg column (8 for .b/.w, 14 for .l). The (illegal)
+# size-11 encoding keeps the generic path's behavior.
 op_cmpi:
+    andi t0, opcode, 0x38
+    bnez t0, cmpi_slow
+    andi t2, opcode, 7                 # Dn operand
+    sll t2, 2
+    add t2, ctx
+    andi t3, opcode, 0xC0
+    beqz t3, cmpi_f_byte
+    beq t3, 0xC0, cmpi_slow
+    xori t1, t3, 0x40
+    beqz t1, cmpi_f_word
+cmpi_f_long:                           # cmpi.l #,Dn (14 cycles)
+    lwl t0, 0(m_pc)                    # 32-bit immediate from the code stream
+    lwr t0, 3(m_pc)
+    addiu m_pc, 4
+    lwu t1, M64K_OFF_DREGS(t2)
+    zx64 t0
+    dsubu result, t1, t0
+    move flag_zc, result
+    sll t0, 0
+    sll t1, 0
+    dsubu flag_nv, t1, t0
+    use_cycles 14
+    dispatch_next
+cmpi_f_word:                           # cmpi.w #,Dn (8 cycles)
+    lhu t0, 0(m_pc)
+    addiu m_pc, 2
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 16
+    sll t0, 16
+    sll t1, 16
+    dsubu flag_nv, t1, t0
+    use_cycles 8
+    dispatch_next
+cmpi_f_byte:                           # cmpi.b #,Dn (8 cycles)
+    lbu t0, 1(m_pc)                    # low byte of the extension word
+    addiu m_pc, 2
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 24
+    sll t0, 24
+    sll t1, 24
+    dsubu flag_nv, t1, t0
+    use_cycles 8
+    dispatch_next
+cmpi_slow:
+#else
+op_cmpi:
+#endif
     set_rmw_cyctable rmw_cyctable_cmpi
     lax rmw_op, op_cmp_rmwimpl
     jal_and_j decode_imm_nocyctable, rmw_eadst
 
+#ifdef M64K_FASTPATHS
+# ADD <Dn>,Dm reg-direct fast path (~3% of in-match instructions). The flag
+# code is an exact inline copy of op_add_rmwimpl with rmw_bitsize folded to a
+# constant; charges are the generic accuracy-0 costs (logical table, EA-reg
+# column: 4 for .b/.w, 6 for .l — the hardware's 8 for .l only appears at
+# accuracy>=1, where fast paths are compiled out). ADDA/ADDX stay generic.
 OP(add):
+    andi t0, opcode, 0x138             # EA mode Dn, direction <ea>+Dm -> Dm
+    bnez t0, add_slow
+    andi t0, opcode, 0xC0
+    beq t0, 0xC0, add_slow             # opmode 011 = ADDA.w
+    andi t1, opcode, 7                 # source Dn
+    sll t1, 2
+    add t1, ctx
+    srl t2, opcode, 7                  # destination Dm
+    andi t2, 0x7<<2
+    add t2, ctx
+    beqz t0, add_f_byte
+    xori t3, t0, 0x40
+    beqz t3, add_f_word
+add_f_long:                            # add.l Dn,Dm (6 cycles at accuracy 0)
+    lwu t0, M64K_OFF_DREGS(t1)
+    lwu t1, M64K_OFF_DREGS(t2)
+    daddu result, t0, t1
+    move flag_zc, result               # bit32 = carry, low32 = !Z
+    dsrl flag_x, flag_zc, 32
+    sll t0, 0                          # re-sign-extend, like sllv by 0
+    sll t1, 0
+    daddu flag_nv, t0, t1
+    sw result, M64K_OFF_DREGS(t2)
+    use_cycles 6
+    dispatch_next
+add_f_word:                            # add.w Dn,Dm (4 cycles)
+    lhu t0, M64K_OFF_DREGS+2(t1)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    daddu flag_nv, t0, t1
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 4
+    dispatch_next
+add_f_byte:                            # add.b Dn,Dm (4 cycles)
+    lbu t0, M64K_OFF_DREGS+3(t1)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 24
+    dsrl flag_x, flag_zc, 32
+    sll t0, 24
+    sll t1, 24
+    daddu flag_nv, t0, t1
+    sb result, M64K_OFF_DREGS+3(t2)
+    use_cycles 4
+    dispatch_next
+add_slow:
+#else
+OP(add):
+#endif
     set_rmw_cyctable rmw_cyctable_logical
     lax rmw_op, op_add_rmwimpl
     jal decode_dptr
@@ -2387,7 +2603,80 @@ OP(movew):
     sh_m68k result, eaptr           # store the word into the destination
     j main_loop
 
+#ifdef M64K_FASTPATHS
+# MOVE.l/MOVEA.l fast paths: reg->reg copies (Dn/An -> Dn/An) and the hot
+# (d16,An) source. NOTE: at TIMING_ACCURACY==0 the generic path charges a
+# flat 12 at entry for every MOVE.l (the reg-direct -4/-4 penalties only
+# exist at accuracy>=1), so the reg->reg forms below charge 12 to stay
+# bit-identical to the generic path, not the hardware's 4.
 OP(movel):
+    andi t0, opcode, 0x38
+    xori t1, t0, 0x28
+    beqz t1, movel_fsrc_d16
+    andi t1, t0, 0x30                  # source mode 000/001 (Dn/An)?
+    bnez t1, movel_slow
+    andi t1, opcode, 0xF               # D0-D7/A0-A7 as one register file
+    sll t1, 2
+    add t1, ctx
+    lw t0, M64K_OFF_DREGS(t1)          # 32-bit value, sign-extended
+    srl t1, opcode, 6                  # destination mode
+    andi t1, 7
+    beqz t1, movel_f_dst_dn
+    xori t2, t1, 1
+    bnez t2, movel_slow
+    srl t1, opcode, 7                  # ---- movea.l Dn/An,Am: no flags ----
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_AREGS(t1)
+    use_cycles 12
+    dispatch_next
+movel_f_dst_dn:                        # ---- move.l Dn/An,Dm ----
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_DREGS(t1)
+    move flag_nv, t0                   # sign-extended: N in bits 31 and 63, V=0
+    zx64 flag_zc, flag_nv
+    use_cycles 12
+    dispatch_next
+
+movel_fsrc_d16:                        # ---- move(a).l (d16,An),Dm/Am  (20 cycles) ----
+    srl t1, opcode, 6
+    andi t1, 7
+    xori t2, t1, 1
+    beqz t2, 1f                        # dst An ok
+    bnez t1, movel_slow                # else only dst Dn
+1:  andi t2, opcode, 7
+    sll t2, 2
+    add t2, ctx
+    lw eaptr32, M64K_OFF_AREGS(t2)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movel_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    use_cycles 20
+    lwl t0, 0(eaptr)                   # unaligned-capable pair, like lw_m68k
+    lwr t0, 3(eaptr)
+    bnez t1, movel_f16_an
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_DREGS(t1)
+    move flag_nv, t0
+    zx64 flag_zc, flag_nv
+    dispatch_next
+movel_f16_an:
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_AREGS(t1)
+    dispatch_next
+
+movel_slow:
+#else
+OP(movel):
+#endif
     use_cycles 12
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_movel_penalty
@@ -3071,6 +3360,17 @@ branch_exec:
     j jmp_exec
 
 OP(dbcc):
+#ifdef M64K_FASTPATHS
+    # DBF (cond=false, i.e. DBRA) is by far the most common DBcc form and its
+    # condition can never be true: skip the check_cc call and go straight to
+    # the counter decrement.
+    andi t0, opcode, 0x0F00
+    xori t0, 0x0100
+    bnez t0, dbcc_checkcc
+    addiu m_pc, 2
+    j dbcc_dec
+dbcc_checkcc:
+#endif
     addiu m_pc, 2
     jal check_cc
     #if M64K_CONFIG_TIMING_ACCURACY >= 0
@@ -3081,6 +3381,7 @@ OP(dbcc):
     #else
     bnez t0, main_loop
     #endif
+dbcc_dec:
     andi t0, opcode, 0x7
     sll t0, 2
     la_ctx dptr, M64K_OFF_DREGS,t0
