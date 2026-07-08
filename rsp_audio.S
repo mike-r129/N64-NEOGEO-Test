@@ -30,13 +30,20 @@
 #      a0 = param block RDRAM physical (see PARAM LAYOUT below)
 #      a1 = output block RDRAM physical (see OUT LAYOUT below)
 #      a2 = sequence number to write at out+1412 when done
+#  0x2 cmd_adpcm_wp:   like 0x1, plus a3 = RDRAM physical of the resident
+#      dynamic-state block (whole-pump mode: acc/astep/aout/now_data per A
+#      channel and acc/adpcmd/prev_acc/adpcml/now_data for B chain RSP-side
+#      across chunks; the param's dynamic fields are used only for channels
+#      flagged FRESH at +8/+9).
 #
 # PARAM LAYOUT (384 bytes, mirrored in ym2610.c rspa_param_t):
 #   +0   u32 jedi_phys      RDRAM physical of jedi_table[49*16] (s16)
 #   +4   u16 n              samples this chunk (1..128)
 #   +6   u8  amask          bit c = ADPCM-A channel c active
 #   +7   u8  bflags         bit 0 = ADPCM-B active on RSP
-#   +8   pad to 16
+#   +8   u8  fresha         (0x2 only) bit c = A channel c state is in param
+#   +9   u8  freshb         (0x2 only) bit 0 = B state is in param
+#   +10  pad to 16
 #   +16  A channel c at +16 + c*48:
 #     +0  u32 now_addr   +4  u32 now_step   +8  u32 step   +12 u32 end_x2m
 #     +16 s32 acc        +20 s32 astep      +24 s32 aout
@@ -65,6 +72,7 @@
     RSPQ_BeginOverlayHeader
         RSPQ_DefineCommand cmd_adpcm_test, 12   # 0x0: a0=src, a1=dst, a2=size
         RSPQ_DefineCommand cmd_adpcm_run, 12    # 0x1: a0=param, a1=out, a2=seq
+        RSPQ_DefineCommand cmd_adpcm_wp, 16     # 0x2: + a3=resident dyn block
     RSPQ_EndOverlayHeader
 
     RSPQ_EmptySavedState
@@ -92,6 +100,15 @@ RA_SAVE:   .dcb.b 4
 CUR_SAVE:  .dcb.b 4
 CH_MASK:   .dcb.b 4
 CH_PTR:    .dcb.b 4
+# whole-pump mode (cmd_adpcm_wp): the ADPCM waveform state chains RSP-side
+# through an RDRAM block (see rspwpa_dyn in ym2610.c) instead of round-
+# tripping through the param echo. DYNA layout: 6 x 16B A slots
+# {s32 acc, s32 astep, s32 aout, u8 now_data} then a 24B B slot at +96
+# {s32 acc, s32 adpcmd, s32 prev_acc, s32 adpcml, u8 now_data}, 128 total.
+WP_MODE:   .dcb.b 4
+DYN_PHYS:  .dcb.b 4
+    .align 3               # DMA alignment (the rsp_fm DYNBUF lesson)
+DYNA:      .dcb.b 128
 
     .text
 
@@ -158,7 +175,14 @@ cmd_adpcm_test:
     #   64-sample half   s8 = samples remaining   s2 = nh (this half)
     #############################################################
     .func cmd_adpcm_run
+cmd_adpcm_wp:
+    sw a3, %lo(DYN_PHYS)
+    li t0, 1
+    j adpcm_run_common
+    sw t0, %lo(WP_MODE)
 cmd_adpcm_run:
+    sw zero, %lo(WP_MODE)
+adpcm_run_common:
     sll a0, 8                   # strip the rspq command byte from arg word 0
     srl a0, 8
     move s5, a1
@@ -175,6 +199,81 @@ cmd_adpcm_run:
     li s4, %lo(JEDI_BUF)
     jal DMAIn
     li t0, DMA_SIZE(1568, 1)
+
+    # whole-pump: overlay the resident dynamic state over the (stale) fields
+    # the CPU packed, unless the channel is FRESH (param holds its key-on /
+    # re-seed state). Then recompute aout from the effective acc + shipped
+    # volume: aout == ((s16)acc * vol_mul) >> vol_shift & ~3 is an invariant
+    # at every chunk boundary of a live channel, which makes CPU-side TL/IL
+    # volume writes free (they recompute their copy from a stale acc).
+    lw t0, %lo(WP_MODE)
+    beqz t0, wp_in_done
+    nop
+    lw s0, %lo(DYN_PHYS)
+    li s4, %lo(DYNA)
+    jal DMAIn
+    li t0, DMA_SIZE(128, 1)
+
+    lbu t5, %lo(PARAM_BUF) + 6  # amask
+    lbu t6, %lo(PARAM_BUF) + 8  # fresh-A bits
+    li s1, %lo(PARAM_BUF) + 16
+    li s2, %lo(DYNA)
+wpa_in_loop:
+    andi t0, t5, 1
+    beqz t0, wpa_in_next
+    andi t1, t6, 1
+    bnez t1, wpa_in_aout        # fresh: param dynamic fields are current
+    nop
+    lw t0, 0(s2)                # acc
+    sw t0, 16(s1)
+    lw t0, 4(s2)                # astep
+    sw t0, 20(s1)
+    lbu t0, 12(s2)              # now_data
+    sb t0, 28(s1)
+wpa_in_aout:
+    lw t1, 16(s1)               # acc (12-bit signed, sign-extended)
+    lbu t2, 30(s1)              # vol_mul (small, >= 0)
+    move t0, zero
+    beqz t2, 2f
+    nop
+1:  andi t3, t2, 1
+    subu t3, zero, t3
+    and  t3, t3, t1
+    addu t0, t0, t3
+    srl  t2, t2, 1
+    bnez t2, 1b
+    sll  t1, t1, 1
+2:  lbu t2, 31(s1)              # vol_shift
+    srav t0, t0, t2
+    srl t0, 2
+    sll t0, 2                   # & ~3
+    sw t0, 24(s1)
+wpa_in_next:
+    srl t5, 1
+    srl t6, 1
+    addiu s1, 48
+    addiu s2, 16
+    li t0, %lo(PARAM_BUF) + 16 + 6*48
+    bne s1, t0, wpa_in_loop
+    nop
+    # B: overlay acc/adpcmd/prev_acc/now_data unless fresh (adpcml is
+    # recomputed every sample by the decoder — no overlay-in needed)
+    lbu t0, %lo(PARAM_BUF) + 7
+    andi t0, 1
+    beqz t0, wp_in_done
+    lbu t1, %lo(PARAM_BUF) + 9  # fresh-B (delay slot: harmless load)
+    bnez t1, wp_in_done
+    li s1, %lo(PARAM_BUF) + 304
+    li s2, %lo(DYNA) + 96
+    lw t0, 0(s2)                # acc
+    sw t0, 16(s1)
+    lw t0, 4(s2)                # adpcmd
+    sw t0, 20(s1)
+    lw t0, 8(s2)                # prev_acc
+    sw t0, 24(s1)
+    lbu t0, 16(s2)              # now_data
+    sb t0, 46(s1)
+wp_in_done:
 
     sw zero, %lo(ARRIVED)
 
@@ -249,6 +348,56 @@ no_b:
     subu s8, s2
     bnez s8, half_loop
     nop
+
+    # whole-pump: chain the post-chunk dynamic fields into the resident
+    # block and DMA it home (must complete BEFORE the final seq DMA — the
+    # CPU's drain/pull waits on seq)
+    lw t0, %lo(WP_MODE)
+    beqz t0, wp_out_done
+    nop
+    lbu t5, %lo(PARAM_BUF) + 6
+    li s1, %lo(PARAM_BUF) + 16
+    li s2, %lo(DYNA)
+wpa_out_loop:
+    andi t0, t5, 1
+    beqz t0, wpa_out_next
+    nop
+    lw t0, 16(s1)               # acc
+    sw t0, 0(s2)
+    lw t0, 20(s1)               # astep
+    sw t0, 4(s2)
+    lw t0, 24(s1)               # aout
+    sw t0, 8(s2)
+    lbu t0, 28(s1)              # now_data
+    sb t0, 12(s2)
+wpa_out_next:
+    srl t5, 1
+    addiu s1, 48
+    addiu s2, 16
+    li t0, %lo(PARAM_BUF) + 16 + 6*48
+    bne s1, t0, wpa_out_loop
+    nop
+    lbu t0, %lo(PARAM_BUF) + 7
+    andi t0, 1
+    beqz t0, wpa_out_b_done
+    li s1, %lo(PARAM_BUF) + 304 # (delay slot: harmless)
+    li s2, %lo(DYNA) + 96
+    lw t0, 16(s1)               # acc
+    sw t0, 0(s2)
+    lw t0, 20(s1)               # adpcmd
+    sw t0, 4(s2)
+    lw t0, 24(s1)               # prev_acc
+    sw t0, 8(s2)
+    lw t0, 48(s1)               # adpcml
+    sw t0, 12(s2)
+    lbu t0, 46(s1)              # now_data
+    sb t0, 16(s2)
+wpa_out_b_done:
+    lw s0, %lo(DYN_PHYS)
+    li s4, %lo(DYNA)
+    jal DMAOut
+    li t0, DMA_SIZE(128, 1)
+wp_out_done:
 
     # echo the (state-updated) param block to out+1024
     li s4, %lo(PARAM_BUF)

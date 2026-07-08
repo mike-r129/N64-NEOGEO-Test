@@ -157,3 +157,48 @@ Also measured/landed on the way:
 - rspq lost-wakeup watchdog (plat_audio_pump): halted+SIG_MORE persisting
   across two pumps -> clear halt. Covers the kernel race that panicked
   display_get three times; 1200s of soaks since with zero false positives.
+
+## Full WP-M2 implementation (2026-07-08)
+
+Landed exactly per the addendum, with these concrete choices:
+
+- **cmd_adpcm_wp (0x2)** in rsp_audio.S mirrors cmd_fm_wp: a3 = resident
+  dyn block phys (128B: 6 x 16B A slots {acc,astep,aout,now_data} + 24B B
+  slot {acc,adpcmd,prev_acc,adpcml,now_data}); DMA in after the param,
+  overlay per channel unless its FRESH bit (param +8/+9) is set, DMA back
+  BEFORE the seq word. `.align 3` before DYNA (the rsp_fm DMA lesson).
+- **aout is NOT resident**: aout == ((s16)acc*vol_mul)>>vol_shift & ~3 is
+  an invariant at every chunk boundary of a live channel (recomputed on
+  every nibble batch; A consumes >=1 nibble per sample at the fixed 18.5k
+  rate), so the RSP recomputes it at chunk start from the effective acc +
+  shipped volume. This makes ADPCM-A TL/IL writes FREE under residency
+  (they recompute the CPU copy from a stale acc — same shape as FM's
+  vol_out = tl + volume). B's adpcml rescale (reg 0x1b) is the ONE write
+  that mutates resident state in place: rare drain+pull+refresh hatch.
+- **Residency masks, not fresh flags**: wpa_res/wpb_res track which
+  channels the RSP owns. Key-on clears the bit (CPU fields just got
+  reset) -> next build ships FRESH. Pulls (B nonlinear window, staging
+  overflow, 0x1b rescale, offload death) drain the last kicked seq, read
+  the block back, and clear the bit.
+- **B eager EOS at build** (arrived | EOS bit, PCM_BSY=0, portstate=0 when
+  the walk hits end this chunk): M2-lite adopted these one chunk late,
+  which could cross a Z80 slice between emit calls — full M2 restores the
+  C core's call-boundary timing exactly. (A's eager end flags were already
+  in M2-lite.)
+- **rspa param/out/src rings of 16**, indexed by the SAME slot as the FM
+  pend ring; pend gains {a_on, a_seq} and rspwp_collect waits on both seq
+  words and folds acc + fm + adpcm in one place.
+- **Cross-pump deferral is at BUFFER granularity** in plat_audio_pump, not
+  per chunk: sound_gen_samples ends with YM2610_wp_finish_async() (ship +
+  sweep, no drain); the stage->aring publish is deferred to the next pump
+  entry behind the blocking YM2610_wp_finish(). The fill policy counts the
+  pending buffer as staged lead; a safety valve publishes immediately if
+  published lead drops under one AI callback (n frames), which degrades to
+  exactly the old behavior when already behind. [SNDRMS] reads the tail
+  spans pre-final (diagnostic only).
+- **Verify**: MVS64_RSPWP_VERIFY now also dual-computes ADPCM (C stays
+  authoritative incl. flags/addresses — eager+advance are compiled out;
+  the RSP chain runs from its own resident state and is compared per
+  sample + per dyn field at collect; aout compare skipped for channels
+  that END in the chunk, where C freezes a write-time value and the RSP a
+  chunk-start recompute — dead state either way).

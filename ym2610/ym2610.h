@@ -73,13 +73,17 @@ void YM2610Update(int *p);
 void YM2610Update_stream(int length);
 
 #if defined(N64) && defined(MVS64_RSPWP)
-/* Whole-pump deferred FM (WHOLEPUMP-DESIGN.md): the caller (emit) points
- * dest_base at the uncached AI position of the span BEFORE calling
+/* Whole-pump deferred FM+ADPCM (WHOLEPUMP-DESIGN.md): the caller (emit)
+ * points dest_base at the staging position of the span BEFORE calling
  * YM2610Update_stream — deferred chunks write their final samples there at
- * collect time. YM2610_wp_finish() drains everything in flight and MUST run
- * before the pump returns its buffer to the AI. */
+ * collect time. YM2610_wp_finish_async() runs at pump end: it ships the
+ * tail command and sweeps finished chunks but leaves the rest in flight
+ * (they drain during the inter-pump 68k window). YM2610_wp_finish() is the
+ * blocking drain and MUST run before the staging buffer is published to
+ * the pull ring or reused. */
 extern short *ym2610_wp_dest_base;
 void YM2610_wp_finish(void);
+void YM2610_wp_finish_async(void);
 void YM2610_wp_mark_emitted(void);
 #endif
 

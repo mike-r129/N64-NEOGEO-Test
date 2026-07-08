@@ -610,10 +610,13 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 	if (produced < nsamples && !silent) emit(out, produced, nsamples - produced);
 
 #if defined(N64) && defined(MVS64_RSPWP)
-	/* The AI consumes this buffer once we return: every deferred FM chunk
-	 * must have landed its final samples by now (pipeline tail wait, the
-	 * only synchronous RSP wait in the whole-pump design). */
-	YM2610_wp_finish();
+	/* Cross-pump deferral (full WP-M2): tail chunks may still be in flight
+	 * when we return — `out` is the platform's staging buffer, and the
+	 * platform pump blocks on YM2610_wp_finish() before publishing it to
+	 * the pull ring (usually at its NEXT entry, after the inter-pump 68k
+	 * window has drained the RSP for free). NOTE: the [SNDRMS] probe below
+	 * reads the tail spans before they are final — diagnostic only. */
+	YM2610_wp_finish_async();
 #endif
 
 	if (snd_dbg)

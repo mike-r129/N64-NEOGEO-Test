@@ -208,6 +208,43 @@ void plat_enable_audio(int enable) {
     audio_enabled = enable;
 }
 
+// Copy one generated buffer into the staging ring (stereo frames).
+static void aring_push(const int16_t *src, int n) {
+    uint32_t wr = aring_wr;
+    for (int i = 0; i < n; i++) {
+        uint32_t s = (wr + i) & (ARING_FRAMES - 1);
+        aring[s * 2 + 0] = src[i * 2 + 0];
+        aring[s * 2 + 1] = src[i * 2 + 1];
+    }
+    MEMORY_BARRIER();      // publish samples before advancing the index
+    aring_wr = wr + n;
+}
+
+static int16_t stage[2048 * 2];
+
+#ifdef MVS64_RSPWP
+// Cross-pump output deferral (full WP-M2, WHOLEPUMP-DESIGN.md addendum).
+// sound_gen_samples() now returns with its tail RSP chunks still in flight;
+// publishing `stage` to the ring is deferred to the NEXT pump entry, so the
+// RSP burst deficit drains for free during the inter-pump 68k/draw window
+// instead of being paid as a blocking wait at pump end. The fill policy
+// counts the pending buffer as staged lead (it is published before the ISR
+// could ever need it), and a safety valve publishes immediately whenever
+// less than one AI callback of PUBLISHED lead remains.
+void YM2610_wp_finish(void);
+static int wp_pending_n;       // frames generated into stage, not yet published
+static void wp_publish(void) {
+    extern uint32_t profile_snd;
+    uint32_t t0;
+    if (!wp_pending_n) return;
+    t0 = TICKS_READ();
+    YM2610_wp_finish();        // usually instant: the RSP had the whole window
+    profile_snd += TICKS_DISTANCE(t0, TICKS_READ());
+    aring_push(stage, wp_pending_n);
+    wp_pending_n = 0;
+}
+#endif
+
 void plat_audio_pump(void) {
     if (!audio_enabled) return;
 
@@ -242,6 +279,12 @@ void plat_audio_pump(void) {
             wedged_seen = 0;
         }
     }
+#endif
+#ifdef MVS64_RSPWP
+    // Publish the previous pump's deferred buffer first: its chunks have had
+    // the whole inter-pump window to complete, so the blocking finish inside
+    // is normally a no-op poll.
+    wp_publish();
 #endif
 #ifdef SND_HEALTH
     uint32_t _t0 = TICKS_READ();
@@ -283,25 +326,27 @@ void plat_audio_pump(void) {
     int pass_budget = (underrun_streak >= 1) ? 1 : AI_NUM_BUFFERS;
 
     int filled = 0, discarded = 0;
-    static int16_t stage[2048 * 2];
 
     // Top the ring up toward TARGET_LEAD. The ISR consumes exactly n frames
     // per callback, so lead is always a multiple of n.
     extern uint32_t profile_snd;
     while (filled < pass_budget) {
         uint32_t lead = aring_wr - aring_rd;
+#ifdef MVS64_RSPWP
+        lead += (uint32_t)wp_pending_n;   // deferred buffer counts as staged
+#endif
         if (lead + (uint32_t)n > TARGET_LEAD) break;   // topped up
+#ifdef MVS64_RSPWP
+        wp_publish();          // free the staging buffer before reusing it
+#endif
         uint32_t snd_t0 = TICKS_READ();
         sound_gen_samples(stage, n);
         profile_snd += TICKS_DISTANCE(snd_t0, TICKS_READ());
-        uint32_t wr = aring_wr;
-        for (int i = 0; i < n; i++) {
-            uint32_t s = (wr + i) & (ARING_FRAMES - 1);
-            aring[s * 2 + 0] = stage[i * 2 + 0];
-            aring[s * 2 + 1] = stage[i * 2 + 1];
-        }
-        MEMORY_BARRIER();      // publish samples before advancing the index
-        aring_wr = wr + n;
+#ifdef MVS64_RSPWP
+        wp_pending_n = n;      // defer the publish to the next pump entry
+#else
+        aring_push(stage, n);
+#endif
         filled++;
     }
 
@@ -332,13 +377,31 @@ void plat_audio_pump(void) {
         last_t = now;
         last_rd = rd_now;
         if (filled == 0 && wall_due >= 2 * n) {
+#ifdef MVS64_RSPWP
+            wp_publish();      // free the staging buffer before reusing it
+#endif
             uint32_t snd_t0 = TICKS_READ();
             sound_gen_samples(stage, n);
+#ifdef MVS64_RSPWP
+            // discard buffer: complete in-flight chunks before stage reuse,
+            // but never publish (the platform's AI is broken here anyway)
+            YM2610_wp_finish();
+#endif
             profile_snd += TICKS_DISTANCE(snd_t0, TICKS_READ());
             wall_due -= n;
             discarded++;
         }
     }
+
+#ifdef MVS64_RSPWP
+    // Safety valve: with less than one full AI callback of PUBLISHED lead,
+    // the deferred buffer cannot wait for the next pump entry (a slow frame
+    // would starve the ISR into a silence pad). Publish now — this pays the
+    // residual RSP deficit exactly when we're already behind, which is the
+    // old (pre-deferral) behavior.
+    if (wp_pending_n && aring_wr - aring_rd < (uint32_t)n)
+        wp_publish();
+#endif
 
 #ifdef SND_HEALTH
     // Delivery-health probe (USB/ISViewer).
