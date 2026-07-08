@@ -371,7 +371,13 @@ fix_draw:
 
     .align 4
 RDP_SPRITE_DRAW:
-    .quad RdpSyncPipe()
+    # No SyncPipe: it is only required before pipeline ATTRIBUTE changes
+    # (SetOtherModes/SetCombine/...), which this stream never does. The
+    # per-tile hazards are exactly what SyncTile (TILE0/TILE1 descriptor
+    # reuse by the previous rect) and SyncLoad (LoadBlock over TMEM the
+    # previous rect reads) cover — same policy as libdragon's rdpq
+    # autosync for texrect streams. The old per-tile SyncPipe forced a
+    # full pipeline drain per 16x16 tile, ~565 times a frame in fights.
     .quad RdpSyncTile()
     .quad RdpSyncLoad()
     .quad RdpSetTexImage(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, 4)
@@ -523,6 +529,9 @@ cmd_sprite_draw:
     addi s3, 48
 
 sprite_draw:
+    # The template is 9 quads (72 bytes) since the SyncPipe removal; the
+    # fifth 16-byte copy over-copies 8 stale bytes past the stream end,
+    # which is harmless: s3 advances by 72 and RDPQ_Send sends up to s3.
     li s0, %lo(RDP_SPRITE_DRAW)
     lqv vload0,  0,s0
     lqv vload1, 16,s0
@@ -537,13 +546,13 @@ sprite_draw:
     sqv vload4, 64,s3
 
     # Store sprite pixel address in SetTexImage
-    sw a0, 3*8+4(s3)
+    sw a0, 2*8+4(s3)
 
     # Store palette number into SetTile
-    lbu t0, 5*8+5(s3)
+    lbu t0, 4*8+5(s3)
     sll t1, palslot, 4
     or t0, t1
-    sb t0, 5*8+5(s3)
+    sb t0, 4*8+5(s3)
 
     # Extract X/Y
     sll rect_x0, a1, 8
@@ -613,27 +622,27 @@ sprite_draw:
     sll rect_x0, 14
     sll rect_y0, 2
     or rect_x0, rect_y0
-    lw t0, 8*8+4(s3)
+    lw t0, 7*8+4(s3)
     or t0, rect_x0
-    sw t0, 8*8+4(s3)
+    sw t0, 7*8+4(s3)
 
     andi rect_sw, 0x3FF
     andi rect_sh, 0x3FF
     sll rect_sw, 14
     sll rect_sh, 2
     or rect_sw, rect_sh
-    lw t0, 8*8+0(s3)
+    lw t0, 7*8+0(s3)
     or t0, rect_sw
-    sw t0, 8*8+0(s3)
+    sw t0, 7*8+0(s3)
 
     sll rect_s0, 5
     sll rect_t0, 5
-    sh rect_s0, 9*8+0(s3)
-    sh rect_t0, 9*8+2(s3)
-    sh rect_ds, 9*8+4(s3)
-    sh rect_dt, 9*8+6(s3)
+    sh rect_s0, 8*8+0(s3)
+    sh rect_t0, 8*8+2(s3)
+    sh rect_ds, 8*8+4(s3)
+    sh rect_dt, 8*8+6(s3)
 
-    addi s3, 10*8
+    addi s3, 9*8
 
     # Send to RDP and go back to main loop
     j RDPQ_Send
