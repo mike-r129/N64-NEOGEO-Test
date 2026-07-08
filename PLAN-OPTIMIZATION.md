@@ -1,5 +1,46 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## ✅ M64K FAST PATHS LANDED (2026-07-08 day session) — rank 4 finally paid, in the RSP era
+
+**Measure-first result that unblocked the work:** a per-frame least-squares fit of the
+m68k bucket against executed instructions and TLB faults (analyze-m68k.py on a PERFCOUNT
+run, R²=0.99) split the bucket cleanly: **~90 host cycles per 68k instruction, 85-90% of
+the bucket scaling on instruction count, TLB/MMIO traps only ~9-10% (~1.1ms/frame,
+handlers included).** The interpreter is stall-dominated (ALU path ≈ 25-30 cycles), so
+the lever is fewer icache lines touched per instruction, not fewer arithmetic ops —
+which is why inlining the hot forms (2-3 straight-line lines vs 6-7 scattered lines of
+decode_ea/check_cc chains) pays now, and why traps/io are documented as NOT the wall.
+
+Landed as `M64K_FASTPATHS` (default ON, `FP_OFF=1` reverts; compiled out at
+TIMING_ACCURACY>=1), two waves, both testsuite-gated (125/126 PASS = CHK-only known
+failure; aggregate cycle diff unchanged at 2.67%):
+- **a1b94b7 wave 1:** Bcc direct condition dispatch (bcc_cctable, sense baked in, GE/LT
+  collapse to bgez/bltz on flag_nv; taken path unchanged so idle-skip still fires);
+  MOVE.w Dn->{Dn,(An),(An)+,(d16,An)}, (d16,An)->Dn, #imm->(An); MOVE.b (d16,An)->Dn +
+  (An)+->Dn; TST.b/.w (d16,An); dispatch_next macro (main_loop's dispatch expanded at
+  fast-path tails — main_loop expands the same macro).
+- **f5af2c3 wave 2:** DBF skips check_cc; ADD.b/.w/.l Dn,Dm; ADDQ/SUBQ #,Dn; CMPI #,Dn;
+  MOVE.l/MOVEA.l reg->reg + (d16,An)->Dn/An.
+
+**Bit-exactness discipline:** identical accuracy-0 cycle charges applied BEFORE the m68k
+data access (MMIO observes the same mid-instruction clock — samsho2 reads LSPCMODE);
+loads in t0 / stores from result (TLB trap register convention); A7 quirks, MOVEA.w,
+ADDA/ADDX and all odd EAs stay generic; on ADDRERR builds an odd address bails to the
+generic implementation with no state mutated, so address errors raise via the original
+machinery.
+
+**Measured (ares 560s runs, spr-bucket-matched fight frames): +3.1..+3.8 fps in every
+bucket — 36.9→40.0 / 36.0→39.0 / 32.2→35.9 / 30.1→33.9; m68k bucket 76→67 / 77→68 /
+83→71 / 93→78; fitted per-instruction cost 90→73 host cycles.** Deliverable: play7.
+
+**Next walls, measured tonight:** (1) **snd ~56-64%, of which the Z80 interpreter is
+~half** ([SNDRMS] z80ms≈310 vs ymms≈300 per interval; within YM: fm-glue 70 / ssg 55 /
+mix 59 / eg 11 / adpcm 3) — a Z80 core fast-path/structural pass is the next single
+biggest CPU lever, WAV-gated; (2) sprite walk 12-19% (walk-on-RSP, ucode project);
+(3) m64k residual: remaining forms are each <1% of count — diminishing, the well is
+mostly drained; (4) TMEM/descriptor slot rotation (hardware-facing, can't be gated in
+ares).
+
 ## ✅/❌ DRAW TIER MEASURED (2026-07-07 day session) — the fix layer was the lever, not the RSP
 
 [PERF2] fine profiling split the in-fight draw 33% into: **fix layer 15.5%**
