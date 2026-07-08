@@ -28,6 +28,15 @@ CFLAGS += -DUSE_M64K
 CFLAGS += -DM64K_BLOCKOPS
 ASFLAGS += -DM64K_BLOCKOPS
 N64_ASFLAGS += -DM64K_BLOCKOPS
+# m64k inline fast paths for the profile-dominant opcode forms (Bcc condition
+# dispatch, hot MOVE.b/.w forms, TST.b/.w (d16,An)) — testsuite-covered (the
+# standalone m64k testsuite build enables the same define). Disable with
+# make ... FP_OFF=1 for A/B measurement.
+ifndef FP_OFF
+CFLAGS += -DM64K_FASTPATHS
+ASFLAGS += -DM64K_FASTPATHS
+N64_ASFLAGS += -DM64K_FASTPATHS
+endif
 endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 

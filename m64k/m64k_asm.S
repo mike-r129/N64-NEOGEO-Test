@@ -328,6 +328,48 @@ opshiftsmem:
 .endm
 
 
+# "dispatch_next" macro. Exact copy of the main_loop dispatch, for inlining at
+# the tail of the M64K_FASTPATHS opcode handlers: it removes the extra
+# "j main_loop" hop (and its pipeline bubble) from the hottest paths. Any
+# change here IS a change to main_loop (which expands this same macro).
+.macro dispatch_next
+    .set push
+    .set noreorder
+    blez m_cycles, main_loop_exit
+     lhu opcode, 0(m_pc)
+#ifdef MVS64_PERFCOUNT
+    lw t1, perf_m68k_insns
+    addiu t1, 1
+    sw t1, perf_m68k_insns
+#endif
+    #if M64K_CONFIG_ADDRERR
+    sw opcode, M64K_OFF_IR(ctx)
+    #endif
+    #if M64K_CONFIG_TIMING_ACCURACY < 0
+    addi m_cycles, M64K_CONFIG_TIMING_ACCURACY
+    #endif
+    srl t1, opcode, 12
+    sll t1, 2
+    lw t0, optable(t1)
+    jr t0
+     addi m_pc, 2
+    .set pop
+.endm
+
+# "check_addr_bail" macro. Used by the M64K_FASTPATHS handlers on ADDRERR
+# builds: an odd word address bails to the opcode's GENERIC implementation
+# (label) with no architectural state mutated, so the generic path re-executes
+# the instruction from scratch and raises the address error through its normal
+# machinery with bit-exact state. Compiles to nothing on non-ADDRERR builds.
+.macro check_addr_bail reg, label
+    #if M64K_CONFIG_ADDRERR
+    .set noat
+    andi $1, \reg, 1
+    bnez $1, \label
+    .set at
+    #endif
+.endm
+
     .globl _m64k_asmrun
 _m64k_asmrun:
     addiu sp,sp,-128
@@ -411,24 +453,7 @@ _m64k_asmrun:
     #endif
 
 ALIGN(main_loop):
-    blez m_cycles, main_loop_exit
-     lhu opcode, 0(m_pc)
-#ifdef MVS64_PERFCOUNT
-    lw t1, perf_m68k_insns
-    addiu t1, 1
-    sw t1, perf_m68k_insns
-#endif
-    #if M64K_CONFIG_ADDRERR
-    sw opcode, M64K_OFF_IR(ctx)
-    #endif
-    #if M64K_CONFIG_TIMING_ACCURACY < 0
-    addi m_cycles, M64K_CONFIG_TIMING_ACCURACY
-    #endif
-    srl t1, opcode, 12
-    sll t1, 2
-    lw t0, optable(t1)
-    jr t0
-     addi m_pc, 2
+    dispatch_next
 op_tbl0:
     srl t0, opcode, 6
     andi t0, 0xF << 2
@@ -2046,7 +2071,47 @@ op_clr_rmwimpl:
     li flag_zc, 0
     jr ra
 
+#ifdef M64K_FASTPATHS
+# TST.b/.w (d16,An) fast path (the dominant productive TST forms in-match).
+# .l and every other EA keep the generic path. At TIMING_ACCURACY==0 the
+# generic byte/word path charges 4 (entry) + 8 (ea_101), consulted from no
+# cycle table, so the flat 12 below is exact; at >=1 the charges are the same
+# for these forms (the singleop-table quirk only affects .l).
 OP(tst):
+    andi t0, opcode, 0x38
+    xori t0, 0x28
+    bnez t0, tst_slow                  # only (d16,An)
+    andi t0, opcode, 0xC0
+    beq t0, 0x80, tst_slow             # .l stays generic
+    beq t0, 0xC0, tst_slow             # TAS stays generic
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    beqz t0, tst_f_byte
+    check_addr_bail eaptr32, tst_slow  # word: odd address raises via generic path
+    addiu m_pc, 2                      # ---- tst.w (d16,An)  (12 cycles) ----
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lhu_m68k t0, eaptr
+    move flag_zc, t0
+    sll flag_nv, t0, 16
+    dispatch_next
+tst_f_byte:
+    addiu m_pc, 2                      # ---- tst.b (d16,An)  (12 cycles) ----
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lbu_m68k t0, eaptr
+    move flag_zc, t0
+    sll flag_nv, flag_zc, 24
+    dispatch_next
+
+tst_slow:
+#else
+OP(tst):
+#endif
     srl rmw_bitsize, opcode, 6
     andi rmw_bitsize, 3
     beq rmw_bitsize, 3, op_tas
@@ -2090,7 +2155,60 @@ cyc_move_penalty:
     jr ra
 #endif
 
+#ifdef M64K_FASTPATHS
+# MOVE.b fast paths: (d16,An)->Dn is the single hottest MOVE form in-match,
+# (An)+->Dn the second. Byte accesses cannot raise address errors, so no
+# ADDRERR bail is needed; the A7 byte quirk (+2) keeps A7 on the generic path.
 OP(moveb):
+    andi t0, opcode, 0x1C0             # destination must be Dn
+    bnez t0, moveb_slow
+    andi t0, opcode, 0x38
+    xori t1, t0, 0x28
+    beqz t1, moveb_f_d16
+    xori t1, t0, 0x18
+    bnez t1, moveb_slow
+    andi t1, opcode, 7                 # ---- move.b (An)+,Dm  (8 cycles) ----
+    xori t2, t1, 7
+    beqz t2, moveb_slow                # A7: +2 quirk stays generic
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    addiu t2, eaptr32, 1
+    sw t2, M64K_OFF_AREGS(t1)          # writeback before the load, like ea_011
+    map_m68k eaptr, eaptr32
+    use_cycles 8
+    lbu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sb t0, M64K_OFF_DREGS+3(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 24
+    dispatch_next
+
+moveb_f_d16:                           # ---- move.b (d16,An),Dm  (12 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addiu m_pc, 2
+    addu eaptr32, t2
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lbu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sb t0, M64K_OFF_DREGS+3(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 24
+    dispatch_next
+
+moveb_slow:
+#else
+OP(moveb):
+#endif
     use_cycles 4
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_move_penalty
@@ -2108,7 +2226,146 @@ OP(moveb):
     sll flag_nv, result, 24               # addect N, clear V
     j main_loop
 
+#ifdef M64K_FASTPATHS
+# MOVE.w fast paths for the profile-dominant forms (samsho2 in-match:
+# Dn->(d16,An)/(An)/(An)+/Dn, (d16,An)->Dn and #imm->(An) together are ~60%
+# of all MOVE.w). Each form decodes inline, skipping both decode_ea indirect
+# calls. Cycle charges are identical to the generic path and are applied
+# BEFORE the m68k-space data access so MMIO handlers observe the same
+# mid-instruction clock. Anything unusual — other EA modes, MOVEA, the A7
+# post-increment quirk, odd addresses on ADDRERR builds — bails to the
+# generic implementation below with no architectural state mutated.
 OP(movew):
+    andi t0, opcode, 0x38
+    bnez t0, movew_fsrc_other
+    andi t1, opcode, 7                 # ---- source Dn: value into t0 ----
+    sll t1, 2
+    add t1, ctx
+    lhu t0, M64K_OFF_DREGS+2(t1)
+    srl t1, opcode, 6                  # destination mode (bits 8:6)
+    andi t1, 7
+    beqz t1, movew_f_dst_dn
+    xori t2, t1, 2
+    beqz t2, movew_f_dst_an
+    xori t2, t1, 3
+    beqz t2, movew_f_dst_anp
+    xori t2, t1, 5
+    beqz t2, movew_f_dst_d16
+    j movew_slow
+
+movew_f_dst_dn:                        # move.w Dn,Dm  (4 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sh t0, M64K_OFF_DREGS+2(t1)
+    move flag_zc, t0                   # !Z = value, C cleared
+    sll flag_nv, t0, 16                # N from bit 15, V cleared
+    use_cycles 4
+    dispatch_next
+
+movew_f_dst_an:                        # move.w Dn,(An)  (8 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 8
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_f_dst_anp:                       # move.w Dn,(An)+  (8 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    xori t2, t1, 7<<2
+    beqz t2, movew_slow                # A7 keeps its word-align quirk generic
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    addiu t2, eaptr32, 2
+    sw t2, M64K_OFF_AREGS(t1)          # writeback before the store, like ea_011
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 8
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_f_dst_d16:                       # move.w Dn,(d16,An)  (12 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movew_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 12
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_fsrc_other:
+    xori t1, t0, 0x28                  # source (d16,An)?
+    beqz t1, movew_fsrc_d16
+    xori t1, t0, 0x38                  # source mode 111?
+    bnez t1, movew_slow
+    andi t1, opcode, 7
+    xori t1, 4                         # submode #imm?
+    bnez t1, movew_slow
+    srl t1, opcode, 6
+    andi t1, 7
+    xori t1, 2                         # only ->(An) is fast for #imm
+    bnez t1, movew_slow
+    srl t1, opcode, 7                  # ---- move.w #imm,(An)  (12 cycles) ----
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    lhu t0, 0(m_pc)                    # immediate word (code stream, cannot fault)
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 12
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_fsrc_d16:                        # ---- move.w (d16,An),Dm  (12 cycles) ----
+    srl t1, opcode, 6
+    andi t1, 7
+    bnez t1, movew_slow                # only ->Dn is fast
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movew_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lhu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sh t0, M64K_OFF_DREGS+2(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 16
+    dispatch_next
+
+movew_slow:
+#else
+OP(movew):
+#endif
     use_cycles 4
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_move_penalty
@@ -2669,6 +2926,117 @@ bsr_exec:
     addu eaptr32, m_pc
     j jsr_exec
 
+#ifdef M64K_FASTPATHS
+# Bcc fast path (hottest opcode class in-match): dispatch directly on the
+# condition field (opcode bits 11:8) through bcc_cctable; each entry tests its
+# condition with the sense baked in and branches straight to bcc_taken /
+# bcc_nottaken. This removes the check_cc call/return pair and the generic
+# invert logic. BSR (cond 1) routes through the same table to its original
+# implementation. Displacement decode and cycle charges are identical to the
+# generic path (not-taken: 8 for the 8-bit form, 12 for the 16-bit form;
+# taken charges 10 in branch_exec). check_cc itself stays: DBcc/Scc use it.
+OP(bcc):
+    .set push
+    .set noreorder
+    srl t0, opcode, 6
+    andi t0, 0x3C
+    lw t0, bcc_cctable(t0)
+    lb t3, -1(m_pc)                    # signed 8-bit displacement (0 => 16-bit follows)
+    jr t0
+    #if M64K_CONFIG_TIMING_ACCURACY >= 0
+     li rmw_cyctable, 8                # not-taken charge for the 8-bit form
+    #else
+     nop
+    #endif
+    .set pop
+
+bcct_hi:                               # HI: C==0 && Z==0
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    bnez t0, bcc_nottaken
+    zx64 t0, flag_zc
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_ls:                               # LS: C==1 || Z==1
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    bnez t0, bcc_taken
+    zx64 t0, flag_zc
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_cc:                               # CC: C==0
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_cs:                               # CS: C==1
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_ne:                               # NE: Z==0
+    zx64 t0, flag_zc
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_eq:                               # EQ: Z==1
+    zx64 t0, flag_zc
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_vc:                               # VC: V==0  (V = bit63(N^V) ^ bit31(N))
+    dsrl t0, flag_nv, 63
+    srl t1, flag_nv, 31
+    xor t0, t1
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_vs:                               # VS: V==1
+    dsrl t0, flag_nv, 63
+    srl t1, flag_nv, 31
+    xor t0, t1
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_pl:                               # PL: N==0
+    srl t0, flag_nv, 31
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_mi:                               # MI: N==1
+    srl t0, flag_nv, 31
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_ge:                               # GE: N==V  (bit63 of flag_nv is N^V)
+    bgez flag_nv, bcc_taken
+    j bcc_nottaken
+bcct_lt:                               # LT: N!=V
+    bltz flag_nv, bcc_taken
+    j bcc_nottaken
+bcct_gt:                               # GT: N==V && Z==0
+    bltz flag_nv, bcc_nottaken
+    zx64 t0, flag_zc
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_le:                               # LE: N!=V || Z==1
+    bltz flag_nv, bcc_taken
+    zx64 t0, flag_zc
+    beqz t0, bcc_taken
+    j bcc_nottaken
+
+bcc_taken:
+    bnez t3, branch_exec               # 8-bit displacement: straight to the branch
+    lh t3, 0(m_pc)                     # 0 => fetch the 16-bit displacement
+    addiu m_pc, 2
+    addiu t3, -2                       # displacement refers to PC before increment
+    j branch_exec
+bcc_nottaken:
+    bnez t3, 1f
+    addiu m_pc, 2                      # skip the unused 16-bit displacement word
+    #if M64K_CONFIG_TIMING_ACCURACY >= 0
+    li rmw_cyctable, 12                # not-taken charge for the 16-bit form
+    #endif
+1:
+    #if M64K_CONFIG_TIMING_ACCURACY >= 0
+    sub m_cycles, rmw_cyctable
+    #endif
+    j main_loop
+#else
 OP(bcc):
     andi t0, opcode, 0xFF00
     beq t0, 0x6100, op_bsr
@@ -2694,6 +3062,7 @@ bcc_exec:
      nop
      #endif
     .set reorder
+#endif
 branch_exec:
     lw eaptr32, pc_diff                # calculate full 32bit branch target (using pc_diff)
     addu eaptr32, t3
@@ -2928,6 +3297,15 @@ OP(scc):
     .section .sdata
 opcctable:
     .long   cc_t, cc_hi, cc_cc, cc_ne, cc_vc, cc_pl, cc_ge, cc_gt
+#ifdef M64K_FASTPATHS
+# Bcc fast-path dispatch: one entry per condition code (opcode bits 11:8),
+# sense baked in. Cond 0 (BRA) is always taken; cond 1 is BSR.
+bcc_cctable:
+    .long   bcc_taken, op_bsr, bcct_hi, bcct_ls
+    .long   bcct_cc,   bcct_cs, bcct_ne, bcct_eq
+    .long   bcct_vc,   bcct_vs, bcct_pl, bcct_mi
+    .long   bcct_ge,   bcct_lt, bcct_gt, bcct_le
+#endif
 
     .text
 ALIGN(check_cc):
