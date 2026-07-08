@@ -131,6 +131,27 @@ DYNA:      .dcb.b 128
     .endm
 
     #############################################################
+    # VMUL16: dst = (s16)x * (s16)y, exact 32-bit product via the
+    # VU multiplier: vmudh places the full product in ACC[47:16],
+    # so ACC_HI = product[31:16] and ACC_MD = product[15:0].
+    # BOTH OPERANDS MUST FIT s16. Clobbers \tmp and $v27-$v29
+    # lane 0. ~10 ops flat vs MULU's ~7 per multiplier bit — the
+    # shift-add loops were roughly half the ADPCM-B chunk cost.
+    #############################################################
+    .macro VMUL16 dst, x, y, tmp
+    mtc2 \x, $v27.e0
+    mtc2 \y, $v28.e0
+    vmudh $v29, $v27, $v28.e0
+    vsar $v29, COP2_ACC_HI
+    vsar $v28, COP2_ACC_MD
+    mfc2 \dst, $v29.e0
+    mfc2 \tmp, $v28.e0
+    sll \dst, 16
+    andi \tmp, 0xFFFF
+    or \dst, \tmp
+    .endm
+
+    #############################################################
     # cmd_adpcm_test - echo/transform self-test
     #   a0: RDRAM source (8-byte aligned)
     #   a1: RDRAM destination (8-byte aligned)
@@ -233,17 +254,8 @@ wpa_in_loop:
 wpa_in_aout:
     lw t1, 16(s1)               # acc (12-bit signed, sign-extended)
     lbu t2, 30(s1)              # vol_mul (small, >= 0)
-    move t0, zero
-    beqz t2, 2f
-    nop
-1:  andi t3, t2, 1
-    subu t3, zero, t3
-    and  t3, t3, t1
-    addu t0, t0, t3
-    srl  t2, t2, 1
-    bnez t2, 1b
-    sll  t1, t1, 1
-2:  lbu t2, 31(s1)              # vol_shift
+    VMUL16 t0, t1, t2, t3
+    lbu t2, 31(s1)              # vol_shift
     srav t0, t0, t2
     srl t0, 2
     sll t0, 2                   # & ~3
@@ -516,19 +528,8 @@ a_have:
     nop
 
     # aout = (acc * vol_mul) >> vol_shift & ~3   (acc is 12-bit signed)
-    move t0, zero
-    move t1, t4
-    move a2, k0
-    beqz a2, 4f
-    nop
-3:  andi t2, a2, 1
-    subu t2, zero, t2
-    and t2, t1
-    addu t0, t2
-    srl a2, 1
-    bnez a2, 3b
-    sll t1, 1
-4:  srav t0, t0, k1
+    VMUL16 t0, t4, k0, t1
+    srav t0, t0, k1
     srl t0, 2
     sll t0, 2                   # & ~3
     move s3, t0
@@ -654,8 +655,7 @@ b_have:
     # acc += BDEC1[data] * adpcmd / 8 (C truncating division), clamp +-32767
     sll t0, t2, 1
     lh t1, %lo(BDEC1)(t0)
-    move s4, t3
-    MULU t0, t1, s4, k1         # t0 = BDEC1[data] * adpcmd (k1 scratch)
+    VMUL16 t0, t1, t3, k1       # BDEC1[data] (s5) * adpcmd (<= 24576)
     sra k1, t0, 31
     andi k1, 7
     addu t0, k1
@@ -675,9 +675,7 @@ b_have:
     # adpcmd = adpcmd * BDEC2[data] / 64, clamp [127, 24576]
     sll t0, t2, 1
     lh t1, %lo(BDEC2)(t0)
-    move s4, t1                 # multiplier = table value (<= 153)
-    move t1, t3                 # multiplicand = adpcmd
-    MULU t0, t1, s4, k1
+    VMUL16 t0, t3, t1, k1       # adpcmd (<= 24576) * table (<= 153)
     srl t3, t0, 6
     li k1, 24576
     slt t0, k1, t3
@@ -693,17 +691,29 @@ b_have:
     nop
 
 b_interp:
-    # adpcml = (((prev<<16) + (acc-prev)*now_step) >> 16) * volume
-    subu t1, t4, s3
-    move s4, t7
-    MULU t0, t1, s4, k1         # (acc-prev)*now_step, exact mod 2^32
-    sll t2, s3, 16
-    addu t0, t2
-    sra t0, 16
-    move t1, t0
-    move s4, k0
-    MULU t0, t1, s4, k1         # * volume
-    move k1, t0                 # adpcml
+    # adpcml = ((prev*(65536-now_step) + acc*now_step) >> 16) * volume
+    # (the C core's own formulation). Both products are s16 * u16 and sum
+    # exactly in the 48-bit ACC (|sum| <= 2^31), so ACC[47:16] IS the
+    # arithmetic >>16 of the s32 sum. now_step==0 short-circuits to prev
+    # (the u16 lane can't hold 65536; prev*65536>>16 == prev exactly).
+    beqz t7, 1f
+    move t0, s3
+    subu t1, zero, t7           # (65536 - step) & 0xFFFF, step in [1,65535]
+    mtc2 s3, $v25.e0            # prev
+    mtc2 t1, $v26.e0            # 65536-step (u16)
+    mtc2 t4, $v27.e0            # acc
+    mtc2 t7, $v28.e0            # step (u16)
+    vmudm $v29, $v25, $v26.e0   # ACC  = prev * (65536-step)   (s16 x u16)
+    vmadm $v29, $v27, $v28.e0   # ACC += acc * step            (s16 x u16)
+    vsar $v29, COP2_ACC_HI
+    vsar $v28, COP2_ACC_MD
+    mfc2 t0, $v29.e0
+    mfc2 t1, $v28.e0
+    sll t0, 16
+    andi t1, 0xFFFF
+    or t0, t1                   # (prev<<16 + (acc-prev)*step) >> 16
+1:
+    VMUL16 k1, t0, k0, t1       # adpcml = interp (s16) * volume (<= 255)
 
     sra t0, k1, 9               # pass-4 fold: dtb[i] >> 9
     and t2, t0, v0
