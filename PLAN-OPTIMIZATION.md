@@ -323,3 +323,26 @@ that silently corrupt on N64 only.
 - **Diagnostics cleanup:** resolve/remove `[CACHE]`/`[PROFILE]`/FPS `debugf`, the
   `mvsmakerom.c:543` idle_skip TODO, and the `roms.c:100` FIXME invalidate comment as each
   owning item lands.
+
+## 2026-07-08 session — whole-pump default + pump reorder: in-fight 35.6 fps
+
+Landed (perf-fps a3c1a3c..b357256, all gated):
+1. Full WP-M2 (RSP-resident ADPCM + cross-pump publish deferral): same-source
+   bucket-matched A/B ~doubles in-fight fps; RSPWP now DEFAULT-ON (WP_OFF=1).
+2. Sprite-layer empty-tile skip (crom bitmap; pixel gate 21/21).
+3. Per-tile [PERF2] split restored (+empty=): exposed that "dense scene"
+   buckets were RSP saturation (tiles ~565 const, rspq 3->76%).
+4. THE REORDER: plat_audio_pump moved to end of emu_render — the audio RSP
+   burst drains under the frame's 68k instead of stalling the next render.
+   rspq bucket -> 2.6-3.6% everywhere. 600s in-fight median 35.6 fps.
+5. SyncPipe dropped from the per-tile sprite RDP stream (hardware-facing).
+6. ADPCM VU multiplies (vmudh/vmudm); verify gate 36864 chunks 0 mismatch.
+
+Method note: NEVER compare unbucketed fight medians across builds — faster
+builds reach different content. analyze-buckets.py (parent dir) buckets by
+[PERF2] spr ticks.
+
+Next walls at 35.6 fps in-fight: m68k ~78% of frame budget, sprite walk
+~12-14%, snd ~62%. The 68k core (m64k throughput/RMW) is the next lever;
+draw-side options: descriptor/TMEM slot rotation to pipeline RDP loads
+(hardware-facing), walk micro-opts.

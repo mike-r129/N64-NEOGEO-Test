@@ -202,3 +202,35 @@ Landed exactly per the addendum, with these concrete choices:
   sample + per dyn field at collect; aout compare skipped for channels
   that END in the chunk, where C freezes a write-time value and the RSP a
   chunk-start recompute — dead state either way).
+
+## The pump-position discovery (2026-07-08, the second big lever)
+
+Measured (600s, same source, RSPWP on vs off, spr-bucket-matched): the
+offload roughly DOUBLED in-fight fps (19.2->35.9 etc). But the restored
+per-tile [PERF2] split then showed tiles/frame ~CONSTANT (~565) across
+"scene density" buckets while the rspq bucket exploded 3% -> 76% — the
+buckets were really RSP-SATURATION buckets: the offload freed the CPU but
+made the RSP the contended resource (~12-16ms of audio per pump), and the
+main loop pumped audio at loop end, ~0.7ms of 68k before the NEXT frame's
+render event issued its draw commands into a queue still full of audio.
+
+Fix: pump the audio at the END of emu_render (right after the frame's
+draw issue). The RSP drains the fast video queue first and chews audio
+under the remaining ~90% of the frame's 68k work. Result: rspq bucket
+2.6-3.6% in ALL buckets, in-fight median 35.6 fps over 600s (n=12127),
+audio starvation back at the WP-off structural baseline.
+
+Also landed the same night: sprite-layer empty-tile skip (crom bitmap,
+pixel-gated 21/21, ~50/565 tiles), per-tile SyncPipe removal from the
+sprite RDP stream (spec-safe; aimed at real hardware — ares barely
+models sync stalls), and VU multipliers for the ADPCM MULU loops
+(vmudh/vmudm + vsar; verify gate green, 36864 chunks 0 mismatch).
+
+Ladder of record (in-fight medians, content-matched): play4-era ~22.9 ->
+play5 29.3 (fix skip) -> WP-off same-source baseline 19.2* -> full WP-M2
+21.6-35.9 by bucket -> +pump reorder 35.6 overall median.
+(*today's baseline runs slower than play5-era measurements at matched
+spr — content/music mix differs across eras; same-day A/B is the truth.)
+
+Remaining walls at 35.6: m68k ~78%, sprite walk ~12-14%, snd ~62%
+(of a 60fps frame budget) — the 68k core is the next big lever.
