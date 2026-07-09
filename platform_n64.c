@@ -222,6 +222,13 @@ static void aring_push(const int16_t *src, int n) {
 
 static int16_t stage[2048 * 2];
 
+#ifdef MVS64_PERFCOUNT
+uint32_t perf_snd_pub;         // publish cost this frame (blocking finish +
+                               // ring copy) = the profile_snd share that is
+                               // NOT sound_gen_samples. Read+reset by emu.c.
+                               // Stays defined without RSPWP (always 0 then).
+#endif
+
 #ifdef MVS64_RSPWP
 // Cross-pump output deferral (full WP-M2, WHOLEPUMP-DESIGN.md addendum).
 // sound_gen_samples() now returns with its tail RSP chunks still in flight;
@@ -242,6 +249,9 @@ static void wp_publish(void) {
     profile_snd += TICKS_DISTANCE(t0, TICKS_READ());
     aring_push(stage, wp_pending_n);
     wp_pending_n = 0;
+#ifdef MVS64_PERFCOUNT
+    perf_snd_pub += TICKS_DISTANCE(t0, TICKS_READ());
+#endif
 }
 #endif
 

@@ -113,26 +113,46 @@ static int z80_wrote;                    // set by z80_out/z80_write = real work
 #ifdef SND_HEALTH
 static unsigned long g_z80_steps, g_z80_skipcyc; static int g_z80_skips;
 #endif
+#ifdef MVS64_Z80HIST
+// Diagnostic: where do the interpreted Z80 steps actually go? 16-byte PC
+// buckets accumulated per step; top buckets reported per [SNDRMS] interval.
+// Also counts stepping segments (timer-boundary re-entries) to price the
+// per-segment cache-reentry cost. Diagnostic builds only (16KB table).
+static uint32_t z80_hist[4096];
+static uint32_t g_z80_segs;
+#endif
 // [SNDPROF] split cost telemetry (N64): where does audio wall-time actually go —
 // stepping the Z80 vs synthesising the YM2610? Reported in the [SNDRMS] line as
 // z80ms/ymms per 60-call interval (TICKS_PER_SECOND/1000 ticks per ms).
 #if defined(SND_HEALTH) && defined(N64)
 static uint32_t g_prof_z80t, g_prof_ymt;
+static uint32_t g_prof_gen;   // whole sound_gen_samples body: genms - z80ms
+                              // - ymms = the unaccounted seam (timer service,
+                              // boundary math, RMS probe, wp ship/sweep)
 #endif
-struct z80snap {
-	uint16_t sp, ix, iy;
-	uint8_t a,b,c,d,e,h,l, a_,b_,c_,d_,e_,h_,l_,f_, i;
-	uint8_t flags, iff;
-};
+// The snapshot runs at EVERY backward-branch edge of every Z80 loop (not
+// just idle spins), so it is on the stepping hot path: pack the exact same
+// fields as before into three u64s composed in registers and compare those
+// directly — no memset/field stores/memcmp. Same captured state = identical
+// skip decisions at identical cycle boundaries (the WAV-locked invariant).
+struct z80snap { uint64_t q0, q1, q2; };
 static inline void z80_snap(struct z80snap *s, const z80 *z) {
-	memset(s, 0, sizeof *s);             // zero padding so memcmp is exact
-	s->sp=z->sp; s->ix=z->ix; s->iy=z->iy;
-	s->a=z->a; s->b=z->b; s->c=z->c; s->d=z->d; s->e=z->e; s->h=z->h; s->l=z->l;
-	s->a_=z->a_; s->b_=z->b_; s->c_=z->c_; s->d_=z->d_;
-	s->e_=z->e_; s->h_=z->h_; s->l_=z->l_; s->f_=z->f_; s->i=z->i;
-	s->flags = (z->sf<<7)|(z->zf<<6)|(z->yf<<5)|(z->hf<<4)|
-	           (z->xf<<3)|(z->pf<<2)|(z->nf<<1)|(z->cf);
-	s->iff = (z->iff1?1:0)|(z->iff2?2:0)|(z->interrupt_mode<<2);
+	s->q0 = (uint64_t)z->sp | ((uint64_t)z->ix << 16) | ((uint64_t)z->iy << 32) |
+	        ((uint64_t)z->a << 48) | ((uint64_t)z->b << 56);
+	s->q1 = (uint64_t)z->c | ((uint64_t)z->d << 8) | ((uint64_t)z->e << 16) |
+	        ((uint64_t)z->h << 24) | ((uint64_t)z->l << 32) |
+	        ((uint64_t)z->a_ << 40) | ((uint64_t)z->b_ << 48) |
+	        ((uint64_t)z->c_ << 56);
+	s->q2 = (uint64_t)z->d_ | ((uint64_t)z->e_ << 8) | ((uint64_t)z->h_ << 16) |
+	        ((uint64_t)z->l_ << 24) | ((uint64_t)z->f_ << 32) |
+	        ((uint64_t)z->i << 40) |
+	        ((uint64_t)(uint8_t)((z->sf<<7)|(z->zf<<6)|(z->yf<<5)|(z->hf<<4)|
+	                             (z->xf<<3)|(z->pf<<2)|(z->nf<<1)|(z->cf)) << 48) |
+	        ((uint64_t)(uint8_t)((z->iff1?1:0)|(z->iff2?2:0)|
+	                             (z->interrupt_mode<<2)) << 56);
+}
+static inline int z80_snap_eq(const struct z80snap *a, const struct z80snap *b) {
+	return a->q0 == b->q0 && a->q1 == b->q1 && a->q2 == b->q2;
 }
 
 // YM2610 stream output (interleaved s16 L/R), filled by YM2610Update_stream().
@@ -233,6 +253,14 @@ static void switchbank(int bank, uint16_t port) {
 }
 
 // --- Z80 bus ---------------------------------------------------------------
+// NOTE (2026-07-09): inlining this map into z80.c's rb/wb (killing the
+// function-pointer call per byte access) was implemented, WAV-verified
+// bit-exact, and MEASURED WORSE on N64: us/Z80-step 3.29 -> 3.62 (+10%),
+// snd +2-4 points, in-fight fps -1..-1.8. The 6-branch decode inlined into
+// hundreds of rb/wb sites across the opcode switch blew the icache, while
+// the callback keeps it in one hot line — same lesson class as the -O3
+// audio regression. The Z80's ~300 host cycles/step is cache behavior, not
+// call overhead. Don't retry inline-bus; attack step count / locality.
 static uint8_t z80_read(void *ud, uint16_t addr) {
 	(void)ud;
 	if (addr < 0x8000) return M_ROM[addr];               // fixed first 32KB
@@ -492,6 +520,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		memset(out, 0, (size_t)nsamples * 2 * sizeof(int16_t));
 		return nsamples;
 	}
+#if defined(SND_HEALTH) && defined(N64)
+	uint32_t _gen_t0 = TICKS_READ();
+#endif
 #ifdef MVS64_SNDTRACE
 	trace_drain();   // flush 68k->Z80 commands + YM key on/off to the log (SD/USB)
 #endif
@@ -515,7 +546,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 	int produced = 0;
 
 	uint16_t last_back = 0xFFFF;        // idle-skip: target of previous back-branch
-	struct z80snap spin_snap;           // registers at last_back last time we hit it
+	struct z80snap spin_snap = {0,0,0}; // registers at last_back last time we hit it
+	                                    // (zero-init only quiets maybe-uninitialized:
+	                                    // every compare is guarded by spin_armed)
 	int spin_armed = 0;                 // snapshot valid + no writes since it taken
 
 	while (cpu.cyc < frame_end) {
@@ -544,6 +577,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #if defined(SND_HEALTH) && defined(N64)
 		uint32_t _zt0 = TICKS_READ();
 #endif
+#ifdef MVS64_Z80HIST
+		if (cpu.cyc < next) g_z80_segs++;
+#endif
 		while (cpu.cyc < next) {
 			z80_service_level_irq();   // must precede the HALT check: a
 			                           // re-delivered tick wakes a halted CPU
@@ -568,6 +604,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #endif
 			uint16_t pc0 = cpu.pc;
 			z80_wrote = 0;
+#ifdef MVS64_Z80HIST
+			z80_hist[cpu.pc >> 4]++;
+#endif
 			z80_step(&cpu);
 #ifdef SND_HEALTH
 			g_z80_steps++;
@@ -582,7 +621,7 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 					// on it), which shifts YM timer phase = audible divergence.
 					// Measured: a >=8-repeat gate broke the byte-identical WAV.
 					struct z80snap now; z80_snap(&now, &cpu);
-					if (spin_armed && memcmp(&now, &spin_snap, sizeof now) == 0) {
+					if (spin_armed && z80_snap_eq(&now, &spin_snap)) {
 #ifdef SND_HEALTH
 						g_z80_skipcyc += (next - cpu.cyc); g_z80_skips++;
 #endif
@@ -648,16 +687,37 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			// re-delivered (each one was a lost music tick before this fix);
 			// nmiw  = command NMIs delivered mid-handler (pre-run cap hit) /
 			//         handlers that outran the completion cap.
-			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu lost=%d t=%d%d irqre=%d nmiw=%d,%d\n",
+			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu genms=%lu lost=%d t=%d%d irqre=%d nmiw=%d,%d\n",
 				rms, pk, cpu.pc, sound_code,
 				g_z80_steps, g_z80_skips, g_z80_skipcyc,
 				(unsigned long)(g_prof_z80t / (TICKS_PER_SECOND / 1000)),
 				(unsigned long)(g_prof_ymt / (TICKS_PER_SECOND / 1000)),
+				(unsigned long)(g_prof_gen / (TICKS_PER_SECOND / 1000)),
 				g_cmd_lost, ym_timer_on[0], ym_timer_on[1],
 				g_irq_redeliver, g_nmi_precap, g_nmi_postcap);
 			plat_log("[SNDTMR] fires=%d,%d\n", g_timer_fires[0], g_timer_fires[1]);
 			g_timer_fires[0] = g_timer_fires[1] = 0;
-			g_prof_z80t = 0; g_prof_ymt = 0;
+#ifdef MVS64_Z80HIST
+			{
+				// Top-12 16-byte PC buckets this interval + segment count.
+				char hb[200]; int hn = 0;
+				hn += snprintf(hb + hn, sizeof hb - (size_t)hn, "segs=%lu",
+				               (unsigned long)g_z80_segs);
+				for (int k = 0; k < 12 && hn < (int)sizeof hb - 16; k++) {
+					uint32_t best = 0; int bi = -1;
+					for (int j = 0; j < 4096; j++)
+						if (z80_hist[j] > best) { best = z80_hist[j]; bi = j; }
+					if (bi < 0 || !best) break;
+					hn += snprintf(hb + hn, sizeof hb - (size_t)hn,
+					               " %03x0=%lu", bi, (unsigned long)best);
+					z80_hist[bi] = 0;   // consumed (rest cleared below)
+				}
+				plat_log("[Z80HIST] %s\n", hb);
+				memset(z80_hist, 0, sizeof z80_hist);
+				g_z80_segs = 0;
+			}
+#endif
+			g_prof_z80t = 0; g_prof_ymt = 0; g_prof_gen = 0;
 			{
 				// Latched-voice hunt: snapshot every tone-holding state element
 				// (SSG regs, FM key/EG state, ADPCM activity). A channel that
@@ -688,6 +748,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			g_z80_steps = 0; g_z80_skipcyc = 0; g_z80_skips = 0;
 		}
 	}
+#endif
+#if defined(SND_HEALTH) && defined(N64)
+	g_prof_gen += TICKS_DISTANCE(_gen_t0, TICKS_READ());
 #endif
 	return nsamples;
 }

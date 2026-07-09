@@ -551,16 +551,19 @@ int main(int argc, char *argv[]) {
 			// units to stay integer: 100.00% == 10000).
 			extern uint32_t perf_m68k_insns, perf_idle_skips, perf_tlb_faults;
 			extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+			extern uint32_t perf_snd_pub;
 			const uint32_t fb = TICKS_PER_SECOND / 60 / 10000;  // ticks per 0.01%
-			framef("[PERF] insns=%lu skips=%lu tlb=%lu dwait=%lu dissue=%lu dend=%lu\n",
+			framef("[PERF] insns=%lu skips=%lu tlb=%lu dwait=%lu dissue=%lu dend=%lu pub=%lu\n",
 				(unsigned long)perf_m68k_insns,
 				(unsigned long)perf_idle_skips,
 				(unsigned long)perf_tlb_faults,
 				(unsigned long)(perf_draw_wait / fb),
 				(unsigned long)(perf_draw_issue / fb),
-				(unsigned long)(perf_draw_end / fb));
+				(unsigned long)(perf_draw_end / fb),
+				(unsigned long)(perf_snd_pub / fb));
 			perf_m68k_insns = perf_idle_skips = perf_tlb_faults = 0;
 			perf_draw_wait = perf_draw_issue = perf_draw_end = 0;
+			perf_snd_pub = 0;
 
 			// DRAW-1 fine split of the draw-issue bucket (video.c): phase
 			// ticks (same 0.01%-of-frame units) + per-frame draw counts.
