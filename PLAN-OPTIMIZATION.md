@@ -1,5 +1,39 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## ⚖ Z80/SND PASS CLOSED WITH MEASUREMENT (2026-07-09) — the interpreter is at its floor
+
+**The sound bucket's books now balance exactly** (genms/[SNDRMS] + pub/[PERF]
+instrumentation, 19736a3): in-fight profile_snd = **60% Z80 stepping (~5.7ms/frame,
+~13% of ALL wall) + 31% YM emit (SSG+mix+copy+WP glue) + ~9% seams/publish**. The Z80
+is the single biggest remaining CPU cost after m68k. Steps are REAL driver work:
+MVS64_Z80HIST shows ~92-133k steps/interval across ~10 music-engine regions at
+~300-430 steps per timer segment (only ~5k/interval is spin-detector re-arm at the
+0x0130 idle loop, which is semantics-locked — the skip must fire at the same cycle
+boundary or the WAV diverges).
+
+Three experiments, all WAV-gated (3600-frame deterministic PC run, byte-identical):
+- ❌ **Inline bus** (kill the read_byte/write_byte indirect call per access):
+  bit-exact but MEASURED WORSE — us/step 3.29→3.62 (+10%), fps −1..−1.8. Inlining
+  the 6-branch map into hundreds of rb/wb switch sites blew the icache; the callback
+  keeps the decode in one hot line. Reverted; documented in z80_read's comment.
+- ❌ **-Os on z80.c only** (Z80_OS=1 knob): text 39KB→23KB (−40%) but us/step and
+  bucket-matched fps FLAT. Not switch-footprint-bound either.
+- ✅ **Spin-snapshot repack** (three u64s composed in registers vs memset+memcmp on
+  every backward-branch edge): kept — WAV-identical, +0.1..+0.8 fps in all buckets
+  (noise-level-positive), smaller hot loop.
+
+**Verdict: ~3.4us/Z80-step (in-fight ~5.3) is the interpreter's practical floor on
+this CPU** — not call overhead, not icache footprint, struct already ~3 hot dcache
+lines. A step-change needs structural work (threaded-code/JIT Z80 — a large project
+with WAV risk). The YM half (~2.9ms/frame: ssg 55 + mix 59 + fm-glue 70 + eg 11 per
+interval) is a set of ~0.5ms candidates, none dominant.
+
+**Remaining walls, re-ranked by measured size:** (1) m68k ~65-78% of budget
+(~11ms/frame at ~73 host cyc/insn — stall floor, hot forms drained); (2) Z80 ~5.7ms
+(floor, above); (3) draw ~5ms in fights — **sprite walk 12-19% is the biggest
+tractable target: walk-on-RSP ucode project**; (4) YM emit ~2.9ms (diffuse);
+(5) TMEM slot rotation (hardware-facing, can't gate in ares).
+
 ## ✅ M64K FAST PATHS LANDED (2026-07-08 day session) — rank 4 finally paid, in the RSP era
 
 **Measure-first result that unblocked the work:** a per-frame least-squares fit of the

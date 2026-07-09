@@ -88,6 +88,16 @@ $(BUILD_DIR)/ym2610/ym2610.o: CFLAGS += -Os
 $(BUILD_DIR)/z80.o: CFLAGS += -Os
 $(BUILD_DIR)/sound_neogeo.o: CFLAGS += -Os
 endif
+# Z80-core-only -Os (Z80_OS=1): MEASURED FLAT (2026-07-09). Text shrank 40%
+# (39KB->23KB) but us/Z80-step 3.37->3.42 and bucket-matched fps identical —
+# the interpreter's per-step cost is not switch-footprint-bound either (the
+# inline-bus experiment already ruled out callback overhead; struct layout is
+# already 3 hot dcache lines). Z80 stepping (~60% of snd, ~5.7ms/frame) is at
+# its practical interpreter floor; the next lever there is structural.
+# Knob kept off-by-default for reproducing the measurement.
+ifdef Z80_OS
+$(BUILD_DIR)/z80.o: CFLAGS += -Os
+endif
 # Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
 # (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
 ASFLAGS += $(EXTRA_DEFINES)
