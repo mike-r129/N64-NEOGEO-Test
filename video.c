@@ -93,14 +93,38 @@ static void render_fix(void) {
 }
 
 
-static void render_sprites(void) {
+// --- sprite walk: produce/consume split -----------------------------------
+// The SCB walk produces a flat list of visible-tile records; the consume
+// pass turns records into draw calls. The split is what lets the walk move
+// to the RSP on N64 (cmd_sprite_walk in rsp_video.S produces the same list):
+// the C producer below is the bit-exact reference, and the ucode is gated
+// against it record-by-record (MVS64_WALKDBG dual-compute). Record fields
+// carry exactly what draw_sprite needs; positions keep only the low 12 bits,
+// which is lossless: both draw paths reduce positions mod 512 (PC) or to a
+// 12-bit signed field (RSP), and sx/ssy never carry information above that.
+typedef struct {
+	uint32_t w0;   // tnum[0..19] | palnum[20..27] | flipx[28] | flipy[29]
+	uint32_t w1;   // sx[0..11] | ssy[12..23] | (sw-1)[24..27] | (ssh-1)[28..31]
+} SprWalkRec;
+
+// ~7x the observed in-fight maximum (~600 tiles). Overflowing content is
+// walked correctly but its excess records are dropped (logged), so pixels
+// would differ from the old direct-draw path only in that case.
+#define SPRWALK_MAX_RECS  4096
+static SprWalkRec sprwalk_recs[SPRWALK_MAX_RECS] __attribute__((aligned(16)));
+static int sprwalk_overflow;   // records dropped this frame (diagnostic)
+
+// Bit-exact reference walk: same SCB reads, same vshrink math, same culls,
+// same order as the historical direct-draw loop.
+static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	int sx = 0, sy = 0, sh = 0, sw = 0, vshrink = 0;
 	bool repeat_tiles = false;
+	int nrec = 0;
 
 	uint8_t aa;
 	bool aa_enabled = lspc_get_auto_animation(&aa);
 
-	render_begin_sprites();
+	sprwalk_overflow = 0;
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -199,38 +223,71 @@ static void render_sprites(void) {
 
 						// debugf("[VIDEO]   %s: nt:%d y:%d ssy:%d ssh:%d tnum:%x\n", half?"bot":"top", nt, y, ssy, ssh, tnum);
 
-						// Auto animation
-						if (aa_enabled) {
-							if (tc & 8)      { tnum &= ~7; tnum |= aa & 7; }
-							else if (tc & 4) { tnum &= ~3; tnum |= aa & 3; }
-						}
+					// Auto animation
+					if (aa_enabled) {
+						if (tc & 8)      { tnum &= ~7; tnum |= aa & 7; }
+						else if (tc & 4) { tnum &= ~3; tnum |= aa & 3; }
+					}
 
-						// Skip tiles known to decode to all-transparent
-						// pixels — the sprite-layer analogue of the fix
-						// skip above (ROM-stable fact, learned on first
-						// fetch; pixel-identical by construction: index-0
-						// pixels never pass the alpha compare).
-						if (crom_tile_empty(tnum)) {
-#ifdef DRAW_PERF
-							perf_dr_empty++;
-#endif
-						} else
-						// Draw the tile
-						draw_sprite(tnum, palnum, sx, ssy, sw, ssh, tc&1, tc&2);
+					// Emit the record the consume pass will draw.
+					if (nrec < maxrecs) {
+						recs[nrec].w0 = tnum | (palnum << 20)
+						              | ((tc & 1) << 28) | ((tc & 2) << 28);
+						recs[nrec].w1 = (sx & 0xFFF) | ((ssy & 0xFFF) << 12)
+						              | ((sw-1) << 24) | ((ssh-1) << 28);
+						nrec++;
+					} else {
+						sprwalk_overflow++;
 					}
 				}
-
-				y += ssh;
-				nt++; nt &= 31;
-
-				// In non-repeat mode (standard), the top half
-				// finishes when/if we reach tile #16 (or before, if
-				// the vertical sprite size is reached).
-				if (!repeat_tiles && nt == 16) break;  // FIXME: draw overfill when not repeating
 			}
+
+			y += ssh;
+			nt++; nt &= 31;
+
+			// In non-repeat mode (standard), the top half
+			// finishes when/if we reach tile #16 (or before, if
+			// the vertical sprite size is reached).
+			if (!repeat_tiles && nt == 16) break;  // FIXME: draw overfill when not repeating
 		}
 	}
+}
 
+	if (sprwalk_overflow)
+		debugf("[VIDEO] sprite walk overflow: %d records dropped\n", sprwalk_overflow);
+	return nrec;
+}
+
+// Consume pass: identical tail of the historical loop — empty-tile skip,
+// then draw_sprite, in record order (cache side effects unchanged).
+static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
+	for (int i=0;i<nrec;i++) {
+		uint32_t w0 = recs[i].w0, w1 = recs[i].w1;
+		uint32_t tnum = w0 & 0xFFFFF;
+
+		// Skip tiles known to decode to all-transparent
+		// pixels — the sprite-layer analogue of the fix
+		// skip above (ROM-stable fact, learned on first
+		// fetch; pixel-identical by construction: index-0
+		// pixels never pass the alpha compare).
+		if (crom_tile_empty(tnum)) {
+#ifdef DRAW_PERF
+			perf_dr_empty++;
+#endif
+			continue;
+		}
+
+		draw_sprite(tnum, (w0 >> 20) & 0xFF,
+		            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
+		            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
+		            w0 & (1 << 28), w0 & (1 << 29));
+	}
+}
+
+static void render_sprites(void) {
+	render_begin_sprites();
+	int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
+	sprite_walk_consume(sprwalk_recs, nrec);
 	render_end_sprites();
 }
 
