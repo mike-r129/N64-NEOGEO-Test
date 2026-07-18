@@ -12,6 +12,7 @@
         RSPQ_DefineCommand cmd_sprite_draw, 12 # 0x2
         RSPQ_DefineCommand cmd_pal_convert, 8  # 0x3
         RSPQ_DefineCommand cmd_sprite_begin, 4 # 0x4
+        RSPQ_DefineCommand cmd_sprite_walk, 12 # 0x5
 	RSPQ_EndOverlayHeader
 
 RSPQ_BeginSavedState
@@ -650,6 +651,368 @@ sprite_draw:
 
     .endfunc
 
+
+
+#########################################################################
+# SPRITE WALK (SCB -> visible-tile record list)
+#########################################################################
+#
+# cmd_sprite_walk ports sprite_walk_produce() (video.c) bit-exactly: it
+# walks the 381-sprite SCB + tilemaps out of the emulated VRAM (writeback'd
+# by the CPU before the kick), applies the same chaining / vshrink / cull /
+# auto-animation math, and emits the same 8-byte SprWalkRec records the C
+# producer would, in the same order. No pixel pointers, no palette work:
+# the CPU consume pass is unchanged. Gated by the MVS64_WALKDBG
+# dual-compute build (C and RSP lists compared per frame).
+#
+# DMEM budget note: the 2KB tilemap staging shares PAL_BUFFER (pal_convert
+# and the walk never overlap — FIFO command order). Everything else is
+# dedicated: 96B SCB group, 512B list staging, 32B magic, ~40B state.
+#
+# Command: 0x5, 12 bytes
+#   a0 (word0, cmd byte in top): VRAM physical base
+#   a1: record list RDRAM physical base
+#   a2: aa byte [0..7] | aa_enabled [8] | maxrecs [16..28]
+# Trailer written at list + maxrecs*8: {u32 nrec, u32 ovfl}.
+
+    .data
+    .align 4
+WALK_MAGIC:   # copy of VSHRINK_MAGIC (video.c)
+    .byte 1, 9, 5, 13, 3, 11, 7, 15, 0, 8, 4, 12, 2, 10, 6, 14
+    .byte 14, 6, 10, 2, 12, 4, 8, 0, 15, 7, 11, 3, 13, 5, 9, 1
+
+    .bss
+    .align 4
+WALK_SCB:     .dcb.b 96        # one 16-sprite group: z[32] y[32] x[32]
+WALK_LIST:    .dcb.b 512       # 64-record staging
+WALK_TRAILER: .dcb.b 8
+    .align 2
+WALK_VRAM:    .dcb.b 4         # VRAM phys base
+WALK_LBASE:   .dcb.b 4         # list RDRAM base
+WALK_LCUR:    .dcb.b 4         # current flush phys
+WALK_FILL:    .dcb.b 4         # bytes staged in WALK_LIST
+WALK_NREC:    .dcb.b 4
+WALK_OVFL:    .dcb.b 4
+WALK_MAX:     .dcb.b 4
+
+    .text
+
+    # Register map (DMAIn/DMAOut clobber only t2/at; args in s0/s4/t0):
+    #   v0 = group (0..23)      v1 = sprite-in-group (0..15)
+    #   s1 = VRAM phys          s2/s3 = free (unused)
+    #   s5 = sx   s6 = sy   s7 = sh   s8 = sw
+    #   k0 = vshrink   k1 = repeat_tiles
+    #   a2 = half flag   a3 = aa | aa_en<<8
+    #   t3 = y   t4 = nt   t5 = maxy   t7 = ssh (per iteration)
+    #   t6/t8/t9/t0/t1 = scratch
+    .func cmd_sprite_walk
+cmd_sprite_walk:
+    sll a0, 8                    # strip the rspq command byte from arg word 0
+    srl a0, 8
+    sw a0, %lo(WALK_VRAM)
+    sw a1, %lo(WALK_LBASE)
+    sw a1, %lo(WALK_LCUR)
+    sw zero, %lo(WALK_FILL)
+    sw zero, %lo(WALK_NREC)
+    sw zero, %lo(WALK_OVFL)
+    andi a3, a2, 0x1FF           # aa | aa_en<<8
+    srl t0, a2, 16
+    sw t0, %lo(WALK_MAX)
+
+    li v0, 0                     # group index
+walk_group:
+    # --- DMA this group's SCB (3 x 32B) and tilemaps (2048B) ---
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 5                # g*32
+    addu s0, s1, t4
+    li t5, 0x10000               # SCB z at word 0x8000
+    addu s0, s0, t5
+    li s4, %lo(WALK_SCB)
+    jal DMAIn
+    li t0, DMA_SIZE(32, 1)
+
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 5
+    addu s0, s1, t4
+    li t5, 0x10400               # SCB y at word 0x8200
+    addu s0, s0, t5
+    li s4, %lo(WALK_SCB) + 32
+    jal DMAIn
+    li t0, DMA_SIZE(32, 1)
+
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 5
+    addu s0, s1, t4
+    li t5, 0x10800               # SCB x at word 0x8400
+    addu s0, s0, t5
+    li s4, %lo(WALK_SCB) + 64
+    jal DMAIn
+    li t0, DMA_SIZE(32, 1)
+
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 11               # g*2048
+    addu s0, s1, t4
+    li s4, %lo(PAL_BUFFER)
+    jal DMAIn
+    li t0, DMA_SIZE(2048, 1)
+
+    li v1, 0                     # sprite-in-group
+walk_sprite:
+    sll t4, v0, 4
+    addu t4, t4, v1              # snum
+    li t5, 381
+    beq t4, t5, walk_group_next
+    nop
+    sll t4, v1, 1
+    addiu t5, t4, %lo(WALK_SCB)
+    lhu t6, 0(t5)                # zc
+    lhu t7, 32(t5)               # yc
+    lhu t8, 64(t5)               # xc
+
+    andi t9, t7, 0x40
+    bnez t9, walk_chain
+    nop
+    # fresh sprite: sx/sy/sh/vshrink/repeat from SCB
+    srl s5, t8, 7                # sx = xc>>7
+    srl s6, t7, 7
+    li t9, 496
+    subu s6, t9, s6              # sy = 496 - (yc>>7)
+    andi s7, t7, 0x3F
+    sll s7, s7, 4                # sh = (yc&0x3F)*16
+    li k1, 0                     # repeat = false
+    li t9, 512
+    slt t9, t9, s7               # sh > 512 ?
+    beqz t9, 1f
+    nop
+    li s7, 512
+    li k1, 1                     # repeat = true
+1:  andi k0, t6, 0xFF            # vshrink
+    b walk_scb_done
+    nop
+walk_chain:
+    addu s5, s5, s8              # sx += sw (previous sprite's sw)
+walk_scb_done:
+    srl s8, t6, 8
+    andi s8, s8, 0xF
+    addiu s8, s8, 1              # sw = ((zc>>8)&0xF)+1
+
+    beqz s7, walk_next_sprite    # sh == 0
+    nop
+    slti t9, s5, 320
+    bnez t9, walk_chk_y          # sx < 320: not x-skipped
+    nop
+    addu t9, s5, s8
+    slti t9, t9, 513
+    bnez t9, walk_next_sprite    # sx >= 320 && sx+sw <= 512: skip
+    nop
+walk_chk_y:
+    slti t9, s6, 224
+    bnez t9, walk_visible        # sy < 224: cannot Y-cull
+    nop
+    addu t9, s6, s7
+    slti t9, t9, 513
+    bnez t9, walk_next_sprite    # sy >= 224 && sy+sh <= 512: skip
+    nop
+walk_visible:
+    li t3, 0                     # y = 0
+    li t4, 0                     # nt = 0
+    li a2, 0                     # half = 0
+    # maxy = min(sh, 256)
+    li t5, 256
+    slti t9, s7, 256
+    beqz t9, walk_tile_loop
+    nop
+    move t5, s7
+
+walk_tile_loop:
+    slt t9, t3, t5               # while (y < maxy)
+    beqz t9, walk_half_end
+    nop
+    # ssh = (vs+1)>>4 + (((vs+1)&15) > MAGIC[nt])
+    addiu t6, k0, 1
+    srl t7, t6, 4
+    andi t6, t6, 15
+    addiu t8, t4, %lo(WALK_MAGIC)
+    lbu t8, 0(t8)
+    slt t6, t8, t6
+    addu t7, t7, t6              # t7 = ssh
+    beqz t7, walk_advance        # ssh == 0: no draw, no clip
+    nop
+    # clip: when y + ssh > sh, ssh becomes sh - y
+    addu t6, t3, t7
+    slt t6, s7, t6
+    beqz t6, 2f
+    nop
+    subu t7, s7, t3
+2:
+    # ssy = sy + y; visible if ssy < 224 || ssy+ssh > 512
+    addu t6, s6, t3
+    slti t8, t6, 224
+    bnez t8, walk_emit
+    nop
+    addu t8, t6, t7
+    slti t8, t8, 513
+    bnez t8, walk_advance
+    nop
+walk_emit:
+    # tmap fetch: PAL_BUFFER + i*128 + nt*4
+    sll t6, v1, 7
+    sll t8, t4, 2
+    addu t6, t6, t8
+    addiu t6, t6, %lo(PAL_BUFFER)
+    lhu t9, 0(t6)                # tnum (low 16)
+    lhu t8, 2(t6)                # tc
+    srl t6, t8, 4                # tnum |= ((tc>>4)&0xF)<<16
+    andi t6, t6, 0xF
+    sll t6, t6, 16
+    or t9, t9, t6
+    # auto animation (a3 = aa | aa_en<<8)
+    andi t6, a3, 0x100
+    beqz t6, 4f
+    nop
+    andi t6, t8, 8
+    beqz t6, 3f
+    nop
+    addi t6, zero, -8
+    and t9, t9, t6               # tnum &= ~7
+    andi t6, a3, 7
+    or t9, t9, t6                # tnum |= aa & 7
+    b 4f
+    nop
+3:  andi t6, t8, 4
+    beqz t6, 4f
+    nop
+    addi t6, zero, -4
+    and t9, t9, t6               # tnum &= ~3
+    andi t6, a3, 3
+    or t9, t9, t6                # tnum |= aa & 3
+4:
+    # w0 = tnum | palnum<<20 | (tc&1)<<28 | (tc&2)<<28
+    srl t6, t8, 8
+    andi t6, t6, 0xFF
+    sll t6, t6, 20
+    or t9, t9, t6
+    andi t6, t8, 1
+    sll t6, t6, 28
+    or t9, t9, t6
+    andi t6, t8, 2
+    sll t6, t6, 28               # bit 29
+    or t9, t9, t6                # t9 = w0
+    # w1 = (sx&0xFFF) | (ssy&0xFFF)<<12 | (sw-1)<<24 | (ssh-1)<<28
+    addu t6, s6, t3              # ssy
+    andi t6, t6, 0xFFF
+    sll t6, t6, 12
+    andi t8, s5, 0xFFF
+    or t6, t6, t8
+    addiu t8, s8, -1
+    sll t8, t8, 24
+    or t6, t6, t8
+    addiu t8, t7, -1
+    sll t8, t8, 28
+    or t6, t6, t8                # t6 = w1
+    # capacity check
+    lw t8, %lo(WALK_NREC)
+    lw t0, %lo(WALK_MAX)
+    slt t0, t8, t0
+    beqz t0, walk_over
+    nop
+    lw t0, %lo(WALK_FILL)
+    addiu t1, t0, %lo(WALK_LIST)
+    sw t9, 0(t1)
+    sw t6, 4(t1)
+    addiu t0, t0, 8
+    sw t0, %lo(WALK_FILL)
+    addiu t8, t8, 1
+    sw t8, %lo(WALK_NREC)
+    li t1, 512
+    bne t0, t1, walk_advance     # staging not full yet
+    nop
+    # flush 512B of records
+    lw s0, %lo(WALK_LCUR)
+    li s4, %lo(WALK_LIST)
+    jal DMAOut
+    li t0, DMA_SIZE(512, 1)
+    lw t0, %lo(WALK_LCUR)
+    addiu t0, t0, 512
+    sw t0, %lo(WALK_LCUR)
+    sw zero, %lo(WALK_FILL)
+    b walk_advance
+    nop
+walk_over:
+    lw t0, %lo(WALK_OVFL)
+    addiu t0, t0, 1
+    sw t0, %lo(WALK_OVFL)
+walk_advance:
+    addu t3, t3, t7              # y += ssh
+    addiu t4, t4, 1
+    andi t4, t4, 31              # nt = (nt+1) & 31
+    bnez k1, walk_tile_loop      # repeat: no nt==16 break
+    nop
+    li t6, 16
+    beq t4, t6, walk_half_end    # non-repeat: break at tile #16
+    nop
+    b walk_tile_loop
+    nop
+walk_half_end:
+    li t6, 256
+    slt t6, t6, s7               # sh > 256 ?
+    beqz t6, walk_next_sprite
+    nop
+    bnez a2, walk_next_sprite    # second half already done
+    nop
+    li a2, 1                     # half = 1
+    move t5, s7                  # maxy = sh
+    beqz k1, walk_h1_norep
+    nop
+    # repeat: y -= (y-256)*2 ; nt = (32-nt) & 31
+    addiu t6, t3, -256
+    sll t6, t6, 1
+    subu t3, t3, t6
+    li t6, 32
+    subu t4, t6, t4
+    andi t4, t4, 31
+    b walk_tile_loop
+    nop
+walk_h1_norep:
+    li t6, 512
+    subu t3, t6, t3              # y = 512 - y
+    b walk_tile_loop
+    nop
+walk_next_sprite:
+    addiu v1, v1, 1
+    li t6, 16
+    bne v1, t6, walk_sprite
+    nop
+walk_group_next:
+    addiu v0, v0, 1
+    li t6, 24
+    bne v0, t6, walk_group
+    nop
+
+    # final partial flush (fill is a multiple of 8)
+    lw t0, %lo(WALK_FILL)
+    beqz t0, walk_trailer
+    nop
+    lw s0, %lo(WALK_LCUR)
+    li s4, %lo(WALK_LIST)
+    jal DMAOut
+    addiu t0, t0, -1             # DMA_SIZE(fill, 1)
+walk_trailer:
+    lw t0, %lo(WALK_NREC)
+    sw t0, %lo(WALK_TRAILER)
+    lw t0, %lo(WALK_OVFL)
+    sw t0, %lo(WALK_TRAILER) + 4
+    lw t0, %lo(WALK_MAX)
+    sll t0, t0, 3
+    lw s0, %lo(WALK_LBASE)
+    addu s0, s0, t0              # trailer at list + maxrecs*8
+    li s4, %lo(WALK_TRAILER)
+    jal DMAOut
+    li t0, DMA_SIZE(8, 1)
+
+    j RSPQ_Loop
+    nop
+    .endfunc
 
 
 #include <rsp_rdpq.inc>

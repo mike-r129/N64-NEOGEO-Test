@@ -31,7 +31,7 @@ uint8_t WORK_RAM[64*1024] ALIGN_64K;
 uint8_t BACKUP_RAM[64*1024] ALIGN_64K;
 uint8_t MEMCARD_RAM[64*1024] ALIGN_64K;   // 68k bank 0x8 (memory card); open-bus 0xFF = no card
 uint16_t PALETTE_RAM[8*1024];  // two banks
-uint16_t VIDEO_RAM[34*1024];
+uint16_t VIDEO_RAM[34*1024] __attribute__((aligned(16)));  // RSP sprite-walk DMA source
 
 int PALETTE_RAM_BANK;
 

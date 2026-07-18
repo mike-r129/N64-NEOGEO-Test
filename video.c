@@ -57,8 +57,33 @@ uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
 uint32_t perf_dr_cache, perf_dr_rspq;
 uint32_t perf_dr_tiles, perf_dr_cells;
 uint32_t perf_dr_empty;   /* sprite tiles skipped as known-empty */
+uint32_t perf_dr_wwait;   /* RSP sprite walk: CPU time blocked in rspq_wait */
 #define DRAW_PERF 1
 #endif
+
+// --- sprite walk: produce/consume split -----------------------------------
+// The SCB walk produces a flat list of visible-tile records; the consume
+// pass turns records into draw calls. The split is what lets the walk move
+// to the RSP on N64 (cmd_sprite_walk in rsp_video.S produces the same list):
+// the C producer below is the bit-exact reference, and the ucode is gated
+// against it record-by-record (MVS64_WALKDBG dual-compute). Record fields
+// carry exactly what draw_sprite needs; positions keep only the low 12 bits,
+// which is lossless: both draw paths reduce positions mod 512 (PC) or to a
+// 12-bit signed field (RSP), and sx/ssy never carry information above that.
+typedef struct {
+	uint32_t w0;   // tnum[0..19] | palnum[20..27] | flipx[28] | flipy[29]
+	uint32_t w1;   // sx[0..11] | ssy[12..23] | (sw-1)[24..27] | (ssh-1)[28..31]
+} SprWalkRec;
+
+// ~7x the observed in-fight maximum (~600 tiles). Overflowing content is
+// walked correctly but its excess records are dropped (logged), so pixels
+// would differ from the old direct-draw path only in that case.
+#define SPRWALK_MAX_RECS  4096
+// +2 records: the RSP walk writes its {nrec, ovfl} trailer at list+maxrecs*8
+// (sprite_walk_produce_rsp) — keep it inside the object for -Warray-bounds.
+static SprWalkRec sprwalk_recs[SPRWALK_MAX_RECS + 2] __attribute__((aligned(16)));
+static int sprwalk_overflow;   // records dropped this frame (diagnostic)
+static int sprwalk_rsp_ovfl;   // overflow count reported by the RSP walk
 
 #ifdef N64
 	#if 1
@@ -92,27 +117,6 @@ static void render_fix(void) {
 	render_end_fix();
 }
 
-
-// --- sprite walk: produce/consume split -----------------------------------
-// The SCB walk produces a flat list of visible-tile records; the consume
-// pass turns records into draw calls. The split is what lets the walk move
-// to the RSP on N64 (cmd_sprite_walk in rsp_video.S produces the same list):
-// the C producer below is the bit-exact reference, and the ucode is gated
-// against it record-by-record (MVS64_WALKDBG dual-compute). Record fields
-// carry exactly what draw_sprite needs; positions keep only the low 12 bits,
-// which is lossless: both draw paths reduce positions mod 512 (PC) or to a
-// 12-bit signed field (RSP), and sx/ssy never carry information above that.
-typedef struct {
-	uint32_t w0;   // tnum[0..19] | palnum[20..27] | flipx[28] | flipy[29]
-	uint32_t w1;   // sx[0..11] | ssy[12..23] | (sw-1)[24..27] | (ssh-1)[28..31]
-} SprWalkRec;
-
-// ~7x the observed in-fight maximum (~600 tiles). Overflowing content is
-// walked correctly but its excess records are dropped (logged), so pixels
-// would differ from the old direct-draw path only in that case.
-#define SPRWALK_MAX_RECS  4096
-static SprWalkRec sprwalk_recs[SPRWALK_MAX_RECS] __attribute__((aligned(16)));
-static int sprwalk_overflow;   // records dropped this frame (diagnostic)
 
 // Bit-exact reference walk: same SCB reads, same vshrink math, same culls,
 // same order as the historical direct-draw loop.
@@ -285,9 +289,45 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 }
 
 static void render_sprites(void) {
+	uint8_t aa;
+	bool aa_enabled = lspc_get_auto_animation(&aa);
 	render_begin_sprites();
+#if defined(N64) && !defined(MVS64_WALK_CPU)
+	// The walk runs on the RSP (cmd_sprite_walk, rsp_video.S); the CPU only
+	// consumes the record list. MVS64_WALK_CPU=1 reverts to the C walk.
+	int nrec = sprite_walk_produce_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa, aa_enabled);
+	#ifdef MVS64_WALKDBG
+	// Dual-compute gate: the C walk is authoritative; compare record lists
+	// per frame and log any divergence (see rsp_audio's VERIFY pattern).
+	{
+		static SprWalkRec recs_c[SPRWALK_MAX_RECS];
+		static uint32_t walkdbg_frames;
+		int rsp_ovfl = sprwalk_rsp_ovfl;
+		int nc = sprite_walk_produce(recs_c, SPRWALK_MAX_RECS);
+		if (nc != nrec || memcmp(recs_c, sprwalk_recs, nc * sizeof(SprWalkRec)) != 0
+		    || rsp_ovfl != sprwalk_overflow) {
+			debugf("[WALKDBG] MISMATCH frame=%lu nrec=%d nc=%d ovfl=%d/%d\n",
+				(unsigned long)walkdbg_frames, nrec, nc, rsp_ovfl, sprwalk_overflow);
+			for (int i=0; i<nc && i<nrec; i++) {
+				if (recs_c[i].w0 != sprwalk_recs[i].w0 || recs_c[i].w1 != sprwalk_recs[i].w1) {
+					debugf("[WALKDBG] first diff @%d: rsp %08lx/%08lx vs c %08lx/%08lx\n", i,
+						(unsigned long)sprwalk_recs[i].w0, (unsigned long)sprwalk_recs[i].w1,
+						(unsigned long)recs_c[i].w0, (unsigned long)recs_c[i].w1);
+					break;
+				}
+			}
+		}
+		if (++walkdbg_frames % 600 == 0)
+			debugf("[WALKDBG] %lu frames checked OK\n", (unsigned long)walkdbg_frames);
+		sprite_walk_consume(recs_c, nc);
+	}
+	#else
+	sprite_walk_consume(sprwalk_recs, nrec);
+	#endif
+#else
 	int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
 	sprite_walk_consume(sprwalk_recs, nrec);
+#endif
 	render_end_sprites();
 }
 

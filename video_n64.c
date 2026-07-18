@@ -27,6 +27,41 @@ static void rsp_sprite_begin(uint16_t *palette_ram) {
 	rspq_write(RSP_OVL_ID, 0x4, PhysicalAddr(palette_ram));
 }
 
+// Produce the visible-tile record list on the RSP (cmd_sprite_walk). The
+// ucode DMAs the SCB + sprite tilemaps out of the emulated VRAM, so those
+// regions are written back first; the returned count comes from the trailer
+// the ucode DMAs last (rspq_wait ⇒ the whole command is done, DMAs included).
+static int sprite_walk_produce_rsp(SprWalkRec *list, int maxrecs, uint8_t aa, bool aa_en) {
+#ifdef MVS64_WALKDBG
+	debugf("[W] kick\n");
+#endif
+	data_cache_hit_writeback(VIDEO_RAM, 0xBE80);                     // sprite tilemaps
+	data_cache_hit_writeback((uint8_t*)VIDEO_RAM + 0x10000, 0xC00);  // SCB
+	rspq_write(RSP_OVL_ID, 0x5, PhysicalAddr(VIDEO_RAM), PhysicalAddr(list),
+	           (maxrecs << 16) | (aa_en ? 0x100 : 0) | aa);
+	rspq_flush();
+#ifdef DRAW_PERF
+	uint32_t _w0 = TICKS_READ();
+#endif
+	rspq_wait();
+#ifdef DRAW_PERF
+	perf_dr_wwait += TICKS_DISTANCE(_w0, TICKS_READ());
+#endif
+	volatile uint32_t *trailer = (volatile uint32_t *)((uint8_t *)list + maxrecs*8);
+	data_cache_hit_invalidate((void *)trailer, 16);
+	uint32_t nrec = trailer[0], ovfl = trailer[1];
+	sprwalk_rsp_ovfl = (int)ovfl;
+	if (ovfl)
+		debugf("[VIDEO] RSP sprite walk overflow: %lu dropped\n", (unsigned long)ovfl);
+#ifdef MVS64_WALKDBG
+	debugf("[W] done nrec=%lu ovfl=%lu\n", (unsigned long)nrec, (unsigned long)ovfl);
+#endif
+	// n64sys cache ops require 16-byte multiples: round up (the +2 record
+	// padding keeps the tail inside the object).
+	data_cache_hit_invalidate(list, (nrec * sizeof(SprWalkRec) + 15) & ~15);
+	return (int)nrec;
+}
+
 static bool rdp_mode_copy = false;
 static int rdp_tex_slot = 0;
 static int rdp_pal_slot = 0;
