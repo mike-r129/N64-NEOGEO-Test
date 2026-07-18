@@ -1,5 +1,55 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## ❌ SPRITE WALK-ON-RSP SHELVED (2026-07-10) — ucode correct, deadlocks the RSP audio
+
+The rank-3 lever (move the 381-sprite SCB walk off the CPU onto the RSP, ~12-19% of
+the in-fight draw budget, plan-estimated +2-3 fps). **Phase A built and PROVEN
+CORRECT, then shelved: it cannot coexist with the RSP audio offload.**
+
+Design (Phase A): the CPU splits `render_sprites` into a **producer** (walk the SCB +
+tilemaps, apply the exact chaining/vshrink/cull/auto-anim math, emit an 8-byte
+visible-tile record list) and a **consumer** (unchanged empty-test + `draw_sprite`).
+`cmd_sprite_walk` (rsp_video.S, cmd 0x5) is the producer ported to the RSP: it DMAs the
+SCB + sprite tilemaps out of the writeback'd emulated VRAM in 16-sprite groups and DMAs
+back the record list + an `{nrec,ovfl}` trailer the CPU polls. Consuming the list is the
+unchanged CPU draw path, so the RDP stream is identical by construction.
+
+**The ucode is correct and stable in isolation:**
+- ✅ MVS64_WALKDBG dual-compute (C reference vs RSP list compared every frame): a 600s
+  ares run through dense fights = **11,400 frames, 0 mismatches, 0 overflows**.
+- ✅ Walk + **all audio on CPU** (`WP_OFF=1 ADPCM_CPU=1`): **5,150 frames, reached and
+  held gameplay, no wedge**. Refactor also PC-pixel-gated 21/21 + WAV byte-identical.
+
+**The blocker — walk + RSP audio wedges within ~100 frames.** Isolated by controlled
+A/B: stable with CPU audio; wedges with the whole-pump FM offload (`~frame 100`) AND
+with ADPCM-only/FM-on-CPU (`WP_OFF=1`, `~frame 70`). So it is the RSP-walk ↔ RSP-audio
+**rspq-queue-sharing**, not any specific synth path. The walk drains the RSP queue every
+frame right before the audio highpri burst, and that idle→wake edge trips the rspq
+**lost-wakeup race** (the RSP breaks to idle between reading SP_STATUS and the CPU's
+wake — see `RSPQCmd_WaitNewInput` in rsp_queue.inc; libdragon's own double-write and the
+project's pump-entry watchdog do not cover this load). WALKTO instrumentation caught the
+RSP **halted at the kernel idle loop, `st=0x3003`** (no SIG_MORE / SIG_HIGHPRI). The
+hang is `rspq_write` blocking once ships pile up behind the wedged RSP.
+
+**Fixes tried, ALL failed:** (1) HALTED+SIG_MORE clear at ship sites; (2) broadened
+HALTED re-kick via `rspq_flush` before every ship; (3) fix-prep overlap (run the fix
+layer's CPU prep while the walk runs — matches the surviving dual-compute build's
+timing); (4) targeted `CLEAR_HALT` unwedge inside every audio wait-spin loop. **(4) is
+decisive: CLEAR_HALT does NOT recover the RSP** (only 1 kick fired before the hang), so
+at the wedge the RSP is NOT cleanly halted — it is in an unrecoverable state (running-
+stuck/crash or a video↔audio overlay-DMEM/DMA interaction), not the simple lost-wakeup a
+CPU-side re-kick can patch.
+
+**Verdict: shelved.** Coexistence needs open-ended libdragon rspq-kernel work +
+re-validation — a multi-session effort for +2-3 fps, versus the audio offload it fights
+being a **~2x** in-fight win (dropping audio-offload to ship the walk is strongly
+net-negative). **Landed & kept:** the produce/consume split (dde33a9, pixel+WAV gated —
+a permanent clean seam) and the proven ucode (de7f1ff), now **default-OFF, opt-in via
+`MVS64_WALK_RSP`** so a future rspq-hardening pass (or a libdragon upgrade) can revisit
+without re-deriving it. **Deliverable stays play7.** Remaining tractable levers unchanged:
+TMEM slot rotation (hardware-facing, can't gate in ares), then the diffuse YM ~0.5ms
+candidates.
+
 ## ⚖ Z80/SND PASS CLOSED WITH MEASUREMENT (2026-07-09) — the interpreter is at its floor
 
 **The sound bucket's books now balance exactly** (genms/[SNDRMS] + pub/[PERF]

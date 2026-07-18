@@ -292,9 +292,15 @@ static void render_sprites(void) {
 	uint8_t aa;
 	bool aa_enabled = lspc_get_auto_animation(&aa);
 	render_begin_sprites();
-#if defined(N64) && !defined(MVS64_WALK_CPU)
-	// The walk runs on the RSP (cmd_sprite_walk, rsp_video.S); the CPU only
-	// consumes the record list. MVS64_WALK_CPU=1 reverts to the C walk.
+#if defined(N64) && defined(MVS64_WALK_RSP)
+	// OPT-IN (default OFF). The walk runs on the RSP (cmd_sprite_walk,
+	// rsp_video.S); the CPU only consumes the record list. The ucode is
+	// bit-exact (MVS64_WALKDBG dual-compute, 11.4k frames, 0 mismatches) and
+	// stable in isolation, but it DEADLOCKS the RSP audio offload: sharing the
+	// rspq queue with the whole-pump/ADPCM highpri bursts trips a lost-wakeup /
+	// unrecoverable-RSP state within ~100 frames (CLEAR_HALT does not recover
+	// it). See PLAN-OPTIMIZATION.md (2026-07-10). Kept in-tree for a future
+	// rspq-hardening pass; the default N64 path is the stable C walk below.
 	int nrec = sprite_walk_produce_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa, aa_enabled);
 	#ifdef MVS64_WALKDBG
 	// Dual-compute gate: the C walk is authoritative; compare record lists
