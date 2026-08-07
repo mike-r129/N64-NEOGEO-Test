@@ -3632,6 +3632,13 @@ jmp_exec:
     beq m_pc, t1, idle_skip           # samsho2 main vblank wait (hottest)
     ori t1, t0, 0xFC02
     beq m_pc, t1, idle_skip           # samsho2 secondary vblank wait
+    ori t1, t0, 0xFB4A
+    beq m_pc, t1, idle_skip           # samsho2 in-fight vblank wait #3
+    ori t1, t0, 0xFB74
+    beq m_pc, t1, idle_skip           # samsho2 in-fight vblank wait #4
+                                      # (both: tst.b $100A30; beq self —
+                                      # found by MVS64_IDLEPROBE 2026-08-07,
+                                      # byte-identical to the 0x142C shape)
     ori t1, t0, 0x1FE2
     beq m_pc, t1, idle_skip           # mslug
     lui t1, 0xFFC1

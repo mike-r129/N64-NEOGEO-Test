@@ -185,7 +185,8 @@ typedef struct {
 static bool dyn_target_is_spin(uint32_t t)
 {
     t &= 0xFFFFFF;
-    return t == 0x00142C || t == 0x00FC02 || t == 0x001FE2 || t == 0xC18714;
+    return t == 0x00142C || t == 0x00FC02 || t == 0x00FB4A || t == 0x00FB74
+        || t == 0x001FE2 || t == 0xC18714;
 }
 
 static void emit_bail_check(emit_t *e, int addr_reg)
