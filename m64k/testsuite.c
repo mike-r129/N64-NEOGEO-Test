@@ -255,6 +255,116 @@ bool strendswith(const char *s, const char *suffix)
     return strcmp(s+sl-sufl, suffix) == 0;
 }
 
+#ifdef M64K_DYNREC
+// ---- Emitter-differential rig ------------------------------------------
+// Proves dynarec template hand-encodings that the TomHarte vector set
+// cannot cover (there are no immediate-form suites): each synthetic
+// sequence runs twice from an identical seed state — once pure
+// interpreter, once with a forced translated block — and the final
+// architectural state (regs, SR, PC, USP/SSP) plus elapsed cycles must
+// match bit-for-bit. Memory effects are verified by loading stored
+// values back into registers within the sequence. Canary rule: a
+// template counts as covered here only if corrupting its idiom makes a
+// sequence FAIL (verified for ADDI/CMPI at rig introduction).
+static int diff_fails, diff_runs;
+
+static void diff_run(const uint16_t *code, int ncode, int nexpect,
+                     int budget, const char *name)
+{
+    m64k_t st[2];
+    for (int side = 0; side < 2; side++) {
+        m64k_init(&m64k);               // also resets the dynrec table/arena
+        m68k_ram_init();
+        for (int i = 0; i < 8; i++)
+            m64k.dregs[i] = (0x11111111u * i) ^ 0x8000;
+        m64k.dregs[3] = 0;              // Z-flag material
+        m64k.dregs[4] = 0x0000FFFF;     // carry/borrow material
+        for (int i = 0; i < 7; i++)
+            m64k.aregs[i] = 0x4000 + 0x100 * i;
+        m64k.aregs[5] = 0x4501;         // odd: exercises the emitted
+                                        // ADDRERR bail -> generic replay
+        m64k.usp = 0x5000;
+        m64k.ssp = 0x5800;
+        m64k.pc = 0x2000;
+        m64k.sr = 0x2700;
+        for (int i = 0; i < ncode; i++) {
+            m68k_ram_w8(0x2000 + i * 2,     code[i] >> 8);
+            m68k_ram_w8(0x2000 + i * 2 + 1, code[i] & 0xFF);
+        }
+        (void)m68k_ram_r8(0x0000);      // map the vector page (ADDRERR)
+        (void)m68k_ram_r8(0x4000);      // map the data/stack page
+        if (side == 1) {
+            int got = m64k_dyn_translate(&m64k, m64k.pc, nexpect, true);
+            if (got != nexpect) {
+                debugf(">>> DIFF FAIL %s: translated %d insns, expected %d\n",
+                       name, got, nexpect);
+                diff_fails++;
+                diff_runs++;
+                return;
+            }
+        }
+        m64k_run(&m64k, budget);
+        st[side] = m64k;
+    }
+    diff_runs++;
+    bool ok = memcmp(st[0].dregs, st[1].dregs, sizeof(st[0].dregs)) == 0
+           && memcmp(st[0].aregs, st[1].aregs, sizeof(st[0].aregs)) == 0
+           && st[0].usp == st[1].usp && st[0].ssp == st[1].ssp
+           && st[0].pc == st[1].pc && st[0].sr == st[1].sr
+           && st[0].cycles == st[1].cycles;
+    if (!ok) {
+        diff_fails++;
+        debugf(">>> DIFF FAIL %s\n", name);
+        for (int i = 0; i < 8; i++)
+            if (st[0].dregs[i] != st[1].dregs[i])
+                debugf("  D%d: %08lx != %08lx\n", i, st[0].dregs[i], st[1].dregs[i]);
+        for (int i = 0; i < 7; i++)
+            if (st[0].aregs[i] != st[1].aregs[i])
+                debugf("  A%d: %08lx != %08lx\n", i, st[0].aregs[i], st[1].aregs[i]);
+        if (st[0].sr != st[1].sr)
+            debugf("  SR: %04lx != %04lx\n", st[0].sr, st[1].sr);
+        if (st[0].pc != st[1].pc)
+            debugf("  PC: %08lx != %08lx\n", st[0].pc, st[1].pc);
+        if (st[0].cycles != st[1].cycles)
+            debugf("  cycles: %lld != %lld\n",
+                   (long long)st[0].cycles, (long long)st[1].cycles);
+    }
+}
+
+static void run_emitter_differential(void)
+{
+    // MOVEQ edges: zero (Z), -1 (N), positive; and a 3-insn run.
+    diff_run((const uint16_t[]){0x7000}, 1, 1, 100, "moveq #0,d0");
+    diff_run((const uint16_t[]){0x72FF}, 1, 1, 100, "moveq #-1,d1");
+    diff_run((const uint16_t[]){0x747F, 0x7000, 0x76FF}, 3, 3, 100, "moveq x3");
+    // MOVE.w forms (templated set), incl. store->load-back memory checks.
+    diff_run((const uint16_t[]){0x3A03}, 1, 1, 100, "move.w d3,d5");
+    diff_run((const uint16_t[]){0x3481, 0x3E12}, 2, 1, 100, "move.w d1,(a2); (a2),d7");
+    diff_run((const uint16_t[]){0x36C0, 0x3419}, 2, 2, 100, "move.w d0,(a3)+; (a1)+,d2");
+    diff_run((const uint16_t[]){0x3C28, 0x0008}, 2, 1, 100, "move.w (8,a0),d6");
+    diff_run((const uint16_t[]){0x3942, 0x0004, 0x3C2C, 0x0004}, 4, 2, 100, "move.w d2,(4,a4); (4,a4),d6");
+    diff_run((const uint16_t[]){0x3CBC, 0x8000, 0x3E16}, 3, 1, 100, "move.w #0x8000,(a6); (a6),d7");
+    // ADDRERR bail from an emitted block (a5 is odd): the bail replays
+    // the insn generically and raises the address error bit-exactly.
+    diff_run((const uint16_t[]){0x3A84}, 1, 1, 200, "move.w d4,(a5) ADDRERR");
+    // CMPI edges: equal (Z), borrow (C), byte form.
+    diff_run((const uint16_t[]){0x0C42, 0x1111}, 2, 1, 100, "cmpi.w #0x1111,d2");
+    diff_run((const uint16_t[]){0x0C43, 0x0000}, 2, 1, 100, "cmpi.w #0,d3 (Z)");
+    diff_run((const uint16_t[]){0x0C42, 0xFFFF}, 2, 1, 100, "cmpi.w #0xFFFF,d2 (C)");
+    diff_run((const uint16_t[]){0x0C04, 0x00FF}, 2, 1, 100, "cmpi.b #0xFF,d4");
+    // ADDI.w edges: carry+X wrap, Z, sign/overflow.
+    diff_run((const uint16_t[]){0x0644, 0xFFFF}, 2, 1, 100, "addi.w #0xFFFF,d4 (C/X)");
+    diff_run((const uint16_t[]){0x0643, 0x0000}, 2, 1, 100, "addi.w #0,d3 (Z)");
+    diff_run((const uint16_t[]){0x0640, 0x8000}, 2, 1, 100, "addi.w #0x8000,d0 (V)");
+    // Mixed 6-insn block: sequencing + guest-length accounting.
+    diff_run((const uint16_t[]){0x7001, 0x3A03, 0x0C42, 0x1111,
+                                0x0644, 0xFFFF, 0x3419, 0x36C0},
+             8, 6, 200, "mixed x6");
+    debugf("%s emitter differential: %d sequences, %d fails\n",
+           diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
+}
+#endif
+
 int main()
 {
     debug_init_isviewer();
@@ -439,6 +549,10 @@ int main()
     };
     int num_tests = sizeof(testfns)/sizeof(testfns[0]);
 #endif
+
+    #ifdef M64K_DYNREC
+    run_emitter_differential();
+    #endif
 
     for (int i=0; i<num_tests; i++) {
         run_testsuite(testfns[i]);

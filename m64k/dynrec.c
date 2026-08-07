@@ -301,13 +301,10 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         }
     }
 
-    // CMPI/ADDI templates: transcription-complete but GATED OFF — the
-    // vector set has no immediate-form suites and a TRCRC flag-canary run
-    // (240s) proved these forms never enter translated blocks in the test
-    // window, so no active gate covers the hand-encodings. Enable once the
-    // emitter-differential rig (synthetic sequences run through emitted
-    // blocks vs the interpreter) exists to prove them.
-#ifdef M64K_DYNREC_UNPROVEN
+    // CMPI/ADDI: no immediate-form btest suites exist; these encodings are
+    // gated by the testsuite's emitter-differential rig (testsuite.c),
+    // canary-certified 2026-08-07 (a corrupted X-flag idiom fails exactly
+    // the ADDI sequences).
     // CMPI #imm,Dn  [cmpi_f_word/cmpi_f_byte, 8 cycles, 2 words]: CMP
     // flags (no X), no writeback. dptr is set by the interpreter's imm
     // decode; emitted code keeps the stale-dptr law with dptr = ctx
@@ -353,7 +350,6 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         *cmax += 8;
         return 4;
     }
-#endif // M64K_DYNREC_UNPROVEN
     return 0;
 }
 
