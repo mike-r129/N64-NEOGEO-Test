@@ -1,5 +1,103 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🎯 60FPS CAMPAIGN ROADMAP (2026-08-07) — four tracks, workflow-planned + adversarially verified
+
+Goal (user): reach 60 fps in ares testing as the finish gate, sound/graphics
+bit-true, one gated commit per increment. Current: ~34-41 in-fight (play8).
+Four track plans were produced by parallel planner agents reading the sources
+and adversarially verified (2 lenses each on A/B; all verdicts proceed=true).
+Full plans + verdicts: workflow wf_d758761b-bf5 journal. Execution order by
+value-per-risk: C → B(step1) → A(phase 1) → interleave D groundwork, then
+A phase 2 / B predecode / C tail / D fix as gates allow.
+
+**Track C — YM emit trims (est +2..+3.5 total, five independent steps):**
+0. Instrumentation: SSG-silent-fraction + WP-chunk-fraction counters.
+1. WP dead-store elision: rspfm_pack_chan_wp for rspwp_kick_chunk — drop
+   per-slot masks compute + slot-dynamics/op1_out/mem_value stores that
+   cmd_fm_wp overlays with the RSP-resident dyn block and the kick
+   overwrites (masks=0x000F). VERIFY claims against sources before coding.
+2. Hoist pms lfo_pm dedup scan once per chunk (identical across 4 chans) +
+   wp_dirty-gated static-field cache.
+3. Mix banking-copy elision: point chunk accumulators at pd->acc_l/r after
+   kick decision (keep the fallback path intact — timeout/death relies on it).
+4. Emit copy elision: copy only CPU-mixed spans to stage.
+5. SSG chunk batching (SSG_CALC_N, state hoisted); closed-form silent skip
+   ONLY if step-0 shows it worth ~0.4ms+ (subtle exactness edges).
+Gates: steps 1-4 are N64-only (PC WAV green by construction) → gate =
+MVS64_RSPWP_VERIFY dual-compute + bucket-matched 560s; step 5 = WAV gate.
+Risk: icache law applies to new pack/SSG variants — size-audit each.
+
+**Track B — Z80 (re-priced: steps 1-3 +0.5..+1.5; uop-cache is the lever):**
+1. Fused event check, ZERO NEW STATE (reviewer-revised): gate
+   process_interrupts on the EXISTING packed bitfield byte
+   (int_pending/nmi_pending share storage with iff1/iff2/halted in z80.h)
+   plus iff_delay — a mask test, no dual-state maintenance to go stale.
+   WAV-gated, ~30 lines.
+2. Loop fusion z80_run_spin(z,until) — port sound_neogeo.c inner loop
+   VERBATIM (couplings: SND_HEALTH counters, Z80HIST, NOIDLESKIP ifdefs,
+   z80_ext_wrote, service_level_irq ordering). cyc/int state stays
+   struct-resident across port/write callbacks (YM re-enters z80).
+3. Hot/cold partition ONLY from MVS64_Z80OPHIST data (function granularity;
+   do NOT pre-commit CB/ED cold — they're staple driver ops).
+4. Single-site computed-goto: --param max-goto-duplication-insns=0 and an
+   objdump gate that exec_opcode has EXACTLY 1 indirect-jump site.
+5. ROM decoded-uop cache (the big one, +1..+1.5): records keyed by M_ROM
+   offset (immutable → no invalidation), 4B/record {handler u16, len, cyc}
+   — NO imm16 (operands read from resident M_ROM[] directly); residency =
+   per-step check of PC+len-1 vs current bank-window end (windows differ:
+   16/8/4/2KB); RAM/boundary/bank-edge falls back to classic; default-OFF
+   knob + WAV gate.
+
+**Track A — m68k predecode (est +2..+3; reviewer-revised phase 1):**
+1a. M64K_PREDECODE scaffold, all pages classic, default-OFF. Record
+   dispatch (12 insns) expanded at main_loop ONLY; the 30 active
+   dispatch_next tail sites compile to `j main_loop` in predecode builds →
+   phase-1 hot text SMALLER than the 13,624B baseline. s3 = L1 base
+   (verified free, saved in prologue). L1 = 4096×u32 pre-biased:
+   L1[page] = block − ((0xFF000000|page<<12)<<1) mod 2^32 (m_pc carries
+   the 0xFF000000 map base!). Records 4B {s16 handler-off-from-main_loop,
+   u16 operand}; consider 2B handler-only variant if dcache-bound (record
+   stream costs ~1 line per 2-3 insns at 4B, not 1-per-8 as first
+   estimated). Odd-PC law: opcode lhu PRECEDES record lh (bit-identical
+   odd-PC behavior). Shared classic-trampoline block for unpromoted pages.
+1b. Lazy promotion via trigger records + cold-C builder (own section,
+   outside hot text); testsuite gets a forced-promotion mode. STALE-RECORD
+   SOURCES: hw.c REG_SWPBIOS/REG_SWPROM memcpy INTO P_ROM page 0 →
+   must call m64k_predecode_invalidate(0) (or never promote 0x000-0x07F);
+   promote 0x200-0x2FF ONLY if pbrom_linear()!=NULL (cache mode → classic
+   forever).
+2. PBROM bank slices (8×256 L1 entries, swap on write_pbrom, ~1KB copy).
+3. Family resolution + opsize baking (record targets final handler).
+4. Specialize from the parked W3 corpus. RECORD-LAYOUT LAW: specialized
+   handlers may borrow only the u16 operand halfword of adjacent records;
+   every record's s16 handler halfword always holds the classic-equivalent
+   target (mid-instruction jumps stay exact). Charge parity per-form vs
+   the W3 body (CLR splits charges; JSR is 20/2 — no single blanket rule).
+   Do NOT demote slim-wave-3 optable entries until [PDSTAT] proves the
+   classic-page share <2-3%. Coverage honest target: ~72-77% (85% needs a
+   further wave).
+
+**Track D — walk-on-RSP coexistence (est +1.5..+3, killable per gate):**
+New ranked hypothesis: the wedge signature (idle halt, st=0x3003, no
+SIG_MORE, CLEAR_HALT-immune) matches a QUEUE-POINTER DESYNC (stale
+RSPQ_RDRAM_PTR/POINTER_STACK → RSP refetches a 0x00 terminator and
+re-breaks forever), driven by the walk's unique drain-to-idle edge ~8×/
+frame colliding with coalesced highpri epilog-skip patches. Steps:
+(1) zero-change groundwork: DMEM map audit of overlay ELFs, vendored-vs-
+upstream rspq diff, WALKTO wedge-state dumper (SP_PC/SP_STATUS/DMA +
+DMEM RSPQ_RDRAM_PTR/POINTER_STACK/CURRENT_OVL + CPU-side pointers);
+(2) discrimination A: serialize audio highpri vs walk lifetime;
+(3) structural: eliminate the walk's per-frame rspq_wait (sentinel
+trailer poll + early kick + deferred consume); (4) evidence-driven
+vendored-kernel patch; (5) default-ON flip + soak. Kill the track if the
+dump implicates the un-halt hardware quirk.
+
+Validation rig for every increment: testsuite (m64k) / WAV byte-identity
+(shared sound code) / MVS64_RSPWP_VERIFY dual-compute (WP-only paths) /
+560s bucket-matched ares run (fps gate) / ares boot + Sonnet-driven
+BizHawk same-class check on deliverable builds. One commit per gated
+increment, pushed individually.
+
 ## 📐 OPHIST + FASTPATHS WAVE 3 (2026-08-06) — the icache cliff, measured
 
 Session goal (user-picked): start the 68k structural spike toward 60fps.
