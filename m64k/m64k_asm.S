@@ -115,6 +115,9 @@ opshiftsmem:
 #define opcode      s0     // current opcode being executed
 #define eaptr       s1     // effective address pointer (in N64 space)
 #define dptr        s2     // pointer to the other register in the opcode (in N64 space)
+#ifdef M64K_PREDECODE
+#define pd_l1base   s3     // base of the predecode per-page L1 table (__m64k_pd_l1)
+#endif
 #define opsize      s4     // size of the current instruction (1=byte, 2=word, 4=long, 0=not decoded yet)
 #define __________  s5     // unused (NOTE: this is used within movem)
 #define flag_nv     s6     // bit 31: N; bit 63: N^V
@@ -348,11 +351,21 @@ opshiftsmem:
 .endm
 
 
-# "dispatch_next" macro. Exact copy of the main_loop dispatch, for inlining at
-# the tail of the M64K_FASTPATHS opcode handlers: it removes the extra
-# "j main_loop" hop (and its pipeline bubble) from the hottest paths. Any
-# change here IS a change to main_loop (which expands this same macro).
-.macro dispatch_next
+# "dispatch_body" macro: the real main_loop dispatch. In classic builds it is
+# also expanded at the tail of every M64K_FASTPATHS handler (as
+# "dispatch_next") to skip the "j main_loop" hop. In M64K_PREDECODE builds it
+# is expanded ONLY at main_loop (the record dispatch is bigger, and the
+# ~13.5KB icache law forbids inlining it ~30x — see PLAN-OPTIMIZATION.md);
+# the tails then compile to a plain "j main_loop". Any change here IS a
+# change to main_loop.
+#
+# Predecode record dispatch (phase 1): the guest-page L1 table (pd_l1base =
+# s3, entries pre-biased per page, built in m64k.c) yields a 4-byte record
+# per guest word: {s16 handler offset from main_loop (the lax base), u16
+# operand}. The record address is left in t1 for phase-2 specialized
+# handlers. The opcode lhu stays FIRST so odd-PC behavior (misaligned fault
+# / ADDRERR) is bit-identical to the classic dispatch.
+.macro dispatch_body
     .set push
     .set noreorder
     blez m_cycles, main_loop_exit
@@ -376,12 +389,34 @@ opshiftsmem:
     #if M64K_CONFIG_TIMING_ACCURACY < 0
     addi m_cycles, M64K_CONFIG_TIMING_ACCURACY
     #endif
+#ifdef M64K_PREDECODE
+    srl t1, m_pc, 10                   # page index * 4: (m_pc>>12)<<2
+    andi t1, 0x3FFC
+    addu t1, pd_l1base
+    lw t1, 0(t1)                       # biased record-block base
+    sll t2, m_pc, 1                    # 32-bit: the bias cancels the page bits
+    addu t1, t2                        # t1 = record address (phase-2 ABI)
+    lh t0, 0(t1)                       # s16 handler offset from main_loop
+    addu t0, lax_base
+    jr t0
+     addi m_pc, 2
+#else
     srl t1, opcode, 12
     sll t1, 2
     lw t0, optable(t1)
     jr t0
      addi m_pc, 2
+#endif
     .set pop
+.endm
+
+# "dispatch_next": fast-path handler tails. See dispatch_body.
+.macro dispatch_next
+#ifdef M64K_PREDECODE
+    j main_loop
+#else
+    dispatch_body
+#endif
 .endm
 
 # "check_addr_bail" macro. Used by the M64K_FASTPATHS handlers on ADDRERR
@@ -418,6 +453,9 @@ _m64k_asmrun:
     li mmap_mask, M64K_CONFIG_MEMORY_BASE
     #endif
     la lax_base, LAX_BASE_ADDR
+#ifdef M64K_PREDECODE
+    la pd_l1base, __m64k_pd_l1
+#endif
     dli zx64_mask, 0x00000000FFFFFFFF
     lw t1, M64K_OFF_PC(ctx)
     lw t0, M64K_OFF_SR(ctx)
@@ -480,8 +518,27 @@ _m64k_asmrun:
     or flag_x, t1
     #endif
 
+#ifdef M64K_PREDECODE
+    .globl main_loop
+#endif
 ALIGN(main_loop):
-    dispatch_next
+    dispatch_body
+#ifdef M64K_PREDECODE
+# Classic-dispatch record target: every record of an unpromoted page points
+# here (phase 1: every record, full stop). The opcode is already loaded and
+# m_pc already advanced by dispatch_body; this is exactly the classic
+# optable dispatch minus those two steps.
+    .globl classic_dispatch_body
+ALIGN(classic_dispatch_body):
+    .set push
+    .set noreorder
+    srl t1, opcode, 12
+    sll t1, 2
+    lw t0, optable(t1)
+    jr t0
+     nop
+    .set pop
+#endif
 op_tbl0:
     srl t0, opcode, 6
     andi t0, 0xF << 2

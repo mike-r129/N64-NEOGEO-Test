@@ -60,11 +60,46 @@ static inline void exc_push16(m64k_t *m64k, uint16_t v)
     WM16(m64k->ssp, v);
 }
 
+#ifdef M64K_PREDECODE
+/* Phase-1a predecode scaffold (see PLAN-OPTIMIZATION.md, 60fps campaign):
+ * a 4096-entry L1 table maps every 4KB guest page to a record block of one
+ * 4-byte record per guest word {s16 handler offset from main_loop, u16
+ * operand}. Entries are PRE-BIASED so the asm dispatch computes the record
+ * address as L1[page] + (m_pc << 1) in 32-bit arithmetic — m_pc carries the
+ * 0xFF000000 memory-map base, and the bias cancels it mod 2^32. In phase 1a
+ * no page is ever promoted: every entry points (with its own bias) at ONE
+ * shared trampoline block whose every record targets classic_dispatch_body,
+ * so behavior is provably identical to the classic optable dispatch. */
+uint32_t __m64k_pd_l1[4096] __attribute__((aligned(16)));
+static uint16_t pd_trampoline[2048 * 2] __attribute__((aligned(16)));
+extern char main_loop[], classic_dispatch_body[];
+
+static void __m64k_predecode_init(void)
+{
+    int32_t off = (int32_t)((uint32_t)(uintptr_t)classic_dispatch_body
+                - (uint32_t)(uintptr_t)main_loop);
+    assertf(off >= -32768 && off <= 32767,
+            "predecode handler offset out of s16 range: %ld", (long)off);
+    for (int i = 0; i < 2048; i++) {
+        pd_trampoline[i * 2 + 0] = (uint16_t)(int16_t)off;
+        pd_trampoline[i * 2 + 1] = 0;
+    }
+    for (uint32_t page = 0; page < 4096; page++) {
+        uint32_t gbase = (uint32_t)M64K_CONFIG_MEMORY_BASE | (page << 12);
+        __m64k_pd_l1[page] =
+            (uint32_t)(uintptr_t)pd_trampoline - (gbase << 1);
+    }
+}
+#endif
+
 void m64k_init(m64k_t *m64k)
 {
     memset(m64k, 0, sizeof(*m64k));
     m64k->sr = 0x2700;
     __m64k_tlb_reset(); // FIXME: this clears all TLB entries
+    #ifdef M64K_PREDECODE
+    __m64k_predecode_init();
+    #endif
 }
 
 void m64k_pulse_reset(m64k_t *m64k)

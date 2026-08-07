@@ -24,6 +24,12 @@ M64K_CONFIG += -DM64K_FASTPATHS
 # PLAN-OPTIMIZATION.md 2026-08-06). Kept testsuite-covered as the seed
 # handler corpus for the predecode project.
 M64K_CONFIG += -DM64K_W3_FULL
+# M64K_PREDECODE (killed 2026-08-07, kept opt-in): the phase-1a record
+# dispatch was testsuite-green (125/126) but regressed -5.5..-5.9 fps in
+# every bucket — the per-PC record stream adds ~20+ cyc/insn of dcache
+# misses, more than phase-2 specialization could recover. Enable here to
+# re-test the machinery if the design is ever revisited.
+# M64K_CONFIG += -DM64K_PREDECODE
 
 N64_CFLAGS += $(M64K_CONFIG)
 N64_ASFLAGS += $(M64K_CONFIG)

@@ -37,6 +37,14 @@ CFLAGS += -DM64K_FASTPATHS
 ASFLAGS += -DM64K_FASTPATHS
 N64_ASFLAGS += -DM64K_FASTPATHS
 endif
+# Per-PC predecode record dispatch (60fps campaign track A). Phase 1a is a
+# semantics-neutral scaffold (all pages route through the classic trampoline);
+# testsuite-covered via the standalone m64k Makefile. Opt-in: make ... PD_ON=1.
+ifdef PD_ON
+CFLAGS += -DM64K_PREDECODE
+ASFLAGS += -DM64K_PREDECODE
+N64_ASFLAGS += -DM64K_PREDECODE
+endif
 endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 
