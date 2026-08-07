@@ -1005,11 +1005,24 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         #endif
         return 0;
     }
-    // Minimum profitable length (spec): entry overhead (probe hit + gate +
-    // tail) exceeds the dispatch savings of short blocks — measured
-    // net-negative at 1-3 insn blocks (2026-08-07 480s A/B). Forced mode
-    // (testsuite) keeps single-insn blocks for coverage.
-    if (!force && ninsns < 3) {
+    // Minimum profitable length: entry overhead and, dominantly, the
+    // arena<->interpreter icache interleave (phase-3d verdict: short
+    // blocks at scale cost ~2x m68k time) exceed dispatch savings.
+    // Sweepable via -DM64K_DYN_MINLEN=n for the interleave-curve A/Bs.
+    #ifndef M64K_DYN_MINLEN
+    #define M64K_DYN_MINLEN 3
+    #endif
+    // Ender-terminated blocks only (phase-3d lesson): a block that ends at
+    // an unsupported form ("straight-line tail") on a hot loop head gets
+    // re-entered through the probe EVERY iteration, paying entry+gate+tail
+    // +icache ping-pong on top of the interpreted remainder — measured as
+    // the 39->25fps collapse (min-length-insensitive: the hot loop bodies
+    // are 3+ insns). Blocks must earn their entry with an emitted ender.
+    if (!force && !e.ended) {
+        __m64k_dyn_stat_refused++;
+        return 0;
+    }
+    if (!force && ninsns < M64K_DYN_MINLEN) {
         __m64k_dyn_stat_refused++;
         #ifdef M64K_DYNSTAT
         debugf("[DYNREF] pc=%06lx op=%04x short n=%d stop=%04x\n",
