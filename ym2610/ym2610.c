@@ -3687,6 +3687,19 @@ static void rspfm_pm_dp(FM_OPN *OPN, FM_CH *CH, u32 lfo_pm, u32 dp[4]) {
 /* Pack one channel into param block slot j. Returns 0 if the channel must
  * stay on the CPU this chunk (SSG-EG in use, or >8 distinct lfo_pm values).
  * Must run BEFORE any C code mutates the channel this chunk. */
+/* Per-chunk memo of the pms lfo_pm dedup scan: it depends only on the
+ * chunk-shared (lfo_pm_arr, n), so the first pms-active channel computes it
+ * and the other three reuse it. Callers bump rspfm_pm_scan_gen once per
+ * chunk before their pack loop. */
+static struct {
+	u32 gen;
+	int nv;
+	int hatch;
+	u8 vals[8];
+	u8 pmidx[128];   /* = YM_CHUNK (defined below) */
+} rspfm_pm_scan;
+static u32 rspfm_pm_scan_gen;
+
 static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 		int j, int n,
 		const u8 *lfo_pm_arr, u32 panl, u32 panr,
@@ -3728,25 +3741,43 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 	}
 
 	if (CH->pms) {
-		/* map each sample's lfo_pm to a dp table index (<= 8 distinct) */
-		u8 vals[8];
+		/* Map each sample's lfo_pm to a dp table index (<= 8 distinct).
+		 * The dedup scan depends only on (lfo_pm_arr, n), which is shared
+		 * by all four channels of a chunk, so it is computed once per
+		 * chunk and memoized (rspfm_pm_scan_gen is bumped by the chunk
+		 * callers). The per-channel dp table builds below still run per
+		 * channel (they depend on CH->block_fnum). */
 		u32 dp_c[4];
-		int nv = 0;
-		for (i = 0; i < n; i++) {
-			u8 v = lfo_pm_arr[i];
-			int k;
-			for (k = 0; k < nv; k++)
-				if (vals[k] == v)
-					break;
-			if (k == nv) {
-				if (nv == 8)
-					return 0;   /* fast LFO: fall back to C this chunk */
-				vals[nv++] = v;
+		int nv;
+		if (rspfm_pm_scan.gen != rspfm_pm_scan_gen) {
+			u8 *vals = rspfm_pm_scan.vals;
+			nv = 0;
+			rspfm_pm_scan.hatch = 0;
+			for (i = 0; i < n; i++) {
+				u8 v = lfo_pm_arr[i];
+				int k;
+				for (k = 0; k < nv; k++)
+					if (vals[k] == v)
+						break;
+				if (k == nv) {
+					if (nv == 8) {
+						/* fast LFO: fall back to C this chunk */
+						rspfm_pm_scan.hatch = 1;
+						break;
+					}
+					vals[nv++] = v;
+				}
+				rspfm_pm_scan.pmidx[i] = (u8) k;
 			}
-			p->pmidx[i] = (u8) k;
+			rspfm_pm_scan.nv = nv;
+			rspfm_pm_scan.gen = rspfm_pm_scan_gen;
 		}
+		if (rspfm_pm_scan.hatch)
+			return 0;
+		nv = rspfm_pm_scan.nv;
+		memcpy(p->pmidx, rspfm_pm_scan.pmidx, (size_t) n);
 		for (i = 0; i < nv; i++) {
-			rspfm_pm_dp(OPN, CH, vals[i], dp_c);
+			rspfm_pm_dp(OPN, CH, rspfm_pm_scan.vals[i], dp_c);
 			p->dp[i][0] = dp_c[0];   /* RSP slot order S1,S3,S2,S4 */
 			p->dp[i][1] = dp_c[2];
 			p->dp[i][2] = dp_c[1];
@@ -4405,6 +4436,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 			return 0;
 		}
 	}
+	rspfm_pm_scan_gen++;
 	for (j = 0; j < 4; j++) {
 		FM_CH * const CH = cch[j];
 		const int algo = CH->ALGO & 7;
@@ -5003,6 +5035,7 @@ void YM2610Update_stream(int length) {
 				 * RSP compute time (~2.4ms/chunk, [RSPWAIT] q=0). */
 				int shipped = 0;
 				rspfm_pb.chmask = 0;
+				rspfm_pm_scan_gen++;
 				for (j = 0; j < 4 && shipped < 2; j++) {
 					FM_CH * const CH = cch[j];
 					const int algo = CH->ALGO & 7;
