@@ -770,7 +770,14 @@ void z80_step(z80* const z) {
     exec_opcode(z, opcode);
   }
 
-  process_interrupts(z);
+  // Fused event check (mvs64): process_interrupts does nothing at all
+  // unless one of these conditions holds (EI delay pending, NMI pending,
+  // or a maskable INT that iff1 would accept), so gate the call on the
+  // exact same predicate — zero new state to maintain, and the flags
+  // share one bitfield byte so this is a couple of loads. The common
+  // in-fight case (~97% of steps) skips the call entirely.
+  if (z->iff_delay | (uint8_t)(z->nmi_pending | (z->int_pending & z->iff1)))
+    process_interrupts(z);
 }
 
 // outputs to stdout a debug trace of the emulator
