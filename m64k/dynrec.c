@@ -13,9 +13,38 @@
 #ifdef M64K_DYNREC
 
 // Storage probed/ranged by m64k_asm.S and hw_n64.S (see phase-1 commit).
-uint8_t  __m64k_dyn_arena[M64K_DYN_ARENA_SIZE] __attribute__((aligned(32)));
-uint32_t __m64k_dyn_table[M64K_DYN_TABLE_SETS * 4] __attribute__((aligned(16)));
-static uint32_t dyn_arena_used;
+// LAYOUT-INVARIANCE LAW (2026-08-07): every resize of dynrec statics
+// shifts the .bss behind them, changing the dcache/icache set alignment
+// of unrelated hot data — measured as ±10-15fps swings that masqueraded
+// as dynarec regressions (three different failure signatures across
+// adjacent commits: snd% or m68k% doubling with identical guest work).
+// Therefore: the big arrays are 8KB-aligned (deterministic dcache-set
+// mapping) and ALL small dynrec statics live inside one fixed-size padded
+// block so future dynrec changes never move other .bss.
+uint8_t  __m64k_dyn_arena[M64K_DYN_ARENA_SIZE] __attribute__((aligned(8192)));
+uint32_t __m64k_dyn_table[M64K_DYN_TABLE_SETS * 4] __attribute__((aligned(8192)));
+
+static struct dyn_statics {
+    uint32_t arena_used;
+    int      npending;
+    struct { uint32_t *slot; uint32_t target; } pending[512];
+    uint8_t  tried[1024];
+    uint8_t  pad[8192 - 8 - 512 * 8 - 1024];   // keep sizeof == 8KB forever
+} __attribute__((aligned(8192))) dyn_s;
+#define dyn_arena_used (dyn_s.arena_used)
+#define dyn_npending   (dyn_s.npending)
+#define dyn_pending    (dyn_s.pending)
+#define dyn_tried      (dyn_s.tried)
+_Static_assert(sizeof(struct dyn_statics) == 8192, "dynrec statics must stay 8KB");
+
+// Runtime translation gate: compile-time default only differs by one
+// initializer constant, so ON and OFF binaries are layout-identical —
+// the only clean A/B this platform allows.
+#ifdef M64K_DYN_DISABLE
+int __m64k_dyn_enable = 0;
+#else
+int __m64k_dyn_enable = 1;
+#endif
 
 extern char main_loop[];
 
@@ -33,17 +62,8 @@ void __m64k_dyn_publish(void *dst, const void *src, int len)
 // it at slice boundaries (the deferred-work law: never translate/reclaim
 // while guest code may be mid-flight in the arena).
 uint32_t __m64k_dyn_mailbox;
-static uint8_t dyn_tried[1024];  // 8192-bit once-only filter (hash collisions
-                                 // only suppress translation, never break it)
-
-// Pending block->block chain links: exit slots that currently jump to
-// main_loop and get patched to the target block if/when it is translated.
-// Patching happens only at slice boundaries (the only time translation
-// runs), so no guest code is in flight in the arena. A full table just
-// means those exits keep going through main_loop — never a correctness
-// issue.
-static struct { uint32_t *slot; uint32_t target; } dyn_pending[512];
-static int dyn_npending;
+// (tried-filter, pending chain links and arena bump pointer live in the
+// fixed-size dyn_s block above — layout-invariance law.)
 
 // Visibility counters ([DYNSTAT2] in emu.c, M64K_DYNSTAT builds): how many
 // blocks/insns actually translate in-game and whether chains ever resolve
@@ -71,7 +91,7 @@ static uint32_t *dyn_lookup(uint32_t pc)
 void __m64k_dyn_service(m64k_t *m64k)
 {
     uint32_t pc = __m64k_dyn_mailbox;
-    if (!pc)
+    if (!pc || !__m64k_dyn_enable)
         return;
     __m64k_dyn_mailbox = 0;
     uint32_t h = (pc >> 1) & 8191;
