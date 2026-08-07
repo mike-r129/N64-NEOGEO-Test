@@ -16,6 +16,10 @@ typedef struct {
 	uint16_t *free_sprite_indices;
 	int num_sprites;				// number of sprites currently in cache
 	SpriteCacheEntry *buckets;      // hashtable of the sprite entries
+	uint32_t evict_gen;             // bumped on every eviction: pixel buffers
+	                                // are reused after eviction, so any
+	                                // pointer memoized outside the cache is
+	                                // only valid while evict_gen is unchanged
 } SpriteCache;
 
 void sprite_cache_init(SpriteCache *c, int sprite_size, int max_sprites);
