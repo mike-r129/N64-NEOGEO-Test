@@ -411,6 +411,33 @@ static void run_emitter_differential(void)
     // DBF expire-immediately: d3=0 seed.
     diff_run((const uint16_t[]){0x51CB, 0x0004, 0x4E71, 0x4E71, 0x4E71},
              5, 1, 200, "dbf d3,+4 (expires: d3.w==0)");
+    // ALU batch: ADD/SUB/CMP/ADDQ/SUBQ/ADDA/MOVEA/MOVE.l.
+    diff_run((const uint16_t[]){0xD002}, 1, 1, 100, "add.b d2,d0");
+    diff_run((const uint16_t[]){0xD245}, 1, 1, 100, "add.w d5,d1");
+    diff_run((const uint16_t[]){0xD480}, 1, 1, 100, "add.l d0,d2");
+    diff_run((const uint16_t[]){0xD8C3}, 1, 1, 100, "adda.w d3,a4");
+    diff_run((const uint16_t[]){0x9002}, 1, 1, 100, "sub.b d2,d0");
+    diff_run((const uint16_t[]){0x9245}, 1, 1, 100, "sub.w d5,d1");
+    diff_run((const uint16_t[]){0x9480}, 1, 1, 100, "sub.l d0,d2");
+    diff_run((const uint16_t[]){0xB002}, 1, 1, 100, "cmp.b d2,d0");
+    diff_run((const uint16_t[]){0xB245}, 1, 1, 100, "cmp.w d5,d1");
+    diff_run((const uint16_t[]){0xB244}, 1, 1, 100, "cmp.w d4,d1");
+    diff_run((const uint16_t[]){0x5202}, 1, 1, 100, "addq.b #1,d2");
+    diff_run((const uint16_t[]){0x5245}, 1, 1, 100, "addq.w #1,d5");
+    diff_run((const uint16_t[]){0x5244}, 1, 1, 100, "addq.w #1,d4 (C/X wrap)");
+    diff_run((const uint16_t[]){0x5044}, 1, 1, 100, "addq.w #8,d4");
+    diff_run((const uint16_t[]){0x5480}, 1, 1, 100, "addq.l #2,d0");
+    diff_run((const uint16_t[]){0x5302}, 1, 1, 100, "subq.b #1,d2");
+    diff_run((const uint16_t[]){0x5343}, 1, 1, 100, "subq.w #1,d3 (borrow/X)");
+    diff_run((const uint16_t[]){0x5580}, 1, 1, 100, "subq.l #2,d0");
+    diff_run((const uint16_t[]){0x2841}, 1, 1, 100, "movea.l d1,a4");
+    diff_run((const uint16_t[]){0x2C4D}, 1, 1, 100, "movea.l a5,a6");
+    diff_run((const uint16_t[]){0x3841}, 1, 1, 100, "movea.w d1,a4");
+    diff_run((const uint16_t[]){0x2400}, 1, 1, 100, "move.l d0,d2");
+    diff_run((const uint16_t[]){0x2403}, 1, 1, 100, "move.l d3,d2 (Z)");
+    // ALU + ender loop: addq.w #1,d5; cmp.w d5,d1; bne -6 (budget-bounded).
+    diff_run((const uint16_t[]){0x5245, 0xB245, 0x66FA}, 3, 3, 300,
+             "addq/cmp/bne loop");
     debugf("%s emitter differential: %d sequences, %d fails\n",
            diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
 }

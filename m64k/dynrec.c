@@ -121,7 +121,8 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define SRLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x02)
 #define BGEZ(rs,off)      ITYPE(0x01,rs,1,off)
 #define BLTZ(rs,off)      ITYPE(0x01,rs,0,off)
-#define MOVE(rd,rs)       RTYPE(rs,R_ZERO,rd,0,0x21)  // addu rd, rs, zero
+#define MOVE(rd,rs)       RTYPE(rs,R_ZERO,rd,0,0x21)  // addu: 32-bit move (sign-extends)
+#define DMOVE(rd,rs)      RTYPE(rs,R_ZERO,rd,0,0x25)  // or: 64-bit move (flag values!)
 #define SLLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x00)
 #define DSLL(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x38)
 #define DSRL32(rd,rt,sa)  RTYPE(0,rt,rd,sa,0x3E)  // shift (sa+32)
@@ -213,6 +214,49 @@ static void emit_moveb_flags(emit_t *e, int reg)
 {
     e->buf[e->len++] = MOVE(R_S7, reg);
     e->buf[e->len++] = SLLI(R_S6, reg, 24);
+}
+
+// ADD-family flags (add_f_* idiom): result(t6) = daddu of zero-extended
+// operands in t0/t1; sh = 24/16/0 by size (0 = long: flag_zc is the raw
+// 64-bit sum, sll-0 re-sign-extends the operands).
+static void emit_add_flags(emit_t *e, int sh)
+{
+    if (sh) e->buf[e->len++] = DSLL(R_S7, R_T6, sh);
+    else    e->buf[e->len++] = DMOVE(R_S7, R_T6);  // 64-bit: keep carry bit32
+    e->buf[e->len++] = DSRL32(R_S8, R_S7, 0);
+    e->buf[e->len++] = SLLI(R_T0, R_T0, sh);
+    e->buf[e->len++] = SLLI(R_T1, R_T1, sh);
+    e->buf[e->len++] = DADDU(R_S6, R_T0, R_T1);
+}
+
+// SUB-family flags (op_sub_rmwimpl_flags idiom): result(t6) = dsubu(t1,t0)
+// (dst - src); flag_nv = dsubu of the shifted operands in the same order.
+// with_x: SUB/SUBQ set X from the borrow; CMP leaves X untouched.
+static void emit_sub_flags(emit_t *e, int sh, int with_x)
+{
+    if (sh) e->buf[e->len++] = DSLL(R_S7, R_T6, sh);
+    else    e->buf[e->len++] = DMOVE(R_S7, R_T6);  // 64-bit: keep borrow bit32
+    if (with_x)
+        e->buf[e->len++] = DSRL32(R_S8, R_S7, 0);
+    e->buf[e->len++] = SLLI(R_T0, R_T0, sh);
+    e->buf[e->len++] = SLLI(R_T1, R_T1, sh);
+    e->buf[e->len++] = DSUBU(R_S6, R_T1, R_T0);
+}
+
+// Load a Dn field sized b/w/l into reg (zero-extended). size: 0=b,1=w,2=l.
+static void emit_load_dn(emit_t *e, int reg, int dn, int size)
+{
+    if (size == 0)      e->buf[e->len++] = LBU(reg, R_A0, M64K_OFF_DREGS + 4 * dn + 3);
+    else if (size == 1) e->buf[e->len++] = LHU(reg, R_A0, M64K_OFF_DREGS + 4 * dn + 2);
+    else { e->buf[e->len++] = LW(reg, R_A0, M64K_OFF_DREGS + 4 * dn);
+           e->buf[e->len++] = AND(reg, reg, R_V1); }  // lwu equivalent
+}
+
+static void emit_store_dn(emit_t *e, int reg, int dn, int size)
+{
+    if (size == 0)      e->buf[e->len++] = SB(reg, R_A0, M64K_OFF_DREGS + 4 * dn + 3);
+    else if (size == 1) e->buf[e->len++] = SH(reg, R_A0, M64K_OFF_DREGS + 4 * dn + 2);
+    else                e->buf[e->len++] = SW(reg, R_A0, M64K_OFF_DREGS + 4 * dn);
 }
 
 // Materialize the mapped host address of a baked 24-bit guest address
@@ -624,6 +668,112 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             emit_break_check(e, e->goff + 6);
             *cmax += 16;
             return 6;
+        }
+    }
+
+    // ADD/SUB/CMP .b/.w/.l Dn,Dm and ADDA.w Dn,An (add_f_*/sub-flags
+    // idioms; charges 4/4/6, ADDA 8). ADDQ/SUBQ #q,Dn (addq_fast; 4/4/8).
+    // MOVEA.l/.w (no flags, charge 4) and MOVE.l Dn,Dm (tst_long flag
+    // idiom, charge 4). All operands register-resident: no faults.
+    {
+        int top = op >> 12;
+        int sreg = op & 7, smode = (op >> 3) & 7;
+        int dreg = (op >> 9) & 7;
+        int opmode = (op >> 6) & 7;
+        static const int shtab[3] = { 24, 16, 0 };
+
+        // ADD/SUB Dn,Dm (opmode 0-2, src Dn).
+        if ((top == 0xD || top == 0x9) && smode == 0 && opmode <= 2) {
+            int size = opmode, sh = shtab[size];
+            e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_DREGS + 4 * dreg);
+            emit_load_dn(e, R_T0, sreg, size);
+            emit_load_dn(e, R_T1, dreg, size);
+            if (top == 0xD) {
+                e->buf[e->len++] = DADDU(R_T6, R_T0, R_T1);
+                emit_store_dn(e, R_T6, dreg, size);
+                emit_add_flags(e, sh);
+            } else {
+                e->buf[e->len++] = DSUBU(R_T6, R_T1, R_T0);
+                emit_store_dn(e, R_T6, dreg, size);
+                emit_sub_flags(e, sh, 1);
+            }
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, size == 2 ? -6 : -4);
+            *cmax += (size == 2) ? 6 : 4;
+            return 2;
+        }
+        // ADDA.w Dn,An (opmode 3, src Dn: sign-extended word add, no flags).
+        if (top == 0xD && smode == 0 && opmode == 3) {
+            e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ITYPE(0x21, R_A0, R_T0, M64K_OFF_DREGS + 4 * sreg + 2); // lh
+            e->buf[e->len++] = LW(R_T1, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = MOVE(R_T2, R_T0);
+            e->buf[e->len++] = RTYPE(R_T1, R_T2, R_T2, 0, 0x21);  // addu t2,t1,t2
+            e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            *cmax += 8;
+            return 2;
+        }
+        // CMP.b/.w Dn,Dm (opmode 0/1; no store, no X).
+        if (top == 0xB && smode == 0 && opmode <= 1) {
+            int size = opmode, sh = shtab[size];
+            e->buf[e->len++] = MOVE(R_S2, R_A0);
+            emit_load_dn(e, R_T0, sreg, size);
+            emit_load_dn(e, R_T1, dreg, size);
+            e->buf[e->len++] = DSUBU(R_T6, R_T1, R_T0);
+            emit_sub_flags(e, sh, 0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+            *cmax += 4;
+            return 2;
+        }
+        // ADDQ/SUBQ #q,Dn (size 0-2, EA mode Dn).
+        if (top == 0x5 && smode == 0 && ((op >> 6) & 3) <= 2) {
+            int size = (op >> 6) & 3, sh = shtab[size];
+            int q = (((op >> 9) - 1) & 7) + 1;
+            int is_sub = (op >> 8) & 1;
+            e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_PENDINGEXC + 4);
+            e->buf[e->len++] = ORI(R_T0, R_ZERO, q);
+            emit_load_dn(e, R_T1, sreg, size);
+            if (!is_sub) {
+                e->buf[e->len++] = DADDU(R_T6, R_T0, R_T1);
+                emit_store_dn(e, R_T6, sreg, size);
+                emit_add_flags(e, sh);
+            } else {
+                e->buf[e->len++] = DSUBU(R_T6, R_T1, R_T0);
+                emit_store_dn(e, R_T6, sreg, size);
+                emit_sub_flags(e, sh, 1);
+            }
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, size == 2 ? -8 : -4);
+            *cmax += (size == 2) ? 8 : 4;
+            return 2;
+        }
+        // MOVEA.l Dn/An,Am (charge 12 - rig-measured flat .l rate; no flags).
+        if (top == 0x2 && opmode == 1 && smode <= 1) {
+            int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg;
+            e->buf[e->len++] = LW(R_T0, R_A0, off);
+            e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            *cmax += 12;
+            return 2;
+        }
+        // MOVEA.w Dn/An,Am (sign-extended word, charge 4, no flags).
+        if (top == 0x3 && opmode == 1 && smode <= 1) {
+            int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg + 2;
+            e->buf[e->len++] = ITYPE(0x21, R_A0, R_T0, off);  // lh (sign-extends)
+            e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+            *cmax += 4;
+            return 2;
+        }
+        // MOVE.l Dn,Dm (charge 12 - rig-measured flat .l rate; flags =
+        // tst_long idiom).
+        if (top == 0x2 && opmode == 0 && smode == 0) {
+            e->buf[e->len++] = LW(R_T0, R_A0, M64K_OFF_DREGS + 4 * sreg);
+            e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg);
+            e->buf[e->len++] = MOVE(R_S6, R_T0);
+            e->buf[e->len++] = AND(R_S7, R_T0, R_V1);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            *cmax += 12;
+            return 2;
         }
     }
 
