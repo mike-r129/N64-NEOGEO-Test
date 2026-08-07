@@ -41,6 +41,15 @@
 .endm
 
      .section .sdata
+#ifdef M64K_SDATA_PAD
+# Layout steering (2026-08-07): the per-insn PERFCOUNT counter bump and the
+# per-insn m64k ctx accesses must not share a dcache set (8KB direct-mapped;
+# set=(addr>>4)&511). A collision (measured: counters at ctx+7*8KB exactly)
+# ping-pongs one set EVERY dispatched insn — ~2x m68k time, corrupting every
+# fps measurement in that build. Verify disjointness with nm-perfsyms.sh
+# after ANY build used for fps numbers; steer with -DM64K_SDATA_PAD=<bytes>.
+    .space M64K_SDATA_PAD
+#endif
 pc_diff:      .long 0
 #ifdef MVS64_PERFCOUNT
 # Per-frame diagnostic counters (read+reset by emu.c's [PERF] print):
