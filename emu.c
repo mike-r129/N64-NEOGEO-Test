@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#ifdef MVS64_OPHIST
+#include <malloc.h>   // mallinfo, for the one-time [HEAP] report
+#endif
 #ifndef N64
 #include <stdlib.h>
 #endif
@@ -170,6 +173,16 @@ uint32_t profile_snd;    // ticks synthesizing audio (Z80+YM2610) this frame
 // detach. Diagnostic builds only.
 uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
 #endif
+#ifdef MVS64_OPHIST
+// Exact per-opcode execution histogram; bumped per dispatched instruction
+// in m64k_asm.S (m64k_ophist_ptr points here). 256KB, diagnostic only.
+uint32_t m64k_ophist_tab[65536] __attribute__((aligned(16)));
+#endif
+#ifdef MVS64_PERFCOUNT
+// m64k_run entries this frame: sizes the per-slice constant cost (icache
+// re-entry, register save/restore) vs the per-instruction marginal cost.
+uint32_t perf_m68k_slices;
+#endif
 
 static uint64_t m68k_exec(uint64_t clock) {
 	clock /= M68K_CLOCK_DIV;
@@ -177,6 +190,9 @@ static uint64_t m68k_exec(uint64_t clock) {
 		#ifdef USE_M64K
 		#ifdef N64
 		uint32_t t0 = TICKS_READ();
+		#ifdef MVS64_PERFCOUNT
+		perf_m68k_slices++;
+		#endif
 		m68k_clock = m64k_run(&m64k, clock);
 		profile_m68k += TICKS_DISTANCE(t0, TICKS_READ());
 		#else
@@ -553,15 +569,17 @@ int main(int argc, char *argv[]) {
 			extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
 			extern uint32_t perf_snd_pub;
 			const uint32_t fb = TICKS_PER_SECOND / 60 / 10000;  // ticks per 0.01%
-			framef("[PERF] insns=%lu skips=%lu tlb=%lu dwait=%lu dissue=%lu dend=%lu pub=%lu\n",
+			framef("[PERF] insns=%lu skips=%lu tlb=%lu slices=%lu dwait=%lu dissue=%lu dend=%lu pub=%lu\n",
 				(unsigned long)perf_m68k_insns,
 				(unsigned long)perf_idle_skips,
 				(unsigned long)perf_tlb_faults,
+				(unsigned long)perf_m68k_slices,
 				(unsigned long)(perf_draw_wait / fb),
 				(unsigned long)(perf_draw_issue / fb),
 				(unsigned long)(perf_draw_end / fb),
 				(unsigned long)(perf_snd_pub / fb));
 			perf_m68k_insns = perf_idle_skips = perf_tlb_faults = 0;
+			perf_m68k_slices = 0;
 			perf_draw_wait = perf_draw_issue = perf_draw_end = 0;
 			perf_snd_pub = 0;
 
@@ -586,6 +604,57 @@ int main(int argc, char *argv[]) {
 			perf_dr_cache = perf_dr_rspq = 0;
 			perf_dr_tiles = perf_dr_cells = perf_dr_empty = 0;
 			perf_dr_wwait = 0;
+		}
+		#endif
+		#ifdef MVS64_OPHIST
+		// Exact per-opcode execution histogram (bumped in m64k_asm.S's
+		// dispatch). Every 300 frames: dump every opcode above ~0.05% of
+		// the interval's executed instructions, then reset. Offline
+		// analysis: analyze-ophist.py (parent dir).
+		if ((g_frame % 300) == 299) {
+			// One-time: free-RDRAM report, to size the predecode table.
+			static bool mi_done = false;
+			if (!mi_done) {
+				struct mallinfo mi = mallinfo();
+				framef("[HEAP] used=%u free=%u\n",
+					(unsigned)mi.uordblks, (unsigned)mi.fordblks);
+				mi_done = true;
+			}
+			uint64_t total = 0;
+			for (int i = 0; i < 65536; i++) total += m64k_ophist_tab[i];
+			uint32_t thresh = (uint32_t)(total / 2000);
+			if (thresh < 4) thresh = 4;
+			enum { OPHIST_MAX = 384 };
+			static uint16_t sel_op[OPHIST_MAX];
+			static uint32_t sel_n[OPHIST_MAX];
+			int nsel = 0;
+			uint64_t selected = 0;
+			for (int i = 0; i < 65536 && nsel < OPHIST_MAX; i++) {
+				if (m64k_ophist_tab[i] >= thresh) {
+					sel_op[nsel] = (uint16_t)i;
+					sel_n[nsel] = m64k_ophist_tab[i];
+					selected += m64k_ophist_tab[i];
+					nsel++;
+				}
+			}
+			// insertion sort, descending by count (nsel <= 384)
+			for (int i = 1; i < nsel; i++) {
+				uint16_t o = sel_op[i]; uint32_t n = sel_n[i]; int j = i - 1;
+				while (j >= 0 && sel_n[j] < n) {
+					sel_op[j+1] = sel_op[j]; sel_n[j+1] = sel_n[j]; j--;
+				}
+				sel_op[j+1] = o; sel_n[j+1] = n;
+			}
+			framef("[OPHIST] total=%llu sel=%llu nsel=%d\n",
+				(unsigned long long)total, (unsigned long long)selected, nsel);
+			for (int i = 0; i < nsel; i += 8) {
+				char line[160]; int p = 0;
+				for (int j = i; j < nsel && j < i + 8; j++)
+					p += sprintf(line + p, " %04x:%lu",
+						sel_op[j], (unsigned long)sel_n[j]);
+				framef("[OPH]%s\n", line);
+			}
+			memset(m64k_ophist_tab, 0, sizeof(m64k_ophist_tab));
 		}
 		#endif
 		#ifdef MVS64_IDLEPROBE
