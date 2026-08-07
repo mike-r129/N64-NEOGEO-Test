@@ -345,6 +345,52 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             return 4;
         }
 
+        // move.w #imm,Dn (8 cycles, 2 words; flags baked, rig-verified).
+        if (smode == 7 && sreg == 4 && dmode == 0) {
+            uint16_t imm = fetch16(pc + 2);
+            e->buf[e->len++] = ORI(R_T0, R_ZERO, imm);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            *cmax += 8;
+            return 4;
+        }
+        // move.w (An),Dn (8 cycles, 1 word; rig-verified charge).
+        if (smode == 2 && dmode == 0) {
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = LHU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 8;
+            return 2;
+        }
+        // move.w An,Dn (4 cycles, 1 word; rig-verified charge).
+        if (smode == 1 && dmode == 0) {
+            e->buf[e->len++] = LHU(R_T0, R_A0, M64K_OFF_AREGS + 4 * sreg + 2);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+            *cmax += 4;
+            return 2;
+        }
+        // move.w (xxx).l,Dn (16 cycles, 3 words; refuse odd abs).
+        if (smode == 7 && sreg == 1 && dmode == 0) {
+            uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            if (abs & 1)
+                return 0;
+            emit_abs_host(e, R_T3, abs);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+            e->buf[e->len++] = LHU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            emit_break_check(e, e->goff + 6);
+            *cmax += 16;
+            return 6;
+        }
         // (fall through to unsupported for other MOVE.w forms)
         // move.w #imm,(An)  [movew_fsrc_other tail, 12 cycles, 2 words].
         if (smode == 7 && sreg == 4 && dmode == 2) {
@@ -503,6 +549,18 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             *cmax += 16;
             return 6;
         }
+        // move.b (xxx).l,Dn (16 cycles, 3 words; rig-verified charge).
+        if (smode == 7 && sreg == 1 && dmode == 0) {
+            uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            emit_abs_host(e, R_T3, abs);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+            e->buf[e->len++] = LBU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SB(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 3);
+            emit_moveb_flags(e, R_T0);
+            emit_break_check(e, e->goff + 6);
+            *cmax += 16;
+            return 6;
+        }
         // move.b #imm,(xxx).l (20 cycles, 4 words; flags baked).
         if (smode == 7 && sreg == 4 && dmode == 7 && dreg == 1) {
             uint8_t imm = fetch16(pc + 2) & 0xFF;
@@ -569,6 +627,59 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         }
     }
 
+    // DBF Dn block ender (dbcc_dec, m64k_asm.S 3939-3978): decrement Dn.w;
+    // pre-decrement value 0 => expire (charge 14), else loop (charge 10 in
+    // branch_exec). DBF's condition is never true, so the cc-true path
+    // (charge 12) is unreachable. LAW: 2-word self-loops (disp == -4) are
+    // refused — the interpreter's M64K_BLOCKOPS fuses the hot copy/fill
+    // shapes natively and an emitted ender would bypass that fusion.
+    // The generic sets dptr = &DREGS[n]; emitted keeps parity.
+    if ((op & 0xFFF8) == 0x51C8) {
+        int reg = op & 7;
+        int disp = (int16_t)fetch16(pc + 2);
+        uint32_t target = pc + 2 + disp;
+        int tk_delta = e->goff + 2 + disp;
+        if (disp == -4)                 // BLOCKOPS shapes stay interpreted
+            return 0;
+        if (dyn_target_is_spin(target) || (target & 1))
+            return 0;
+        // 32-bit-wrapped targets (PC near 0, negative disp) change
+        // pc_diff semantics — the interpreter maps them via jmp_exec's OR
+        // (landing at 0xFFFFxxxx inside the window); delta arithmetic on
+        // m_pc would escape the window. Stay generic (found by
+        // DBcc.btest: m_pc=0xFEFFxxxx crash + wrong-code flag fails).
+        if (target & 0xFF000000)
+            return 0;
+        if (tk_delta < -32000 || tk_delta > 32000)
+            return 0;
+        if (e->nchain > 2)
+            return 0;
+        e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_DREGS + 4 * reg);
+        e->buf[e->len++] = LHU(R_T0, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = ADDIU(R_T1, R_T0, -1);
+        e->buf[e->len++] = SH(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = BEQ(R_T0, R_ZERO, 5);   // expire path (below)
+        e->buf[e->len++] = NOP;
+        // taken (loop back): chainable — a self-loop chains to its own
+        // C_max gate, re-checking the budget every iteration.
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -10);
+        e->buf[e->len++] = ADDIU(R_T5, R_T5, tk_delta);
+        e->chain[e->nchain].at = e->len;
+        e->chain[e->nchain].target = target;
+        e->chain[e->nchain].taken = 1;
+        e->nchain++;
+        e->buf[e->len++] = JABS(main_loop);
+        e->buf[e->len++] = NOP;
+        // expired: fall through past the DBF (2 words).
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -14);
+        e->buf[e->len++] = ADDIU(R_T5, R_T5, e->goff + 4);
+        e->buf[e->len++] = JABS(main_loop);
+        e->buf[e->len++] = NOP;
+        *cmax += 14;
+        e->ended = 1;
+        return 4;
+    }
+
     // Bcc / BRA block enders (cond field from bcc_cctable, m64k_asm.S
     // ~3804-3870; flag encodings: C=bit32(s7), Z=(low32(s7)==0),
     // N=bit31(s6), N^V=bit63(s6), V=bit63^bit31). Displacement and both
@@ -589,6 +700,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             return 0;
         if (target & 1)                 // odd target: jmp_exec raises the
             return 0;                   // PC address error — stay generic
+        if (target & 0xFF000000)        // 32-bit wrap: pc_diff changes —
+            return 0;                   // stay generic (see DBF note)
         if (tk_delta < -32000 || tk_delta > 32000)
             return 0;
         if (e->nchain > 2)              // room for both exits

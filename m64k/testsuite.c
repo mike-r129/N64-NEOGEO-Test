@@ -398,6 +398,19 @@ static void run_emitter_differential(void)
     // Mixed with the new forms.
     diff_run((const uint16_t[]){0x4E71, 0x1A03, 0x4A45}, 3, 3, 150,
              "nop; move.b d3,d5; tst.w d5");
+    // MOVE source-form batch.
+    diff_run((const uint16_t[]){0x3A3C, 0x8001}, 2, 1, 100, "move.w #0x8001,d5");
+    diff_run((const uint16_t[]){0x3A3C, 0x0000}, 2, 1, 100, "move.w #0,d5 (Z)");
+    diff_run((const uint16_t[]){0x3212}, 1, 1, 100, "move.w (a2),d1");
+    diff_run((const uint16_t[]){0x300C}, 1, 1, 100, "move.w a4,d0");
+    diff_run((const uint16_t[]){0x3239, 0x0000, 0x4404}, 3, 1, 150, "move.w (abs).l,d1");
+    diff_run((const uint16_t[]){0x1039, 0x0000, 0x4403}, 3, 1, 150, "move.b (abs).l,d0");
+    // DBF ender: d0=2 -> loops twice then expires (non-self-loop shape).
+    diff_run((const uint16_t[]){0x7002, 0x4E71, 0x4E71, 0x51C8, 0xFFFA},
+             5, 4, 300, "moveq #2; nop; nop; dbf d0,-6");
+    // DBF expire-immediately: d3=0 seed.
+    diff_run((const uint16_t[]){0x51CB, 0x0004, 0x4E71, 0x4E71, 0x4E71},
+             5, 1, 200, "dbf d3,+4 (expires: d3.w==0)");
     debugf("%s emitter differential: %d sequences, %d fails\n",
            diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
 }
