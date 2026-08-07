@@ -3639,6 +3639,10 @@ jmp_exec:
     beq t3, eaptr32, dyn_probe_hit
     lw t3, 8(t2)                       # way-1 tag
     beq t3, eaptr32, dyn_probe_hit1
+    # Miss: note the target for the C-side translator (serviced at slice
+    # boundaries; last-writer-wins is fine — hot heads recur every frame).
+    la t2, __m64k_dyn_mailbox
+    sw eaptr32, 0(t2)
 #endif
 #ifdef M64K_DYNSTAT
     jal dynstat_count                  # coverage rig: count this target PC

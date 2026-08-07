@@ -99,6 +99,7 @@ static void __m64k_predecode_init(void)
  * arena. m64k_init resets the table+arena per init (the testsuite relies
  * on this: vectors rewrite guest RAM at reused addresses). */
 extern void __m64k_dynrec_init(void);
+extern void __m64k_dyn_service(m64k_t *m64k);
 #endif
 
 void m64k_init(m64k_t *m64k)
@@ -277,6 +278,9 @@ int64_t m64k_run(m64k_t *m64k, int64_t until)
             m64k->pending_exc[0] = 0;
         }
 
+        #ifdef M64K_DYNREC
+        __m64k_dyn_service(m64k);
+        #endif
         #ifdef M64K_TRACECRC
         tracecrc_slice(m64k);
         #endif

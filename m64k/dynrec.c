@@ -1,8 +1,8 @@
-// m64k dynarec phase-2a: per-form MIPS emitter (DYNREC-PHASE2-TEMPLATES.md).
+﻿// m64k dynarec phase-2a: per-form MIPS emitter (DYNREC-PHASE2-TEMPLATES.md).
 // Skeleton increment: MOVEQ only, straight-line blocks, no game-side
 // translation trigger yet (the testsuite's forced mode is the only caller).
 // NOTE (diagnostic counters): emitted blocks do not bump perf_m68k_insns /
-// OPHIST — instruction counts drift low in instrumented runs with blocks
+// OPHIST â€” instruction counts drift low in instrumented runs with blocks
 // active; use interpreter builds for those measurements.
 #include "m64k.h"
 #include "m64k_internal.h"
@@ -28,10 +28,33 @@ void __m64k_dyn_publish(void *dst, const void *src, int len)
     inst_cache_hit_invalidate(dst, len);
 }
 
+// Translation-trigger mailbox: the jmp_exec probe's miss edge stores the
+// missed target here (last-writer-wins within a slice); m64k_run services
+// it at slice boundaries (the deferred-work law: never translate/reclaim
+// while guest code may be mid-flight in the arena).
+uint32_t __m64k_dyn_mailbox;
+static uint8_t dyn_tried[1024];  // 8192-bit once-only filter (hash collisions
+                                 // only suppress translation, never break it)
+
 void __m64k_dynrec_init(void)
 {
     memset(__m64k_dyn_table, 0xFF, sizeof(__m64k_dyn_table));
+    memset(dyn_tried, 0, sizeof(dyn_tried));
+    __m64k_dyn_mailbox = 0;
     dyn_arena_used = 0;
+}
+
+void __m64k_dyn_service(m64k_t *m64k)
+{
+    uint32_t pc = __m64k_dyn_mailbox;
+    if (!pc)
+        return;
+    __m64k_dyn_mailbox = 0;
+    uint32_t h = (pc >> 1) & 8191;
+    if (dyn_tried[h >> 3] & (1u << (h & 7)))
+        return;
+    dyn_tried[h >> 3] |= 1u << (h & 7);
+    m64k_dyn_translate(m64k, pc, 8, false);
 }
 
 // ---- MIPS encoders -------------------------------------------------------
@@ -81,11 +104,14 @@ static inline uint16_t fetch16(uint32_t a)
 // m_pc to the *current* insn and jumps to main_loop so the generic path
 // replays it from scratch and raises ADDRERR bit-exactly (check_addr_bail
 // semantics; dispatch stores IR itself on the replay).
+#define EMIT_MAXWORDS 160
+#define EMIT_MAXFIX   20
+
 typedef struct {
-    uint32_t buf[96];
+    uint32_t buf[EMIT_MAXWORDS];
     int len;            // emitted words
     int goff;           // guest byte offset of the insn being emitted
-    struct { int at; int goff; } fix[8];
+    struct { int at; int goff; } fix[EMIT_MAXFIX];
     int nfix;
 } emit_t;
 
@@ -93,7 +119,7 @@ static void emit_bail_check(emit_t *e, int addr_reg)
 {
 #if M64K_CONFIG_ADDRERR
     e->buf[e->len++] = ANDI(R_T1, addr_reg, 1);
-    if (e->nfix < 8) {
+    if (e->nfix < EMIT_MAXFIX) {
         e->fix[e->nfix].at = e->len;
         e->fix[e->nfix].goff = e->goff;
         e->nfix++;
@@ -101,6 +127,24 @@ static void emit_bail_check(emit_t *e, int addr_reg)
     e->buf[e->len++] = BNE(R_T1, R_ZERO, 0);   // offset patched at finalize
     e->buf[e->len++] = NOP;
 #endif
+}
+
+// Post-access slice-break check: a guest-memory access can MMIO-fault and
+// the handler's slice-break clamp then zeroes live a1 â€” the interpreter
+// exits at exactly that insn boundary (blez in dispatch), so the block
+// must too or IRQ delivery shifts. The C_max entry gate guarantees a1 > 0
+// at every internal boundary otherwise, so this branch is never taken in
+// the no-clamp case. goff_next = guest offset of the NEXT insn (the
+// checked insn has completed).
+static void emit_break_check(emit_t *e, int goff_next)
+{
+    if (e->nfix < EMIT_MAXFIX) {
+        e->fix[e->nfix].at = e->len;
+        e->fix[e->nfix].goff = goff_next;
+        e->nfix++;
+    }
+    e->buf[e->len++] = ITYPE(0x06, R_A1, 0, 0); // blez a1, <stub> (patched)
+    e->buf[e->len++] = NOP;
 }
 
 // Common MOVE.w flag/store epilogue: value in reg (16-bit, zero-extended).
@@ -150,6 +194,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
             emit_movew_flags(e, R_T0);
+            emit_break_check(e, e->goff + 2);
             *cmax += 8;
             return 2;
         }
@@ -166,6 +211,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
             emit_movew_flags(e, R_T0);
+            emit_break_check(e, e->goff + 4);
             *cmax += 12;
             return 4;
         }
@@ -183,6 +229,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             emit_movew_flags(e, R_T2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
             e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 4);
             *cmax += 12;
             return 4;
         }
@@ -197,6 +244,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             emit_movew_flags(e, R_T6);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
             e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 4);
             *cmax += 12;
             return 4;
         }
@@ -220,7 +268,7 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
 
     emit_t e = { .len = 0, .goff = 0, .nfix = 0 };
     int ninsns = 0, cmax = 0, guest_len = 0;
-    while (ninsns < max_insns && e.len < 64 && e.nfix < 8) {
+    while (ninsns < max_insns && e.len < EMIT_MAXWORDS - 20 && e.nfix < EMIT_MAXFIX - 2) {
         int save = e.len, savefix = e.nfix;
         e.goff = guest_len;
         int gl = emit_insn(fetch16(pc + guest_len), pc + guest_len, &e, &cmax);
@@ -234,9 +282,15 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     }
     if (ninsns == 0)
         return 0;
+    // Minimum profitable length (spec): entry overhead (probe hit + gate +
+    // tail) exceeds the dispatch savings of short blocks — measured
+    // net-negative at 1-3 insn blocks (2026-08-07 480s A/B). Forced mode
+    // (testsuite) keeps single-insn blocks for coverage.
+    if (!force && ninsns < 3)
+        return 0;
 
     // Block frame: [C_max gate] body tail [bail stubs].
-    uint32_t block[96 + 16];
+    uint32_t block[EMIT_MAXWORDS + 8 + 3 * EMIT_MAXFIX];
     int n = 0;
     if (!force) {
         block[n++] = SLTI(R_T0, R_A1, cmax + 1);
