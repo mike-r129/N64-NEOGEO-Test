@@ -290,9 +290,28 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 	}
 }
 
+#if defined(N64) && defined(MVS64_WALK_RSP)
+// Runtime walk gate (twin-binary A/B law: ON and OFF builds differ by one
+// initializer constant, keeping layout identical — the old "-1.6 modal"
+// walk verdict was a cross-binary measurement and is layout-confounded).
+// The kick site latches the decision per frame so collect always matches.
+#ifdef MVS64_WALK_DISABLE
+int mvs64_walk_enable = 0;
+#else
+int mvs64_walk_enable = 1;
+#endif
+static int walk_kicked_this_frame;
+#endif
+
 static void render_sprites(void) {
 	render_begin_sprites();
 #if defined(N64) && defined(MVS64_WALK_RSP)
+	if (!walk_kicked_this_frame) {
+		int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
+		sprite_walk_consume(sprwalk_recs, nrec);
+		render_end_sprites();
+		return;
+	}
 	// OPT-IN (default OFF). The walk runs on the RSP (cmd_sprite_walk,
 	// rsp_video.S); the CPU only consumes the record list. Bit-exact
 	// (MVS64_WALKDBG dual-compute, 11.4k frames, 0 mismatches). The old
@@ -349,7 +368,8 @@ void video_render(void) {
 	// Kick the RSP sprite walk FIRST: VRAM is stable for the whole render
 	// (the 68k is not running), so the walk overlaps render_begin's CPU
 	// work and render_sprites only has to collect the finished list.
-	{
+	walk_kicked_this_frame = mvs64_walk_enable;
+	if (walk_kicked_this_frame) {
 		uint8_t aa_k;
 		bool aa_en_k = lspc_get_auto_animation(&aa_k);
 		sprite_walk_kick_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa_k, aa_en_k);
