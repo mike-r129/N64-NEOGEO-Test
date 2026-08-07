@@ -1,5 +1,40 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 CAMPAIGN DAY 2026-08-07 — SESSION RECORD (25 commits, 9bed4a5..2b55962)
+
+State: ~39-40 fps modal / 34-36 heavy (unchanged deliverable). Landed:
+- **Dynarec phases 1-3** (m64k/dynrec.c): correctness-COMPLETE — ~40
+  templates (MOVEQ/MOVE.w×9/MOVE.b×7/TST×6/CMPI/ADDI/ALU×15/MOVEA/NOP),
+  Bcc×14+BRA+DBF enders, taken-edge chaining, mailbox translation.
+  Armor: differential rig (73 seq, canary-certified), TRCRC per-frame
+  state-hash gate (bit-exact 6300 frames), [DYNTEST] EPC proof.
+  PERF VERDICT: twin-binary A/B = FLAT (infra −0.5..−1.2, translation 0).
+  Escalation to arena-residency = the remaining (long) path.
+- **Measurement science** (the day's biggest lesson): cross-binary fps
+  deltas carry ±10-15fps cache-set-alignment luck. Laws: twin binaries
+  differing by one initializer constant; layout-invariant statics
+  (fixed-size 8KB-aligned blocks); nm-perfsyms.sh counter/ctx dcache-set
+  disjointness gate before trusting ANY PERFCOUNT fps (a collision
+  doubled m68k time in a whole build family). Tools in repo root:
+  nm-hotsets.sh / nm-hotdata.sh / nm-perfsyms.sh.
+- **rspq lost-wakeup FIXED** (vendored libdragon closed-loop flush) —
+  the stability bug behind every wedge since July.
+- Measured-closed levers (clean methodology): walk-on-RSP (−1.3 modal
+  confirmed), crom front-cache (−0.6), predecode (killed earlier), Z80
+  quick steps, YM trims C1-C3, min-length sweeps, idle-probe sweep (two
+  new rare vblank spins added, 2b55962; no large spins remain).
+- Sprite-cache lookup measured at its structural floor (~1 dcache miss
+  per draw); heavy-bucket cache% is irreducible without fewer draws.
+
+**60FPS OUTLOOK**: all incremental levers are at measured floors. The
+remaining structural candidates: (a) dynarec arena-residency escalation
+(chain webs incl. fallthrough + call-graph enders + register caching;
+multi-session, bounded by the 29.5KB-hot-text/16KB-icache overlap),
+(b) RDP-side redesign of the dense-scene draw path, (c) accepting an
+overclock/expansion-dependent target. Honest estimate: 60fps is NOT
+reachable with the remaining incremental toolbox; it needs (a) or (b)
+to pay off at full scale, both multi-session bets.
+
 ## 🚀 M64K DYNAREC BLUEPRINT (2026-08-07, workflow wf_e7459c1e-49c judge synthesis)
 
 Predecode was measured-killed (see below); a true 68k→MIPS dynarec is the
