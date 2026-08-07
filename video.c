@@ -294,14 +294,15 @@ static void render_sprites(void) {
 	render_begin_sprites();
 #if defined(N64) && defined(MVS64_WALK_RSP)
 	// OPT-IN (default OFF). The walk runs on the RSP (cmd_sprite_walk,
-	// rsp_video.S); the CPU only consumes the record list. The ucode is
-	// bit-exact (MVS64_WALKDBG dual-compute, 11.4k frames, 0 mismatches) and
-	// stable in isolation, but it DEADLOCKS the RSP audio offload: sharing the
-	// rspq queue with the whole-pump/ADPCM highpri bursts trips a lost-wakeup /
-	// unrecoverable-RSP state within ~100 frames (CLEAR_HALT does not recover
-	// it). See PLAN-OPTIMIZATION.md (2026-07-10). Kept in-tree for a future
-	// rspq-hardening pass; the default N64 path is the stable C walk below.
-	int nrec = sprite_walk_produce_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa, aa_enabled);
+	// rsp_video.S); the CPU only consumes the record list. Bit-exact
+	// (MVS64_WALKDBG dual-compute, 11.4k frames, 0 mismatches). The old
+	// walk+audio deadlock was the rspq lost-wakeup race, fixed closed-loop
+	// in the vendored libdragon (patches/libdragon-rspq-closed-loop-flush.
+	// patch, 2026-08-07). The kick happened at video_render entry so the
+	// RSP walked during render_begin; here we only collect (sentinel
+	// trailer poll — no full-queue rspq_wait).
+	int nrec = sprite_walk_collect_rsp(sprwalk_recs, SPRWALK_MAX_RECS);
+	(void)aa; (void)aa_enabled;
 	#ifdef MVS64_WALKDBG
 	// Dual-compute gate: the C walk is authoritative; compare record lists
 	// per frame and log any divergence (see rsp_audio's VERIFY pattern).
@@ -344,6 +345,16 @@ void video_render(void) {
 	// Diagnostic: skip all sprite/fix drawing (RSP/RDP) to isolate whether the
 	// ~frame-537 crash is in the N64 render path. Frames still flip (blank screen).
 	return;
+#endif
+#if defined(N64) && defined(MVS64_WALK_RSP)
+	// Kick the RSP sprite walk FIRST: VRAM is stable for the whole render
+	// (the 68k is not running), so the walk overlaps render_begin's CPU
+	// work and render_sprites only has to collect the finished list.
+	{
+		uint8_t aa_k;
+		bool aa_en_k = lspc_get_auto_animation(&aa_k);
+		sprite_walk_kick_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa_k, aa_en_k);
+	}
 #endif
 #ifdef DRAW_PERF
 	uint32_t t0 = TICKS_READ();

@@ -27,29 +27,54 @@ static void rsp_sprite_begin(uint16_t *palette_ram) {
 	rspq_write(RSP_OVL_ID, 0x4, PhysicalAddr(palette_ram));
 }
 
-// Produce the visible-tile record list on the RSP (cmd_sprite_walk). The
+// Produce the visible-tile record list on the RSP (cmd_sprite_walk), split
+// into kick + collect so the RSP walks while the CPU runs render_begin (the
+// palette writeback/convert) instead of stalling in a full rspq_wait. The
 // ucode DMAs the SCB + sprite tilemaps out of the emulated VRAM, so those
-// regions are written back first; the returned count comes from the trailer
-// the ucode DMAs last (rspq_wait ⇒ the whole command is done, DMAs included).
-static int sprite_walk_produce_rsp(SprWalkRec *list, int maxrecs, uint8_t aa, bool aa_en) {
+// regions are written back first. Completion is detected by polling the
+// {nrec, ovfl} trailer the ucode DMAs LAST: the CPU pre-writes a sentinel
+// through the uncached segment (the trailer line is never cached here — the
+// collect path invalidates before any cached read), so the first non-sentinel
+// value means the whole command, DMAs included, is done. A bounded timeout
+// falls back to the old full rspq_wait.
+#define SPRWALK_SENTINEL 0xFFFFFFFFu
+static void sprite_walk_kick_rsp(SprWalkRec *list, int maxrecs, uint8_t aa, bool aa_en) {
 #ifdef MVS64_WALKDBG
 	debugf("[W] kick\n");
 #endif
+	volatile uint32_t *utrailer =
+		(volatile uint32_t *)UncachedAddr((uint8_t *)list + maxrecs*8);
+	utrailer[0] = SPRWALK_SENTINEL;
 	data_cache_hit_writeback(VIDEO_RAM, 0xBE80);                     // sprite tilemaps
 	data_cache_hit_writeback((uint8_t*)VIDEO_RAM + 0x10000, 0xC00);  // SCB
 	rspq_write(RSP_OVL_ID, 0x5, PhysicalAddr(VIDEO_RAM), PhysicalAddr(list),
 	           (maxrecs << 16) | (aa_en ? 0x100 : 0) | aa);
 	rspq_flush();
+}
+static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
+	volatile uint32_t *utrailer =
+		(volatile uint32_t *)UncachedAddr((uint8_t *)list + maxrecs*8);
 #ifdef DRAW_PERF
 	uint32_t _w0 = TICKS_READ();
 #endif
-	rspq_wait();
+	uint32_t t0 = TICKS_READ();
+	while (utrailer[0] == SPRWALK_SENTINEL) {
+		if (TICKS_DISTANCE(t0, TICKS_READ()) > (int32_t)TICKS_FROM_MS(20)) {
+			// Should not happen (the walk is ~1ms): fall back to the
+			// old drain once and log. If even that leaves the sentinel,
+			// the RSP is wedged — treat as an empty frame.
+			debugf("[VIDEO] sprite walk trailer timeout, draining queue\n");
+			rspq_flush();
+			rspq_wait();
+			break;
+		}
+	}
 #ifdef DRAW_PERF
 	perf_dr_wwait += TICKS_DISTANCE(_w0, TICKS_READ());
 #endif
-	volatile uint32_t *trailer = (volatile uint32_t *)((uint8_t *)list + maxrecs*8);
-	data_cache_hit_invalidate((void *)trailer, 16);
-	uint32_t nrec = trailer[0], ovfl = trailer[1];
+	uint32_t nrec = utrailer[0], ovfl = utrailer[1];
+	if (nrec == SPRWALK_SENTINEL)
+		nrec = ovfl = 0;
 	sprwalk_rsp_ovfl = (int)ovfl;
 	if (ovfl)
 		debugf("[VIDEO] RSP sprite walk overflow: %lu dropped\n", (unsigned long)ovfl);
