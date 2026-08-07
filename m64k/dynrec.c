@@ -69,8 +69,10 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define R_T4   12  // eaptr32 (interpreter alias; plain scratch inside blocks)
 #define R_T5   13  // m_pc
 #define R_T6   14  // result: canonical MMIO store source
+#define R_S2   18  // dptr: must stay a valid even host pointer (stale-dptr law)
 #define R_S6   22  // flag_nv
 #define R_S7   23  // flag_zc
+#define R_S8   30  // flag_x
 
 #define ITYPE(op,rs,rt,imm) (((uint32_t)(op)<<26)|((rs)<<21)|((rt)<<16)|((uint16_t)(int16_t)(imm)))
 #define RTYPE(rs,rt,rd,sh,fn) (((rs)<<21)|((rt)<<16)|((rd)<<11)|((sh)<<6)|(fn))
@@ -82,12 +84,17 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define BEQ(rs,rt,off)    ITYPE(0x04,rs,rt,off)
 #define BNE(rs,rt,off)    ITYPE(0x05,rs,rt,off)
 #define LW(rt,base,off)   ITYPE(0x23,base,rt,off)
+#define LBU(rt,base,off)  ITYPE(0x24,base,rt,off)
 #define LHU(rt,base,off)  ITYPE(0x25,base,rt,off)
 #define SW(rt,base,off)   ITYPE(0x2B,base,rt,off)
 #define SH(rt,base,off)   ITYPE(0x29,base,rt,off)
 #define OR(rd,rs,rt)      RTYPE(rs,rt,rd,0,0x25)
 #define MOVE(rd,rs)       RTYPE(rs,R_ZERO,rd,0,0x21)  // addu rd, rs, zero
 #define SLLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x00)
+#define DSLL(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x38)
+#define DSRL32(rd,rt,sa)  RTYPE(0,rt,rd,sa,0x3E)  // shift (sa+32)
+#define DADDU(rd,rs,rt)   RTYPE(rs,rt,rd,0,0x2D)
+#define DSUBU(rd,rs,rt)   RTYPE(rs,rt,rd,0,0x2F)
 #define JABS(addr)        ((2u<<26)|((((uint32_t)(uintptr_t)(addr))>>2)&0x3FFFFFF))
 #define NOP               0u
 
@@ -182,6 +189,49 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         int sreg = op & 7, smode = (op >> 3) & 7;
         int dreg = (op >> 9) & 7, dmode = (op >> 6) & 7;
 
+        // move.w Dn,Dm  [movew_f_dst_dn, 4 cycles, 1 word]: cannot fault.
+        if (smode == 0 && dmode == 0) {
+            e->buf[e->len++] = LHU(R_T0, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+            *cmax += 4;
+            return 2;
+        }
+
+        // move.w Dn,(An)  [movew_f_dst_an, 8 cycles, 1 word].
+        if (smode == 0 && dmode == 2) {
+            e->buf[e->len++] = LHU(R_T2, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = MOVE(R_T6, R_T2);
+            emit_movew_flags(e, R_T2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 8;
+            return 2;
+        }
+
+        // move.w Dn,(An)+  [movew_f_dst_anp, 8 cycles, 1 word]: A7 keeps
+        // its word-align quirk generic; post-inc commits BEFORE the store.
+        if (smode == 0 && dmode == 3 && dreg != 7) {
+            e->buf[e->len++] = LHU(R_T2, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = ADDIU(R_T1, R_T4, 2);
+            e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = MOVE(R_T6, R_T2);
+            emit_movew_flags(e, R_T2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 8;
+            return 2;
+        }
+
         // move.w (An)+,Dn  [movew_fanp_dn, 8 cycles, 1 word]: post-inc
         // commits BEFORE the load (ea_011 order); bail before any mutation.
         if (smode == 3 && dmode == 0) {
@@ -234,6 +284,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             return 4;
         }
 
+        // (fall through to unsupported for other MOVE.w forms)
         // move.w #imm,(An)  [movew_fsrc_other tail, 12 cycles, 2 words].
         if (smode == 7 && sreg == 4 && dmode == 2) {
             uint16_t imm = fetch16(pc + 2);
@@ -249,6 +300,60 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             return 4;
         }
     }
+
+    // CMPI/ADDI templates: transcription-complete but GATED OFF — the
+    // vector set has no immediate-form suites and a TRCRC flag-canary run
+    // (240s) proved these forms never enter translated blocks in the test
+    // window, so no active gate covers the hand-encodings. Enable once the
+    // emitter-differential rig (synthetic sequences run through emitted
+    // blocks vs the interpreter) exists to prove them.
+#ifdef M64K_DYNREC_UNPROVEN
+    // CMPI #imm,Dn  [cmpi_f_word/cmpi_f_byte, 8 cycles, 2 words]: CMP
+    // flags (no X), no writeback. dptr is set by the interpreter's imm
+    // decode; emitted code keeps the stale-dptr law with dptr = ctx
+    // (valid, even). 64-bit idioms: flag_zc = (a-b)<<size (bit32 = borrow),
+    // flag_nv = (a<<shift) - (b<<shift) of sign-extended 32-bit values.
+    if ((op & 0xFFF8) == 0x0C40 || (op & 0xFFF8) == 0x0C00) {
+        int reg = op & 7;
+        int word = (op & 0x40) != 0;
+        uint16_t rawimm = fetch16(pc + 2);
+        uint16_t imm = word ? rawimm : (rawimm & 0xFF);
+        int sh = word ? 16 : 24;
+        e->buf[e->len++] = MOVE(R_S2, R_A0);
+        e->buf[e->len++] = ORI(R_T0, R_ZERO, imm);
+        e->buf[e->len++] = word ? LHU(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg + 2)
+                                : LBU(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg + 3);
+        e->buf[e->len++] = DSUBU(R_T6, R_T1, R_T0);
+        e->buf[e->len++] = DSLL(R_S7, R_T6, sh);
+        e->buf[e->len++] = SLLI(R_T2, R_T0, sh);
+        e->buf[e->len++] = SLLI(R_T1, R_T1, sh);
+        e->buf[e->len++] = DSUBU(R_S6, R_T1, R_T2);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+        *cmax += 8;
+        return 4;
+    }
+
+    // ADDI.w #imm,Dn  [wave-3 W3_FULL body, 8 cycles, 2 words]: full ADD
+    // flags including X (add_f_word idiom: flag_zc = 64-bit sum<<16 with
+    // bit32 = carry, flag_x = that carry, flag_nv = sum of operands<<16).
+    if ((op & 0xFFF8) == 0x0640) {
+        int reg = op & 7;
+        uint16_t imm = fetch16(pc + 2);
+        e->buf[e->len++] = MOVE(R_S2, R_A0);
+        e->buf[e->len++] = ORI(R_T0, R_ZERO, imm);
+        e->buf[e->len++] = LHU(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = DADDU(R_T6, R_T0, R_T1);
+        e->buf[e->len++] = DSLL(R_S7, R_T6, 16);
+        e->buf[e->len++] = DSRL32(R_S8, R_S7, 0);
+        e->buf[e->len++] = SLLI(R_T0, R_T0, 16);
+        e->buf[e->len++] = SLLI(R_T1, R_T1, 16);
+        e->buf[e->len++] = DADDU(R_S6, R_T0, R_T1);
+        e->buf[e->len++] = SH(R_T6, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+        *cmax += 8;
+        return 4;
+    }
+#endif // M64K_DYNREC_UNPROVEN
     return 0;
 }
 
