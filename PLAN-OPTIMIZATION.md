@@ -1,5 +1,70 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🚀 M64K DYNAREC BLUEPRINT (2026-08-07, workflow wf_e7459c1e-49c judge synthesis)
+
+Predecode was measured-killed (see below); a true 68k→MIPS dynarec is the
+only remaining lever big enough for the 60fps gate (est +6..+10 fps full
+line, 8-14 sessions). SPINE = minimal-risk hybrid, escalate with DYNSTAT
+evidence. NON-NEGOTIABLE LAWS (judge-verified against sources):
+- Interpreter-identical register/flag conventions: ctx=a0, m_cycles=a1
+  LIVE (hw_n64.S clamps saved a1), flags s6/s7/s8 eager in the existing
+  encodings, loads→t0, stores from t6/result, canonical lwl/lwr-swl/swr
+  pairs lifted as macros. Zero marshalling at any block boundary; bail to
+  the interpreter at ANY insn boundary.
+- **C_max entry gate**: enter a block only if m_cycles > worst-case
+  one-pass charge (re-tested on DBF back-edges) — the interpreter blezes
+  m_cycles before EVERY insn, so this is the only slice model that keeps
+  slice-exit/IRQ boundaries bit-identical (block-head-only checks overshoot
+  up to a block and change IRQ delivery points).
+- Per-insn template-order cycle charges (no batching initially); MMIO
+  observes the same mid-instruction clock.
+- **hw_n64.S EPC ranges**: BOTH checks (ts_cur refresh ~:249, slice-break
+  a1 clamp ~:417) must also accept [dyn_arena_lo, dyn_arena_hi) or MMIO
+  from translated code silently loses mid-slice clock accuracy. Prove with
+  an arena-resident MMIO stub unit test.
+- **Delay-slot law**: hw_n64.S's delay-slot resolver only recognizes
+  jr t0/t1/t3, jalr t7, jr ra — no trap-capable access in any other
+  indirect delay slot, ever.
+- **PBROM bank hook**: bank switches run in the asm TLB fast path
+  (asm_pbrom_bankno_w, hw_n64.S ~:783) and NEVER reach hw.c write_pbrom —
+  any bank-keyed translation must hook the asm path. Phases 1-2: the
+  0x2xxxxx window is simply never translated. Page 0x000000-0x00007F
+  (vector swap memcpy target) also excluded. ROM-only translation; RAM
+  code never translated.
+- Invalidation/arena reclamation DEFERRED to slice boundaries (an MMIO
+  trap inside translated code must not free the code it returns into).
+- Block table 1024×2-way from day one (direct-mapped hash evicts hot heads
+  silently). Arena 256KB→2MB kseg0-cached; publish primitive = write +
+  data_cache_hit_writeback + inst_cache_hit_invalidate + pointer publish.
+- Density law: ≤40B emitted per guest insn average, hot/cold arena split
+  (bails/resolver stubs in a cold sub-arena); [DYNSTAT] gates every phase.
+- s3 stays reserved (predecode scaffold). Interpreter hot loop untouched:
+  probes ONLY at _m64k_asmrun entry (after IRQ check) and jmp_exec (after
+  the idle-skip compares), ~8 insns each.
+
+**PHASE 1 (one session, NO emitted guest code):** M64K_DYNREC knob
+default-OFF; arena + publish primitive; both probe sites with an empty
+hash; the hw_n64.S EPC-range extension + arena MMIO-stub proof; DBF/branch
+hot-counters + [DYNSTAT] listing candidate superblock spans, % of executed
+insns in-span NET of M64K_BLOCKOPS-covered shapes, and the PC-region split
+(P_ROM / PBROM-window / WORK_RAM — decides if bank-keyed translation must
+be pulled forward); the deterministic per-frame 68k PC/reg/cycle trace-CRC
+rig (ISViewer) demonstrated baseline-vs-baseline identical. Gates: build
+green both knob states; testsuite 125/126; bucket-matched fps flat with
+probes-in (≤0.3); hot-text audit ≤13.7KB; MMIO-stub test green.
+
+**PHASE 2+:** per-form emitter from the debugged fast-path templates
+(collapse decode preambles; PC-relative/immediates baked at translate
+time), forced-superblock testsuite mode, then A's escalations gated on
+DYNSTAT: direct chaining (resolver stubs, publish-ordering law),
+per-block register caching (dirty writeback at every exit incl. bails),
+dead-flag elimination (flags always correct at every possible exit),
+PBROM bank-keyed maps via the asm hook. Est ~28-40 host cyc/insn after
+phase 2, ~25-35 after density work (vs ~73 today → m68k ~11ms → ~4-5ms).
+
+Full designs + judge: workflow wf_e7459c1e-49c journal (A = maximal block
+dynarec, B = hybrid; judge = synthesis, all flaws enumerated).
+
 ## 🎯 60FPS CAMPAIGN ROADMAP (2026-08-07) — four tracks, workflow-planned + adversarially verified
 
 Goal (user): reach 60 fps in ares testing as the finish gate, sound/graphics
