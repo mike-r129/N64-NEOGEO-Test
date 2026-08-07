@@ -18,6 +18,12 @@ M64K_CONFIG += -DM64K_CONFIG_ADDR_WRAP=1
 # Enable the inline fast paths so the testsuite exercises them (with ADDRERR=1
 # they additionally cover the bail-to-generic odd-address route).
 M64K_CONFIG += -DM64K_FASTPATHS
+# Also test the parked wave-3 full set (default-OFF in the game build: the
+# extra ~1.7KB of handlers pushed m64k text to 15.3KB and the whole-frame
+# icache regression outweighed the saved instructions — see
+# PLAN-OPTIMIZATION.md 2026-08-06). Kept testsuite-covered as the seed
+# handler corpus for the predecode project.
+M64K_CONFIG += -DM64K_W3_FULL
 
 N64_CFLAGS += $(M64K_CONFIG)
 N64_ASFLAGS += $(M64K_CONFIG)
