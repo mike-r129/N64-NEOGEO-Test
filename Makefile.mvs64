@@ -19,7 +19,7 @@ src = $(core_src) m68kcpu.c m68kops.c m68kdasm.c
 asm =
 else
 # Default: fast m64k MIPS-asm 68k interpreter (0xFF000000 TLB window + hw_n64.S).
-src = $(core_src) m64k/m64k.c m64k/tlb.c
+src = $(core_src) m64k/m64k.c m64k/tlb.c m64k/dynrec.c
 asm = hw_n64.S m64k/m64k_asm.S
 CFLAGS += -DUSE_M64K
 # DBF block-op fast path (fused copy/fill loops; VRAM-port helper lives in

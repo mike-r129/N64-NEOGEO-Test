@@ -42,6 +42,13 @@ void m64k_init(m64k_t *m64k);
 void m64k_pulse_reset(m64k_t *m64k);
 int64_t m64k_run(m64k_t *m64k, int64_t until);
 
+#ifdef M64K_DYNREC
+/** @brief Translate a straight-line block at pc into the dynarec table
+ * (dynrec.c). force skips the C_max entry gate — testsuite forced mode
+ * only. Returns the number of guest instructions translated (0 = none). */
+int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force);
+#endif
+
 /**
  * @brief Map a linear buffer of memory into the m68k memory map.
  *

@@ -145,6 +145,15 @@ void run_testsuite(const char *fn)
             (void)m68k_ram_r8(final.ram[i][0]);
 
         // Run the opcode
+        #ifdef M64K_DYNREC
+        // Forced-superblock mode: translate the vector's single insn with
+        // the C_max gate skipped (vectors run with m_cycles=1, which the
+        // gate would always refuse), so every supported-form vector
+        // exercises the emitted block end-to-end via the slice-entry
+        // probe. m64k_init above reset the table+arena, so blocks never
+        // leak across vectors (they rewrite RAM at reused addresses).
+        m64k_dyn_translate(&m64k, m64k.pc, 1, true);
+        #endif
         int elapsed_cycles = m64k_run(&m64k, 1);
 
         // Check the results

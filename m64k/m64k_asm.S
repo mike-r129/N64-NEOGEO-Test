@@ -518,7 +518,7 @@ _m64k_asmrun:
     lw t3, 0(t2)                       # way-0 tag
     beq t3, t1, dyn_probe_hit
      lw t3, 8(t2)                      # way-1 tag
-    beq t3, t1, dyn_probe_hit
+    beq t3, t1, dyn_probe_hit1
      nop
     .set pop
 #endif
@@ -547,7 +547,7 @@ _m64k_asmrun:
     or flag_x, t1
     #endif
 
-#ifdef M64K_PREDECODE
+#if defined(M64K_PREDECODE) || defined(M64K_DYNREC)
     .globl main_loop
 #endif
 ALIGN(main_loop):
@@ -3638,7 +3638,7 @@ jmp_exec:
     lw t3, 0(t2)                       # way-0 tag
     beq t3, eaptr32, dyn_probe_hit
     lw t3, 8(t2)                       # way-1 tag
-    beq t3, eaptr32, dyn_probe_hit
+    beq t3, eaptr32, dyn_probe_hit1
 #endif
 #ifdef M64K_DYNSTAT
     jal dynstat_count                  # coverage rig: count this target PC
@@ -4536,12 +4536,21 @@ op_pack: op_rtm: op_trapcc: op_unpk:
     j main_loop_exit
 
 #ifdef M64K_DYNREC
-# Dynarec probe hit target. Phase 1: unreachable (the block table is empty
-# and its 0xFFFFFFFF tags can never equal a 24-bit guest PC); phase 2
-# replaces this with the C_max entry gate + block dispatch. Kept cold, far
-# from the dispatch hot text.
-ALIGN(dyn_probe_hit):
-    j main_loop
+# Dynarec probe hit: way-resolved block dispatch. Both probe sites leave
+# t2 = &set; the emitted block (dynrec.c) carries its own C_max entry gate
+# and every exit restores the m_pc/main_loop contract. "jr t0" is in the
+# TLB handler's delay-slot resolver set; delay slots stay nop regardless.
+    .set push
+    .set noreorder
+ALIGN(dyn_probe_hit):                  # way-0 hit
+    lw t0, 4(t2)
+    jr t0
+     nop
+ALIGN(dyn_probe_hit1):                 # way-1 hit
+    lw t0, 12(t2)
+    jr t0
+     nop
+    .set pop
 #endif
 
 #ifdef M64K_DYNSTAT

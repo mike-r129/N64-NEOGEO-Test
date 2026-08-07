@@ -93,32 +93,12 @@ static void __m64k_predecode_init(void)
 #endif
 
 #ifdef M64K_DYNREC
-/* Dynarec phase-1 infrastructure (PLAN-OPTIMIZATION.md blueprint): the code
- * arena, the 2-way block table probed by m64k_asm.S, and the publish
- * primitive. Phase 1 emits no guest code: the table stays empty (tags all
- * 0xFFFFFFFF — guest PCs are 24-bit, so the probe hit path is unreachable)
- * and the arena is only exercised by the game's boot-time [DYNTEST] stub,
- * which proves the hw_n64.S EPC-range checks accept arena addresses. */
-uint8_t __m64k_dyn_arena[M64K_DYN_ARENA_SIZE] __attribute__((aligned(32)));
-
-/* Per set: { tag0 (guest PC), host0, tag1, host1 }. Probed in m64k_asm.S at
- * _m64k_asmrun entry and jmp_exec; set index = (pc >> 1) & (SETS-1). */
-uint32_t __m64k_dyn_table[M64K_DYN_TABLE_SETS * 4] __attribute__((aligned(16)));
-
-/* Publish primitive: emitted code must be written back from dcache and the
- * stale icache lines invalidated BEFORE any pointer to it is published (the
- * table insert in later phases is the publish step and must come last). */
-void __m64k_dyn_publish(void *dst, const void *src, int len)
-{
-    memcpy(dst, src, len);
-    data_cache_hit_writeback(dst, len);
-    inst_cache_hit_invalidate(dst, len);
-}
-
-static void __m64k_dynrec_init(void)
-{
-    memset(__m64k_dyn_table, 0xFF, sizeof(__m64k_dyn_table));
-}
+/* Dynarec state (arena, 2-way block table, publish primitive, emitter)
+ * lives in dynrec.c; the table is probed by m64k_asm.S at _m64k_asmrun
+ * entry and jmp_exec, and hw_n64.S range-checks fault EPCs against the
+ * arena. m64k_init resets the table+arena per init (the testsuite relies
+ * on this: vectors rewrite guest RAM at reused addresses). */
+extern void __m64k_dynrec_init(void);
 #endif
 
 void m64k_init(m64k_t *m64k)
