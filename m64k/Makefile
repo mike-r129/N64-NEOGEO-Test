@@ -30,6 +30,13 @@ M64K_CONFIG += -DM64K_W3_FULL
 # misses, more than phase-2 specialization could recover. Enable here to
 # re-test the machinery if the design is ever revisited.
 # M64K_CONFIG += -DM64K_PREDECODE
+# m64k dynarec phase-1 machinery (arena + empty block-table probes): opt-in
+# via make ... DYNREC_ON=1 so the testsuite covers the probe-instrumented
+# dispatch. (The EPC-range extension lives in the game's hw_n64.S and is
+# proven by the game-side boot [DYNTEST].)
+ifdef DYNREC_ON
+M64K_CONFIG += -DM64K_DYNREC
+endif
 
 N64_CFLAGS += $(M64K_CONFIG)
 N64_ASFLAGS += $(M64K_CONFIG)

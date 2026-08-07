@@ -161,6 +161,56 @@ static int16_t audio_frame[(AUDIO_FREQ / 5 + 16) * 2];
 #ifdef USE_M64K
 m64k_t m64k;
 #endif
+#if defined(N64) && defined(USE_M64K) && defined(M64K_DYNREC)
+// Boot-time proof that hw_n64.S's EPC-range checks accept dynarec-arena
+// addresses (a non-negotiable dynarec law: MMIO from translated code must
+// keep mid-slice clock accuracy and honor slice-break clamps). Publishes a
+// tiny stub into the arena ("lbu v0, 0(a2); jr ra") and calls it via the
+// hw_n64.S thunk with a1 = sentinel and a2 = an MMIO address (REG_P1CNT,
+// a pure input-port read). The stub's load TLB-faults with EPC inside the
+// arena; on success the handler must have (1) refreshed ts_cur from a1 and
+// (2) consumed slice_break: banked a1 into forced_remaining and clamped the
+// saved a1 to 0.
+static void m64k_dyntest(m64k_t *ctx)
+{
+	extern uint8_t __m64k_dyn_arena[];
+	extern void __m64k_dyn_publish(void *dst, const void *src, int len);
+	extern uint32_t __m64k_dyntest_thunk(uint32_t unused, uint32_t a1_sentinel, uint32_t mmio_addr);
+	extern m64k_t *__m64k_live;
+
+	// The load MUST target t0: the handler's SAFE_MODE check (tlb_readhwio)
+	// enforces the interpreter's canonical loads->t0 convention and bails to
+	// the crash screen for any other RT — emitted code is bound by the same
+	// law (first [DYNTEST] run proved the check fires: an lbu into v0 died).
+	static const uint32_t stub[4] = {
+		0x90C80000,  // lbu t0, 0(a2)   <- TLB-faults: EPC is arena-resident
+		0x03E00008,  // jr ra
+		0x00000000,  // nop (delay slot)
+		0x00000000,
+	};
+	__m64k_dyn_publish(__m64k_dyn_arena, stub, sizeof(stub));
+
+	const uint32_t sent = 0x00123456;
+	ctx->forced_remaining = 0;
+	ctx->ts_cur = 0xDEAD0001;
+	ctx->slice_break = 1;
+	__m64k_live = ctx;
+	uint32_t a1_after = __m64k_dyntest_thunk(0, sent, 0xFF300000);
+	__m64k_live = NULL;
+
+	bool ok_tscur = (ctx->ts_cur == sent);
+	bool ok_clamp = (ctx->forced_remaining == (int32_t)sent) && (a1_after == 0);
+	bool ok_break = (ctx->slice_break == 0);
+	debugf("[DYNTEST] arena EPC accept: ts_cur=%s clamp=%s break=%s -> %s\n",
+		ok_tscur ? "ok" : "FAIL", ok_clamp ? "ok" : "FAIL",
+		ok_break ? "ok" : "FAIL",
+		(ok_tscur && ok_clamp && ok_break) ? "PASS" : "FAIL");
+
+	ctx->forced_remaining = 0;
+	ctx->ts_cur = 0;
+	ctx->slice_break = 0;
+}
+#endif
 static uint64_t g_clock, g_clock_framebegin;
 static uint64_t m68k_clock;
 static EmuEvent events[MAX_EVENTS];
@@ -463,6 +513,9 @@ int main(int argc, char *argv[]) {
 
 	#ifdef USE_M64K
 	m64k_pulse_reset(&m64k);
+	#if defined(N64) && defined(M64K_DYNREC)
+	m64k_dyntest(&m64k);
+	#endif
 	#else
 	m68k_set_cpu_type(M68K_CPU_TYPE_68000);
 	m68k_pulse_reset();
@@ -559,6 +612,19 @@ int main(int argc, char *argv[]) {
 			#else
 			(uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
 			#endif
+		#ifdef M64K_TRACECRC
+		{
+			// Per-frame 68k state-trace hash (dynarec bit-exactness rig,
+			// m64k.c): two runs of the same build+inputs must emit identical
+			// [TRCRC] streams; a dynarec build must match the interpreter's.
+			extern uint32_t __m64k_tracecrc, __m64k_tracecrc_slices;
+			framef("[TRCRC] f=%d crc=%08lx slices=%lu\n", g_frame,
+				(unsigned long)__m64k_tracecrc,
+				(unsigned long)__m64k_tracecrc_slices);
+			__m64k_tracecrc = 2166136261u;
+			__m64k_tracecrc_slices = 0;
+		}
+		#endif
 		#ifdef MVS64_PERFCOUNT
 		{
 			// Diagnostic counters (m64k_asm.S / hw_n64.S): executed 68k

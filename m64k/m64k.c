@@ -92,6 +92,35 @@ static void __m64k_predecode_init(void)
 }
 #endif
 
+#ifdef M64K_DYNREC
+/* Dynarec phase-1 infrastructure (PLAN-OPTIMIZATION.md blueprint): the code
+ * arena, the 2-way block table probed by m64k_asm.S, and the publish
+ * primitive. Phase 1 emits no guest code: the table stays empty (tags all
+ * 0xFFFFFFFF — guest PCs are 24-bit, so the probe hit path is unreachable)
+ * and the arena is only exercised by the game's boot-time [DYNTEST] stub,
+ * which proves the hw_n64.S EPC-range checks accept arena addresses. */
+uint8_t __m64k_dyn_arena[M64K_DYN_ARENA_SIZE] __attribute__((aligned(32)));
+
+/* Per set: { tag0 (guest PC), host0, tag1, host1 }. Probed in m64k_asm.S at
+ * _m64k_asmrun entry and jmp_exec; set index = (pc >> 1) & (SETS-1). */
+uint32_t __m64k_dyn_table[M64K_DYN_TABLE_SETS * 4] __attribute__((aligned(16)));
+
+/* Publish primitive: emitted code must be written back from dcache and the
+ * stale icache lines invalidated BEFORE any pointer to it is published (the
+ * table insert in later phases is the publish step and must come last). */
+void __m64k_dyn_publish(void *dst, const void *src, int len)
+{
+    memcpy(dst, src, len);
+    data_cache_hit_writeback(dst, len);
+    inst_cache_hit_invalidate(dst, len);
+}
+
+static void __m64k_dynrec_init(void)
+{
+    memset(__m64k_dyn_table, 0xFF, sizeof(__m64k_dyn_table));
+}
+#endif
+
 void m64k_init(m64k_t *m64k)
 {
     memset(m64k, 0, sizeof(*m64k));
@@ -99,6 +128,9 @@ void m64k_init(m64k_t *m64k)
     __m64k_tlb_reset(); // FIXME: this clears all TLB entries
     #ifdef M64K_PREDECODE
     __m64k_predecode_init();
+    #endif
+    #ifdef M64K_DYNREC
+    __m64k_dynrec_init();
     #endif
 }
 
@@ -187,6 +219,33 @@ void m64k_exception_interrupt(m64k_t *m64k, int level)
     m64k->cycles += __m64k_exception_cycle_table[24 + level];
 }
 
+#ifdef M64K_TRACECRC
+/* Deterministic per-slice 68k state hash (dynarec bit-exactness rig): after
+ * every interpreter slice the full architectural state is folded into a
+ * running hash, printed+reset once per frame by emu.c ([TRCRC]). Two runs of
+ * the same inputs must produce identical streams; the dynarec build is later
+ * gated on matching the interpreter's stream frame by frame. */
+uint32_t __m64k_tracecrc = 2166136261u;
+uint32_t __m64k_tracecrc_slices;
+
+static void tracecrc_slice(const m64k_t *m64k)
+{
+    uint32_t h = __m64k_tracecrc;
+    #define MIX(v) (h = (h ^ (uint32_t)(v)) * 2654435761u)
+    MIX(m64k->pc);
+    for (int i = 0; i < 8; i++) MIX(m64k->dregs[i]);
+    for (int i = 0; i < 8; i++) MIX(m64k->aregs[i]);
+    MIX(m64k->usp);
+    MIX(m64k->ssp);
+    MIX(m64k->sr);
+    MIX((uint32_t)m64k->cycles);
+    MIX((uint32_t)((uint64_t)m64k->cycles >> 32));
+    #undef MIX
+    __m64k_tracecrc = h;
+    __m64k_tracecrc_slices++;
+}
+#endif
+
 int64_t m64k_run(m64k_t *m64k, int64_t until)
 {
     __m64k_live = m64k;
@@ -237,6 +296,10 @@ int64_t m64k_run(m64k_t *m64k, int64_t until)
             }
             m64k->pending_exc[0] = 0;
         }
+
+        #ifdef M64K_TRACECRC
+        tracecrc_slice(m64k);
+        #endif
     }
 
     return m64k->cycles;

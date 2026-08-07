@@ -27,6 +27,12 @@
 #define M64K_OFF_SLICE_BREAK       (M64K_OFF_CHECK_INTERRUPTS + 1 * 1)
 #define M64K_OFF_FORCED_REMAINING  (M64K_OFF_SLICE_BREAK + 1 * 1)
 
+// Dynarec (M64K_DYNREC, PLAN-OPTIMIZATION.md blueprint). Shared between the
+// C side (arena/table storage in m64k.c), the interpreter probe sites
+// (m64k_asm.S) and the game TLB handler's EPC-range checks (hw_n64.S).
+#define M64K_DYN_ARENA_SIZE   (256 * 1024)
+#define M64K_DYN_TABLE_SETS   1024
+
 
 #ifndef __ASSEMBLER__
 #include "m64k.h"

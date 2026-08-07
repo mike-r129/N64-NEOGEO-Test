@@ -45,6 +45,21 @@ CFLAGS += -DM64K_PREDECODE
 ASFLAGS += -DM64K_PREDECODE
 N64_ASFLAGS += -DM64K_PREDECODE
 endif
+# m64k dynarec (60fps campaign, PLAN-OPTIMIZATION.md blueprint). Phase 1 is
+# infrastructure only: 256KB code arena + publish primitive, empty
+# block-table probes at the two blessed sites (_m64k_asmrun entry, jmp_exec),
+# and the hw_n64.S EPC-range extension proven at boot by [DYNTEST]. No guest
+# code is emitted yet. Opt-in: make ... DYNREC_ON=1.
+ifdef DYNREC_ON
+CFLAGS += -DM64K_DYNREC
+ASFLAGS += -DM64K_DYNREC
+N64_ASFLAGS += -DM64K_DYNREC
+endif
+# Deterministic per-slice 68k state-trace hash printed per frame ([TRCRC]);
+# the dynarec bit-exactness gate. Opt-in: make ... TRCRC_ON=1.
+ifdef TRCRC_ON
+CFLAGS += -DM64K_TRACECRC
+endif
 endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 

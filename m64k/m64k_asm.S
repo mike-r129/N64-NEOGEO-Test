@@ -118,6 +118,12 @@ opshiftsmem:
 #ifdef M64K_PREDECODE
 #define pd_l1base   s3     // base of the predecode per-page L1 table (__m64k_pd_l1)
 #endif
+#ifdef M64K_DYNREC
+#ifdef M64K_PREDECODE
+#error "M64K_DYNREC and M64K_PREDECODE both claim s3"
+#endif
+#define dyn_tab     s3     // base of the dynarec block table (__m64k_dyn_table)
+#endif
 #define opsize      s4     // size of the current instruction (1=byte, 2=word, 4=long, 0=not decoded yet)
 #define __________  s5     // unused (NOTE: this is used within movem)
 #define flag_nv     s6     // bit 31: N; bit 63: N^V
@@ -456,6 +462,9 @@ _m64k_asmrun:
 #ifdef M64K_PREDECODE
     la pd_l1base, __m64k_pd_l1
 #endif
+#ifdef M64K_DYNREC
+    la dyn_tab, __m64k_dyn_table
+#endif
     dli zx64_mask, 0x00000000FFFFFFFF
     lw t1, M64K_OFF_PC(ctx)
     lw t0, M64K_OFF_SR(ctx)
@@ -493,6 +502,26 @@ _m64k_asmrun:
     #if M64K_CONFIG_TIMING_ACCURACY >= 0
     li rmw_cyctable, 0
     #endif
+
+#ifdef M64K_DYNREC
+    # Dynarec block-table probe, slice-entry site (phase 1: the table is
+    # empty — tags are all 0xFFFFFFFF and guest PCs are 24-bit, so the hit
+    # path is unreachable; this measures the shipping lookup cost and
+    # reserves the site). Set = ((pc >> 1) & (SETS-1)) * 16 bytes.
+    .set push
+    .set noreorder
+    lw t1, M64K_OFF_PC(ctx)
+    srl t2, t1, 1
+    andi t2, (M64K_DYN_TABLE_SETS-1)
+    sll t2, 4
+    addu t2, dyn_tab
+    lw t3, 0(t2)                       # way-0 tag
+    beq t3, t1, dyn_probe_hit
+     lw t3, 8(t2)                      # way-1 tag
+    beq t3, t1, dyn_probe_hit
+     nop
+    .set pop
+#endif
 
     #if RANDOM_INITIAL_VALUES
     #define C0_COUNT	$9
@@ -3599,6 +3628,18 @@ jmp_exec:
     lui t1, 0xFFC1
     ori t1, 0x8714
     beq m_pc, t1, idle_skip           # Universe BIOS vblank wait
+#ifdef M64K_DYNREC
+    # Dynarec block-table probe, jmp_exec site (phase 1: unreachable hit
+    # path — see the slice-entry probe). eaptr32 is the 32-bit guest target.
+    srl t2, eaptr32, 1
+    andi t2, (M64K_DYN_TABLE_SETS-1)
+    sll t2, 4
+    addu t2, dyn_tab
+    lw t3, 0(t2)                       # way-0 tag
+    beq t3, eaptr32, dyn_probe_hit
+    lw t3, 8(t2)                       # way-1 tag
+    beq t3, eaptr32, dyn_probe_hit
+#endif
     j main_loop
 idle_skip:
 #ifdef MVS64_PERFCOUNT
@@ -4490,6 +4531,15 @@ op_pack: op_rtm: op_trapcc: op_unpk:
     sw_ctx t0, M64K_OFF_PENDINGEXC+0
     addi m_pc, -2                          # 68000 stacks PC of the faulting opcode
     j main_loop_exit
+
+#ifdef M64K_DYNREC
+# Dynarec probe hit target. Phase 1: unreachable (the block table is empty
+# and its 0xFFFFFFFF tags can never equal a 24-bit guest PC); phase 2
+# replaces this with the C_max entry gate + block dispatch. Kept cold, far
+# from the dispatch hot text.
+ALIGN(dyn_probe_hit):
+    j main_loop
+#endif
 
     # End-of-text marker: the TLB handler (hw_n64.S) uses [_m64k_asmrun,
     # __m64k_asm_end) to recognize faults coming from the interpreter itself

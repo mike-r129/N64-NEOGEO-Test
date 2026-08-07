@@ -243,6 +243,35 @@ tlbcallhandler_standard:
 	# from C handlers and faults from outside m64k are skipped, as is a
 	# slice that was already clamped (forced_remaining!=0 -> ts_cur is
 	# frozen at the clamp value).
+#ifdef M64K_DYNREC
+	# Dynarec builds: faults from emitted code in the arena carry the same
+	# register conventions as the interpreter (a1 == live m_cycles), so the
+	# accept range is [_m64k_asmrun, __m64k_asm_end) OR the arena.
+	lw t0, __m64k_live
+	beqz t0, 8f
+	 ld t1, 22*8(sp)                  # faulting EPC (BD-corrected)
+	la t2, _m64k_asmrun
+	sltu t3, t1, t2
+	bnez t3, 6f                       # EPC below interpreter text: try arena
+	 nop
+	la t2, __m64k_asm_end
+	sltu t3, t1, t2
+	bnez t3, 7f                       # EPC inside interpreter text: accept
+	 nop
+6:	la t2, __m64k_dyn_arena
+	sltu t3, t1, t2
+	bnez t3, 8f                       # EPC below arena
+	 nop
+	la t2, __m64k_dyn_arena + M64K_DYN_ARENA_SIZE
+	sltu t3, t1, t2
+	beqz t3, 8f                       # EPC above arena
+	 nop
+7:	lw t2, M64K_OFF_FORCED_REMAINING(t0)
+	bnez t2, 8f
+	 ld t3, 8*8(sp)                   # saved a1 = live m_cycles
+	sw t3, M64K_OFF_TS_CUR(t0)
+8:
+#else
 	lw t0, __m64k_live
 	beqz t0, 8f
 	 ld t1, 22*8(sp)                  # faulting EPC (BD-corrected)
@@ -258,6 +287,7 @@ tlbcallhandler_standard:
 	 ld t3, 8*8(sp)                   # saved a1 = live m_cycles
 	sw t3, M64K_OFF_TS_CUR(t0)
 8:
+#endif
 	# Decode faulting instruction at EPC. We get the memory address in C0_BADVADDR,
 	# but we need to decode the RS register because it contains the actual value
 	# being read/written. Also, the opcode itself encodes the access width (eg:
@@ -411,6 +441,29 @@ tlb_restore:
 	# nested fault (C handler touching 0xFF.. space) the saved a1 is NOT
 	# m_cycles, so the break request is left set and consumed by the
 	# outermost (interpreter-level) restore instead.
+#ifdef M64K_DYNREC
+	# Dynarec builds: accept arena EPCs too (see the ts_cur check above).
+	lw t0, __m64k_live
+	beqz t0, 9f
+	 ld t1, 22*8(sp)                  # faulting EPC (BD-corrected)
+	la t2, _m64k_asmrun
+	sltu t3, t1, t2
+	bnez t3, 6f                       # EPC below interpreter text: try arena
+	 nop
+	la t2, __m64k_asm_end
+	sltu t3, t1, t2
+	bnez t3, 7f                       # EPC inside interpreter text: accept
+	 nop
+6:	la t2, __m64k_dyn_arena
+	sltu t3, t1, t2
+	bnez t3, 9f                       # EPC below arena
+	 nop
+	la t2, __m64k_dyn_arena + M64K_DYN_ARENA_SIZE
+	sltu t3, t1, t2
+	beqz t3, 9f                       # EPC above arena
+	 nop
+7:	lbu t1, M64K_OFF_SLICE_BREAK(t0)
+#else
 	lw t0, __m64k_live
 	beqz t0, 9f
 	 ld t1, 22*8(sp)                  # faulting EPC (BD-corrected)
@@ -422,6 +475,7 @@ tlb_restore:
 	sltu t3, t1, t2
 	beqz t3, 9f                       # EPC above interpreter text
 	 lbu t1, M64K_OFF_SLICE_BREAK(t0)
+#endif
 	beqz t1, 9f
 	 nop
 	sb zero, M64K_OFF_SLICE_BREAK(t0)
@@ -817,3 +871,25 @@ asm_pbrom_bankno_w:
 
 1:	li k0, 1
 	jr ra
+
+#ifdef M64K_DYNREC
+# Boot-time proof that the EPC-range checks above accept dynarec-arena
+# addresses ([DYNTEST] in emu.c): jumps to an arena-resident stub (written
+# there by the C side: "lbu v0, 0(a2); jr ra; nop") whose MMIO load takes
+# the TLB-exception path with a1 holding a caller-chosen sentinel — exactly
+# the interpreter's convention (a1 == live m_cycles). Returns the post-fault
+# value of a1 so the caller can verify the slice-break clamp fired.
+#
+# uint32_t __m64k_dyntest_thunk(uint32_t unused, uint32_t a1_sentinel,
+#                               uint32_t mmio_addr /* 0xFFxxxxxx */);
+	.global __m64k_dyntest_thunk
+__m64k_dyntest_thunk:
+	addiu sp, sp, -32
+	sd ra, 0(sp)
+	la t0, __m64k_dyn_arena
+	jalr t0
+	move v0, a1
+	ld ra, 0(sp)
+	addiu sp, sp, 32
+	jr ra
+#endif
