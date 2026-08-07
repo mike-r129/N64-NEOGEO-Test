@@ -115,8 +115,22 @@ increment, pushed individually.
   2000-3000 bucket (fixed kick/trailer-poll overhead). Walk stays
   default-OFF until D step 3 (early kick after VRAM writeback, deferred
   consume, no per-frame wait) removes the overhead; then re-A/B.
-- Next up: track A phase-1a scaffold (the big lever), D step 3,
-  C steps 3-5, B step 1.
+- D step 3 (early kick + sentinel poll) landed OPT-IN (9f6d351):
+  WALKDBG green 7.8k frames, but MEASURED flat-to-worse vs the old wait
+  protocol and modal 38.3 vs 39.9 no-walk. VERDICT: walk stays OFF —
+  its overhead exceeds the C-walk savings at moderate sprite counts.
+  Possible future: dynamic heavy-scene-only gating (spr>3000). Track D
+  closed; the rspq fix is its lasting win.
+- B step 1 (event-check gate) landed (8b4354c): WAV-identical, MEASURED
+  FLAT (us/step 3.50 vs 3.49) — the call overhead was never the cost.
+  B's remaining value is the ROM decoded-uop cache.
+- PC (-Werror) build break from the walk split fixed (45b14cb) — run
+  the WAV gate after any video.c N64-path change; it builds the PC side.
+- **Next session start here: track A phase-1a predecode scaffold** (the
+  reviewer-revised design above — record dispatch at main_loop only,
+  tails become `j main_loop`, L1 bias includes the 0xFF000000 base),
+  then C steps 3-5 (mix copy elision, emit spans, SSG batch).
+  State: modal fight bucket ~39.9-40.3 fps, heavy ~34-36.
 
 ## 📐 OPHIST + FASTPATHS WAVE 3 (2026-08-06) — the icache cliff, measured
 
