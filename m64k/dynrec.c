@@ -38,18 +38,33 @@ void __m64k_dynrec_init(void)
 #define R_ZERO 0
 #define R_A0   4   // ctx
 #define R_A1   5   // m_cycles (LIVE)
+#define R_A2   6   // mmap_mask (map_m68k = or with it at MEMORY_BASE 0xFF000000)
 #define R_T0   8   // canonical MMIO load target
+#define R_T1   9
+#define R_T2   10
+#define R_T3   11
+#define R_T4   12  // eaptr32 (interpreter alias; plain scratch inside blocks)
 #define R_T5   13  // m_pc
+#define R_T6   14  // result: canonical MMIO store source
 #define R_S6   22  // flag_nv
 #define R_S7   23  // flag_zc
 
 #define ITYPE(op,rs,rt,imm) (((uint32_t)(op)<<26)|((rs)<<21)|((rt)<<16)|((uint16_t)(int16_t)(imm)))
+#define RTYPE(rs,rt,rd,sh,fn) (((rs)<<21)|((rt)<<16)|((rd)<<11)|((sh)<<6)|(fn))
 #define ADDIU(rt,rs,imm)  ITYPE(0x09,rs,rt,imm)
 #define DADDIU(rt,rs,imm) ITYPE(0x19,rs,rt,imm)
 #define SLTI(rt,rs,imm)   ITYPE(0x0A,rs,rt,imm)
+#define ANDI(rt,rs,imm)   ITYPE(0x0C,rs,rt,imm)
 #define ORI(rt,rs,imm)    ITYPE(0x0D,rs,rt,imm)
 #define BEQ(rs,rt,off)    ITYPE(0x04,rs,rt,off)
+#define BNE(rs,rt,off)    ITYPE(0x05,rs,rt,off)
+#define LW(rt,base,off)   ITYPE(0x23,base,rt,off)
+#define LHU(rt,base,off)  ITYPE(0x25,base,rt,off)
 #define SW(rt,base,off)   ITYPE(0x2B,base,rt,off)
+#define SH(rt,base,off)   ITYPE(0x29,base,rt,off)
+#define OR(rd,rs,rt)      RTYPE(rs,rt,rd,0,0x25)
+#define MOVE(rd,rs)       RTYPE(rs,R_ZERO,rd,0,0x21)  // addu rd, rs, zero
+#define SLLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x00)
 #define JABS(addr)        ((2u<<26)|((((uint32_t)(uintptr_t)(addr))>>2)&0x3FFFFFF))
 #define NOP               0u
 
@@ -60,9 +75,46 @@ static inline uint16_t fetch16(uint32_t a)
 }
 
 // ---- Templates -----------------------------------------------------------
-// Emit one instruction if the form is supported; returns its cycle charge
-// (>0) with *len words appended to buf, or 0 if the form is untranslatable.
-static int emit_insn(uint16_t op, uint32_t *buf, int *len)
+// Emission context for one block. Address-error checks branch forward to a
+// per-check bail stub emitted after the tail: the stub rewinds nothing
+// (templates bail BEFORE any mutation, per the fast-path contract), sets
+// m_pc to the *current* insn and jumps to main_loop so the generic path
+// replays it from scratch and raises ADDRERR bit-exactly (check_addr_bail
+// semantics; dispatch stores IR itself on the replay).
+typedef struct {
+    uint32_t buf[96];
+    int len;            // emitted words
+    int goff;           // guest byte offset of the insn being emitted
+    struct { int at; int goff; } fix[8];
+    int nfix;
+} emit_t;
+
+static void emit_bail_check(emit_t *e, int addr_reg)
+{
+#if M64K_CONFIG_ADDRERR
+    e->buf[e->len++] = ANDI(R_T1, addr_reg, 1);
+    if (e->nfix < 8) {
+        e->fix[e->nfix].at = e->len;
+        e->fix[e->nfix].goff = e->goff;
+        e->nfix++;
+    }
+    e->buf[e->len++] = BNE(R_T1, R_ZERO, 0);   // offset patched at finalize
+    e->buf[e->len++] = NOP;
+#endif
+}
+
+// Common MOVE.w flag/store epilogue: value in reg (16-bit, zero-extended).
+// flag_zc = value (bit32=0 => C clear, low32 !Z), flag_nv = value<<16
+// (32-bit sll sign-extends: bit31=bit63=N, V clear). X unchanged.
+static void emit_movew_flags(emit_t *e, int reg)
+{
+    e->buf[e->len++] = MOVE(R_S7, reg);
+    e->buf[e->len++] = SLLI(R_S6, reg, 16);
+}
+
+// Emit one instruction if the form is supported. Returns the guest length
+// in bytes (>0) and adds its cycle charge to *cmax, or 0 if untranslatable.
+static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
 {
     // MOVEQ #imm,Dn: 0111 rrr 0 iiiiiiii (op_moveq: charge 4;
     // flag_nv = sign-extended byte, flag_zc = zero-extended byte,
@@ -70,11 +122,84 @@ static int emit_insn(uint16_t op, uint32_t *buf, int *len)
     if ((op & 0xF100) == 0x7000) {
         int reg = (op >> 9) & 7;
         int imm = (int8_t)(op & 0xFF);
-        buf[(*len)++] = ADDIU(R_A1, R_A1, -4);
-        buf[(*len)++] = DADDIU(R_S6, R_ZERO, imm);
-        buf[(*len)++] = ORI(R_S7, R_ZERO, op & 0xFF);
-        buf[(*len)++] = SW(R_S6, R_A0, M64K_OFF_DREGS + 4 * reg);
-        return 4;
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+        e->buf[e->len++] = DADDIU(R_S6, R_ZERO, imm);
+        e->buf[e->len++] = ORI(R_S7, R_ZERO, op & 0xFF);
+        e->buf[e->len++] = SW(R_S6, R_A0, M64K_OFF_DREGS + 4 * reg);
+        *cmax += 4;
+        return 2;
+    }
+
+    // MOVE.w family: 0011 DDD ddd sss SSS (dst reg/mode, src mode/reg).
+    // Forms below are 1:1 transcriptions of the debugged fast-path bodies
+    // (m64k_asm.S movew_*, see DYNREC-PHASE2-TEMPLATES.md) with decode
+    // preambles collapsed and code-stream displacements baked.
+    if ((op & 0xF000) == 0x3000) {
+        int sreg = op & 7, smode = (op >> 3) & 7;
+        int dreg = (op >> 9) & 7, dmode = (op >> 6) & 7;
+
+        // move.w (An)+,Dn  [movew_fanp_dn, 8 cycles, 1 word]: post-inc
+        // commits BEFORE the load (ea_011 order); bail before any mutation.
+        if (smode == 3 && dmode == 0) {
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = ADDIU(R_T2, R_T4, 2);
+            e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = LHU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            *cmax += 8;
+            return 2;
+        }
+
+        // move.w (d16,An),Dn  [movew_fsrc_d16, 12 cycles, 2 words]: d16
+        // baked from the code stream at translate time.
+        if (smode == 5 && dmode == 0) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = LHU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            emit_movew_flags(e, R_T0);
+            *cmax += 12;
+            return 4;
+        }
+
+        // move.w Dn,(d16,An)  [movew_f_dst_d16, 12 cycles, 2 words]:
+        // flags from the source value BEFORE the store; store from result.
+        if (smode == 0 && dmode == 5) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            e->buf[e->len++] = LHU(R_T2, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = MOVE(R_T6, R_T2);
+            emit_movew_flags(e, R_T2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            *cmax += 12;
+            return 4;
+        }
+
+        // move.w #imm,(An)  [movew_fsrc_other tail, 12 cycles, 2 words].
+        if (smode == 7 && sreg == 4 && dmode == 2) {
+            uint16_t imm = fetch16(pc + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ORI(R_T6, R_ZERO, imm);
+            emit_movew_flags(e, R_T6);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            *cmax += 12;
+            return 4;
+        }
     }
     return 0;
 }
@@ -93,23 +218,25 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     if ((pc & 0x00FFFFFF) < 0x80)   // vector-swap page: never translated
         return 0;
 
-    uint32_t body[64];
-    int len = 0, ninsns = 0, cmax = 0;
-    while (ninsns < max_insns && len < 48) {
-        int save = len;
-        int c = emit_insn(fetch16(pc + 2 * ninsns), body, &len);
-        if (c == 0) {
-            len = save;
+    emit_t e = { .len = 0, .goff = 0, .nfix = 0 };
+    int ninsns = 0, cmax = 0, guest_len = 0;
+    while (ninsns < max_insns && e.len < 64 && e.nfix < 8) {
+        int save = e.len, savefix = e.nfix;
+        e.goff = guest_len;
+        int gl = emit_insn(fetch16(pc + guest_len), pc + guest_len, &e, &cmax);
+        if (gl == 0) {
+            e.len = save;
+            e.nfix = savefix;
             break;
         }
-        cmax += c;
+        guest_len += gl;
         ninsns++;
     }
     if (ninsns == 0)
         return 0;
 
-    // Block frame: [C_max gate] body [tail].
-    uint32_t block[64 + 8];
+    // Block frame: [C_max gate] body tail [bail stubs].
+    uint32_t block[96 + 16];
     int n = 0;
     if (!force) {
         block[n++] = SLTI(R_T0, R_A1, cmax + 1);
@@ -118,11 +245,23 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         block[n++] = JABS(main_loop);           // bail: interpreter runs it
         block[n++] = NOP;
     }
-    memcpy(block + n, body, len * 4);
-    n += len;
-    block[n++] = ADDIU(R_T5, R_T5, 2 * ninsns); // m_pc -> next insn
+    int body_at = n;
+    memcpy(block + n, e.buf, e.len * 4);
+    n += e.len;
+    block[n++] = ADDIU(R_T5, R_T5, guest_len);  // m_pc -> next insn
     block[n++] = JABS(main_loop);
     block[n++] = NOP;
+    // Address-error bail stubs: m_pc -> the checking insn, then replay
+    // generically (nothing was mutated before the check fired).
+    for (int i = 0; i < e.nfix; i++) {
+        int stub = n;
+        if (e.fix[i].goff != 0)
+            block[n++] = ADDIU(R_T5, R_T5, e.fix[i].goff);
+        block[n++] = JABS(main_loop);
+        block[n++] = NOP;
+        int br = body_at + e.fix[i].at;
+        block[br] |= (uint16_t)(stub - (br + 1));  // patch branch offset
+    }
 
     int bytes = n * 4;
     if (dyn_arena_used + bytes + 8 > M64K_DYN_ARENA_SIZE)
