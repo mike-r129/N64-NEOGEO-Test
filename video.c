@@ -83,7 +83,9 @@ typedef struct {
 // (sprite_walk_produce_rsp) — keep it inside the object for -Warray-bounds.
 static SprWalkRec sprwalk_recs[SPRWALK_MAX_RECS + 2] __attribute__((aligned(16)));
 static int sprwalk_overflow;   // records dropped this frame (diagnostic)
+#ifdef N64
 static int sprwalk_rsp_ovfl;   // overflow count reported by the RSP walk
+#endif
 
 #ifdef N64
 	#if 1
@@ -289,8 +291,6 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 }
 
 static void render_sprites(void) {
-	uint8_t aa;
-	bool aa_enabled = lspc_get_auto_animation(&aa);
 	render_begin_sprites();
 #if defined(N64) && defined(MVS64_WALK_RSP)
 	// OPT-IN (default OFF). The walk runs on the RSP (cmd_sprite_walk,
@@ -302,7 +302,6 @@ static void render_sprites(void) {
 	// RSP walked during render_begin; here we only collect (sentinel
 	// trailer poll — no full-queue rspq_wait).
 	int nrec = sprite_walk_collect_rsp(sprwalk_recs, SPRWALK_MAX_RECS);
-	(void)aa; (void)aa_enabled;
 	#ifdef MVS64_WALKDBG
 	// Dual-compute gate: the C walk is authoritative; compare record lists
 	// per frame and log any divergence (see rsp_audio's VERIFY pattern).
