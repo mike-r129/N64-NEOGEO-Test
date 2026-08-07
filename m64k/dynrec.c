@@ -36,12 +36,30 @@ uint32_t __m64k_dyn_mailbox;
 static uint8_t dyn_tried[1024];  // 8192-bit once-only filter (hash collisions
                                  // only suppress translation, never break it)
 
+// Pending block->block chain links: exit slots that currently jump to
+// main_loop and get patched to the target block if/when it is translated.
+// Patching happens only at slice boundaries (the only time translation
+// runs), so no guest code is in flight in the arena. A full table just
+// means those exits keep going through main_loop — never a correctness
+// issue.
+static struct { uint32_t *slot; uint32_t target; } dyn_pending[512];
+static int dyn_npending;
+
 void __m64k_dynrec_init(void)
 {
     memset(__m64k_dyn_table, 0xFF, sizeof(__m64k_dyn_table));
     memset(dyn_tried, 0, sizeof(dyn_tried));
     __m64k_dyn_mailbox = 0;
     dyn_arena_used = 0;
+    dyn_npending = 0;
+}
+
+static uint32_t *dyn_lookup(uint32_t pc)
+{
+    uint32_t *set = &__m64k_dyn_table[((pc >> 1) & (M64K_DYN_TABLE_SETS - 1)) * 4];
+    if (set[0] == pc) return (uint32_t *)(uintptr_t)set[1];
+    if (set[2] == pc) return (uint32_t *)(uintptr_t)set[3];
+    return NULL;
 }
 
 void __m64k_dyn_service(m64k_t *m64k)
@@ -69,6 +87,7 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define R_T4   12  // eaptr32 (interpreter alias; plain scratch inside blocks)
 #define R_T5   13  // m_pc
 #define R_T6   14  // result: canonical MMIO store source
+#define R_V1   3   // zx64_mask (0x00000000FFFFFFFF)
 #define R_S2   18  // dptr: must stay a valid even host pointer (stale-dptr law)
 #define R_S6   22  // flag_nv
 #define R_S7   23  // flag_zc
@@ -89,6 +108,11 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define SW(rt,base,off)   ITYPE(0x2B,base,rt,off)
 #define SH(rt,base,off)   ITYPE(0x29,base,rt,off)
 #define OR(rd,rs,rt)      RTYPE(rs,rt,rd,0,0x25)
+#define AND(rd,rs,rt)     RTYPE(rs,rt,rd,0,0x24)
+#define XOR(rd,rs,rt)     RTYPE(rs,rt,rd,0,0x26)
+#define SRLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x02)
+#define BGEZ(rs,off)      ITYPE(0x01,rs,1,off)
+#define BLTZ(rs,off)      ITYPE(0x01,rs,0,off)
 #define MOVE(rd,rs)       RTYPE(rs,R_ZERO,rd,0,0x21)  // addu rd, rs, zero
 #define SLLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x00)
 #define DSLL(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x38)
@@ -120,7 +144,20 @@ typedef struct {
     int goff;           // guest byte offset of the insn being emitted
     struct { int at; int goff; } fix[EMIT_MAXFIX];
     int nfix;
+    int ended;          // a block-ender (Bcc/BRA) was emitted: stop decoding
+    struct { int at; uint32_t target; int taken; } chain[4];  // exit J slots
+    int nchain;
 } emit_t;
+
+// Baked branch targets that match the interpreter's jmp_exec idle-skip
+// list must NOT get a direct emitted branch: the skip only fires on the
+// jmp_exec path, and bypassing it would un-skip the vblank spins (the
+// single biggest perf lever). Translation refuses the ender instead.
+static bool dyn_target_is_spin(uint32_t t)
+{
+    t &= 0xFFFFFF;
+    return t == 0x00142C || t == 0x00FC02 || t == 0x001FE2 || t == 0xC18714;
+}
 
 static void emit_bail_check(emit_t *e, int addr_reg)
 {
@@ -350,6 +387,138 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         *cmax += 8;
         return 4;
     }
+    // Bcc / BRA block enders (cond field from bcc_cctable, m64k_asm.S
+    // ~3804-3870; flag encodings: C=bit32(s7), Z=(low32(s7)==0),
+    // N=bit31(s6), N^V=bit63(s6), V=bit63^bit31). Displacement and both
+    // exit PCs baked; charges: taken 10 (branch_exec), not-taken 8/12 by
+    // form. Both exits are chainable J slots. BSR (cond 1) stays generic.
+    // A baked target on the jmp_exec idle-skip list refuses the ender
+    // (the emitted branch would bypass the spin fast-forward).
+    if ((op & 0xF000) == 0x6000 && ((op >> 8) & 0xF) != 1) {
+        int cond = (op >> 8) & 0xF;
+        int disp8 = (int8_t)(op & 0xFF);
+        int glen = (disp8 == 0) ? 4 : 2;
+        int disp = (disp8 == 0) ? (int16_t)fetch16(pc + 2) : disp8;
+        int c_nt = (disp8 == 0) ? 12 : 8;
+        uint32_t target = pc + 2 + disp;
+        int tk_delta = e->goff + 2 + disp;
+        int nt_delta = e->goff + glen;
+        if (dyn_target_is_spin(target))
+            return 0;
+        if (target & 1)                 // odd target: jmp_exec raises the
+            return 0;                   // PC address error — stay generic
+        if (tk_delta < -32000 || tk_delta > 32000)
+            return 0;
+        if (e->nchain > 2)              // room for both exits
+            return 0;
+
+        // cc mini-sequence: branches with symbolic targets, offsets fixed
+        // once the sequence length is known (exits are 4 words each, the
+        // not-taken exit is the fallthrough).
+        uint32_t cc[10];
+        int ncc = 0, nbr = 0;
+        struct { int at; int to_taken; } br[2];
+        #define CCI(w)        (cc[ncc++] = (w))
+        #define CCB(w, tk)    (br[nbr].at = ncc, br[nbr].to_taken = (tk), \
+                               nbr++, cc[ncc++] = (w), cc[ncc++] = NOP)
+        switch (cond) {
+        case 0x0: break;                                    // BRA
+        case 0x2:                                           // HI: !C && !Z
+            CCI(DSRL32(R_T0, R_S7, 0)); CCI(ANDI(R_T0, R_T0, 1));
+            CCB(BNE(R_T0, R_ZERO, 0), 0);
+            CCI(AND(R_T0, R_S7, R_V1));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x3:                                           // LS: C || Z
+            CCI(DSRL32(R_T0, R_S7, 0)); CCI(ANDI(R_T0, R_T0, 1));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            CCI(AND(R_T0, R_S7, R_V1));
+            CCB(BEQ(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x4:                                           // CC: !C
+            CCI(DSRL32(R_T0, R_S7, 0)); CCI(ANDI(R_T0, R_T0, 1));
+            CCB(BEQ(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x5:                                           // CS: C
+            CCI(DSRL32(R_T0, R_S7, 0)); CCI(ANDI(R_T0, R_T0, 1));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x6:                                           // NE: !Z
+            CCI(AND(R_T0, R_S7, R_V1));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x7:                                           // EQ: Z
+            CCI(AND(R_T0, R_S7, R_V1));
+            CCB(BEQ(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x8:                                           // VC: !V
+            CCI(DSRL32(R_T0, R_S6, 31)); CCI(SRLI(R_T1, R_S6, 31));
+            CCI(XOR(R_T0, R_T0, R_T1));
+            CCB(BEQ(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0x9:                                           // VS: V
+            CCI(DSRL32(R_T0, R_S6, 31)); CCI(SRLI(R_T1, R_S6, 31));
+            CCI(XOR(R_T0, R_T0, R_T1));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0xA:                                           // PL: !N
+            CCI(SRLI(R_T0, R_S6, 31));
+            CCB(BEQ(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0xB:                                           // MI: N
+            CCI(SRLI(R_T0, R_S6, 31));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0xC:                                           // GE: !(N^V)
+            CCB(BGEZ(R_S6, 0), 1);
+            break;
+        case 0xD:                                           // LT: N^V
+            CCB(BLTZ(R_S6, 0), 1);
+            break;
+        case 0xE:                                           // GT: !(N^V) && !Z
+            CCB(BLTZ(R_S6, 0), 0);
+            CCI(AND(R_T0, R_S7, R_V1));
+            CCB(BNE(R_T0, R_ZERO, 0), 1);
+            break;
+        case 0xF:                                           // LE: (N^V) || Z
+            CCB(BLTZ(R_S6, 0), 1);
+            CCI(AND(R_T0, R_S7, R_V1));
+            CCB(BEQ(R_T0, R_ZERO, 0), 1);
+            break;
+        }
+        #undef CCI
+        #undef CCB
+        // Fix symbolic branch offsets: not-taken exit starts at ncc,
+        // taken exit at ncc+4 (or at ncc for BRA, which has no nt exit).
+        for (int i = 0; i < nbr; i++) {
+            int tgt = br[i].to_taken ? ncc + 4 : ncc;
+            cc[br[i].at] |= (uint16_t)(int16_t)(tgt - (br[i].at + 1));
+        }
+        for (int i = 0; i < ncc; i++)
+            e->buf[e->len++] = cc[i];
+        if (cond != 0x0) {              // not-taken exit (fallthrough)
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -c_nt);
+            e->buf[e->len++] = ADDIU(R_T5, R_T5, nt_delta);
+            e->chain[e->nchain].at = e->len;
+            e->chain[e->nchain].target = pc + glen;  // fallthrough head
+            e->chain[e->nchain].taken = 0;
+            e->nchain++;
+            e->buf[e->len++] = JABS(main_loop);
+            e->buf[e->len++] = NOP;
+        }
+        // taken exit
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -10);
+        e->buf[e->len++] = ADDIU(R_T5, R_T5, tk_delta);
+        e->chain[e->nchain].at = e->len;
+        e->chain[e->nchain].target = target;
+        e->chain[e->nchain].taken = 1;
+        e->nchain++;
+        e->buf[e->len++] = JABS(main_loop);
+        e->buf[e->len++] = NOP;
+        *cmax += (c_nt > 10) ? c_nt : 10;
+        e->ended = 1;
+        return glen;
+    }
     return 0;
 }
 
@@ -380,6 +549,8 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         }
         guest_len += gl;
         ninsns++;
+        if (e.ended)
+            break;
     }
     if (ninsns == 0)
         return 0;
@@ -403,9 +574,31 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     int body_at = n;
     memcpy(block + n, e.buf, e.len * 4);
     n += e.len;
-    block[n++] = ADDIU(R_T5, R_T5, guest_len);  // m_pc -> next insn
-    block[n++] = JABS(main_loop);
-    block[n++] = NOP;
+    if (!e.ended) {
+        // Straight-line tail (block ended at an unsupported form): the
+        // interpreter must decode the next insn, so no chaining here.
+        block[n++] = ADDIU(R_T5, R_T5, guest_len);
+        block[n++] = JABS(main_loop);
+        block[n++] = NOP;
+    }
+    // Ender exits already set m_pc; resolve their chain slots now if the
+    // target block exists (forced/testsuite blocks never chain: they have
+    // no C_max gate, so a chained loop would never re-check the budget).
+    // Chain policy: TAKEN exits only. Bisected 2026-08-07: full chaining
+    // (fallthrough included) diverges TRCRC at frame 377; taken-only and
+    // no-chain are both bit-exact over 6300 frames. Fallthrough chaining
+    // stays behind DYN_CHAIN_FALLTHROUGH until the divergence is
+    // root-caused; taken chains carry the hot loop back-edges anyway.
+    if (!force) {
+        for (int i = 0; i < e.nchain; i++) {
+            #ifndef DYN_CHAIN_FALLTHROUGH
+            if (!e.chain[i].taken) continue;
+            #endif
+            uint32_t *host = dyn_lookup(e.chain[i].target);
+            if (host)
+                block[body_at + e.chain[i].at] = JABS(host);
+        }
+    }
     // Address-error bail stubs: m_pc -> the checking insn, then replay
     // generically (nothing was mutated before the check fired).
     for (int i = 0; i < e.nfix; i++) {
@@ -430,6 +623,33 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     int way = (set[0] != 0xFFFFFFFF && set[2] == 0xFFFFFFFF) ? 1 : 0;
     set[way * 2 + 1] = (uint32_t)(uintptr_t)dst;
     set[way * 2 + 0] = pc;
+
+    if (!force) {
+        // Register this block's unresolved exits as pending chain links,
+        // then patch any earlier blocks waiting on this head (a self-loop
+        // registers above and resolves here, landing on its own gate).
+        for (int i = 0; i < e.nchain; i++) {
+            #ifndef DYN_CHAIN_FALLTHROUGH
+            if (!e.chain[i].taken) continue;
+            #endif
+            if (block[body_at + e.chain[i].at] == JABS(main_loop)
+                && dyn_npending < 512) {
+                dyn_pending[dyn_npending].slot =
+                    (uint32_t *)(dst + 4 * (body_at + e.chain[i].at));
+                dyn_pending[dyn_npending].target = e.chain[i].target;
+                dyn_npending++;
+            }
+        }
+        for (int i = 0; i < dyn_npending; i++) {
+            if (dyn_pending[i].target == pc) {
+                *dyn_pending[i].slot = JABS(dst);
+                data_cache_hit_writeback(dyn_pending[i].slot, 4);
+                inst_cache_hit_invalidate(dyn_pending[i].slot, 4);
+                dyn_pending[i] = dyn_pending[--dyn_npending];
+                i--;
+            }
+        }
+    }
     return ninsns;
 }
 

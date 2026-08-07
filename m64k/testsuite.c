@@ -360,6 +360,20 @@ static void run_emitter_differential(void)
     diff_run((const uint16_t[]){0x7001, 0x3A03, 0x0C42, 0x1111,
                                 0x0644, 0xFFFF, 0x3419, 0x36C0},
              8, 6, 200, "mixed x6");
+    // Bcc enders: taken/not-taken, forward/backward, both charge forms.
+    diff_run((const uint16_t[]){0x7000, 0x6702, 0x7201, 0x7402}, 4, 2, 100,
+             "moveq #0; beq.s +2 (taken)");
+    diff_run((const uint16_t[]){0x7001, 0x6702, 0x74AA}, 3, 2, 100,
+             "moveq #1; beq.s +2 (not taken)");
+    diff_run((const uint16_t[]){0x6002, 0x7201, 0x7402}, 3, 1, 100,
+             "bra.s +2");
+    diff_run((const uint16_t[]){0x6700, 0x0004, 0x7201}, 3, 1, 100,
+             "beq.w +4 (not taken, 12-cycle form)");
+    diff_run((const uint16_t[]){0x6A02, 0x7201, 0x7402}, 3, 1, 100,
+             "bpl.s +2 (N from seed flags)");
+    // Backward loop: addi.w #-1,d0 decrements to Z; bne.s -6 loops once.
+    diff_run((const uint16_t[]){0x7002, 0x0640, 0xFFFF, 0x66FA}, 4, 3, 200,
+             "moveq #2; addi.w #-1,d0; bne.s -6 (loop)");
     debugf("%s emitter differential: %d sequences, %d fails\n",
            diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
 }
