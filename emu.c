@@ -658,6 +658,19 @@ int main(int argc, char *argv[]) {
 					(unsigned long)(m64k_dynstat_pc[top[i]] & 0xFFFFFF),
 					(unsigned long)m64k_dynstat_cnt[top[i]]);
 			memset(m64k_dynstat_cnt, 0, sizeof(m64k_dynstat_cnt));
+			#ifdef M64K_DYNREC
+			{
+				// Dynarec density: cumulative translations/chains — the
+				// coverage levers phase-3 escalations are gated on.
+				extern uint32_t __m64k_dyn_stat_blocks, __m64k_dyn_stat_insns;
+				extern uint32_t __m64k_dyn_stat_chains, __m64k_dyn_stat_refused;
+				framef("[DYNSTAT2] blocks=%lu insns=%lu chains=%lu refused=%lu\n",
+					(unsigned long)__m64k_dyn_stat_blocks,
+					(unsigned long)__m64k_dyn_stat_insns,
+					(unsigned long)__m64k_dyn_stat_chains,
+					(unsigned long)__m64k_dyn_stat_refused);
+			}
+			#endif
 		}
 		#endif
 		#ifdef M64K_TRACECRC

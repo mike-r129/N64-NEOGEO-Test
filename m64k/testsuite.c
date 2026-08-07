@@ -374,6 +374,30 @@ static void run_emitter_differential(void)
     // Backward loop: addi.w #-1,d0 decrements to Z; bne.s -6 loops once.
     diff_run((const uint16_t[]){0x7002, 0x0640, 0xFFFF, 0x66FA}, 4, 3, 200,
              "moveq #2; addi.w #-1,d0; bne.s -6 (loop)");
+    // NOP, MOVE.b family (byte ops: odd addresses legal, no bail).
+    diff_run((const uint16_t[]){0x4E71}, 1, 1, 100, "nop");
+    diff_run((const uint16_t[]){0x1A03}, 1, 1, 100, "move.b d3,d5");
+    diff_run((const uint16_t[]){0x1219}, 1, 1, 100, "move.b (a1)+,d1");
+    diff_run((const uint16_t[]){0x162D, 0x0004}, 2, 1, 100, "move.b (4,a5),d3 odd");
+    diff_run((const uint16_t[]){0x1B42, 0x0006}, 2, 1, 100, "move.b d2,(6,a5) odd");
+    diff_run((const uint16_t[]){0x1482, 0x1612}, 2, 1, 100, "move.b d2,(a2); (a2),d3");
+    diff_run((const uint16_t[]){0x13C1, 0x0000, 0x4402, 0x1039, 0x0000, 0x4402},
+             6, 1, 150, "move.b d1,(abs).l; readback");
+    diff_run((const uint16_t[]){0x13FC, 0x00A5, 0x0000, 0x4403}, 4, 1, 150,
+             "move.b #0xA5,(abs).l");
+    diff_run((const uint16_t[]){0x13FC, 0x0000, 0x0000, 0x4403}, 4, 1, 150,
+             "move.b #0,(abs).l (Z)");
+    // TST.b/.w forms.
+    diff_run((const uint16_t[]){0x4A02}, 1, 1, 100, "tst.b d2");
+    diff_run((const uint16_t[]){0x4A45}, 1, 1, 100, "tst.w d5");
+    diff_run((const uint16_t[]){0x4A03}, 1, 1, 100, "tst.b d3 (Z)");
+    diff_run((const uint16_t[]){0x4A2D, 0x0002}, 2, 1, 100, "tst.b (2,a5) odd");
+    diff_run((const uint16_t[]){0x4A6C, 0x0004}, 2, 1, 100, "tst.w (4,a4)");
+    diff_run((const uint16_t[]){0x4A39, 0x0000, 0x4402}, 3, 1, 150, "tst.b (abs).l");
+    diff_run((const uint16_t[]){0x4A79, 0x0000, 0x4404}, 3, 1, 150, "tst.w (abs).l");
+    // Mixed with the new forms.
+    diff_run((const uint16_t[]){0x4E71, 0x1A03, 0x4A45}, 3, 3, 150,
+             "nop; move.b d3,d5; tst.w d5");
     debugf("%s emitter differential: %d sequences, %d fails\n",
            diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
 }

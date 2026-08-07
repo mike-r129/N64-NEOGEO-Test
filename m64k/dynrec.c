@@ -45,6 +45,12 @@ static uint8_t dyn_tried[1024];  // 8192-bit once-only filter (hash collisions
 static struct { uint32_t *slot; uint32_t target; } dyn_pending[512];
 static int dyn_npending;
 
+// Visibility counters ([DYNSTAT2] in emu.c, M64K_DYNSTAT builds): how many
+// blocks/insns actually translate in-game and whether chains ever resolve
+// (2026-08-07: zero chains resolved in 240s attract — density-limited).
+uint32_t __m64k_dyn_stat_blocks, __m64k_dyn_stat_insns;
+uint32_t __m64k_dyn_stat_chains, __m64k_dyn_stat_refused;
+
 void __m64k_dynrec_init(void)
 {
     memset(__m64k_dyn_table, 0xFF, sizeof(__m64k_dyn_table));
@@ -107,6 +113,8 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define LHU(rt,base,off)  ITYPE(0x25,base,rt,off)
 #define SW(rt,base,off)   ITYPE(0x2B,base,rt,off)
 #define SH(rt,base,off)   ITYPE(0x29,base,rt,off)
+#define SB(rt,base,off)   ITYPE(0x28,base,rt,off)
+#define LUI(rt,imm)       ITYPE(0x0F,0,rt,imm)
 #define OR(rd,rs,rt)      RTYPE(rs,rt,rd,0,0x25)
 #define AND(rd,rs,rt)     RTYPE(rs,rt,rd,0,0x24)
 #define XOR(rd,rs,rt)     RTYPE(rs,rt,rd,0,0x26)
@@ -198,6 +206,22 @@ static void emit_movew_flags(emit_t *e, int reg)
 {
     e->buf[e->len++] = MOVE(R_S7, reg);
     e->buf[e->len++] = SLLI(R_S6, reg, 16);
+}
+
+// MOVE.b/TST.b flag idiom: value in reg (zero-extended byte); shift 24.
+static void emit_moveb_flags(emit_t *e, int reg)
+{
+    e->buf[e->len++] = MOVE(R_S7, reg);
+    e->buf[e->len++] = SLLI(R_S6, reg, 24);
+}
+
+// Materialize the mapped host address of a baked 24-bit guest address
+// into reg: host = guest | 0xFF000000 (2 insns: lui sign-extends).
+static void emit_abs_host(emit_t *e, int reg, uint32_t guest)
+{
+    uint32_t host = (guest & 0x00FFFFFF) | 0xFF000000u;
+    e->buf[e->len++] = LUI(reg, host >> 16);
+    e->buf[e->len++] = ORI(reg, reg, host & 0xFFFF);
 }
 
 // Emit one instruction if the form is supported. Returns the guest length
@@ -387,6 +411,164 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         *cmax += 8;
         return 4;
     }
+    // NOP (op_nop: charge 4).
+    if (op == 0x4E71) {
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+        *cmax += 4;
+        return 2;
+    }
+
+    // MOVE.b family: byte accesses cannot raise address errors (no bail);
+    // the A7 byte quirk (+2) keeps A7 generic for (An)+ forms. Bodies from
+    // the wave-1/wave-3 fast paths (m64k_asm.S 2690-2781); abs.l forms are
+    // baked-host extensions with charges verified by the differential rig.
+    if ((op & 0xF000) == 0x1000) {
+        int sreg = op & 7, smode = (op >> 3) & 7;
+        int dreg = (op >> 9) & 7, dmode = (op >> 6) & 7;
+
+        // move.b Dn,Dm (4 cycles, 1 word).
+        if (smode == 0 && dmode == 0) {
+            e->buf[e->len++] = LBU(R_T0, R_A0, M64K_OFF_DREGS + 4 * sreg + 3);
+            e->buf[e->len++] = SB(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 3);
+            emit_moveb_flags(e, R_T0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+            *cmax += 4;
+            return 2;
+        }
+        // move.b (An)+,Dn (8 cycles, 1 word; A7 generic): post-inc by 1
+        // BEFORE the load (ea_011 order).
+        if (smode == 3 && dmode == 0 && sreg != 7) {
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = ADDIU(R_T2, R_T4, 1);
+            e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = LBU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SB(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 3);
+            emit_moveb_flags(e, R_T0);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 8;
+            return 2;
+        }
+        // move.b (d16,An),Dn (12 cycles, 2 words).
+        if (smode == 5 && dmode == 0) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = LBU(R_T0, R_T3, 0);
+            e->buf[e->len++] = SB(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 3);
+            emit_moveb_flags(e, R_T0);
+            emit_break_check(e, e->goff + 4);
+            *cmax += 12;
+            return 4;
+        }
+        // move.b Dn,(d16,An) (12 cycles, 2 words; W3 body order: flags
+        // from source before the store).
+        if (smode == 0 && dmode == 5) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            e->buf[e->len++] = LBU(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg + 3);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            emit_moveb_flags(e, R_T6);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = SB(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 4);
+            *cmax += 12;
+            return 4;
+        }
+        // move.b Dn,(An) (8 cycles, 1 word; charge rig-verified).
+        if (smode == 0 && dmode == 2) {
+            e->buf[e->len++] = LBU(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg + 3);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            emit_moveb_flags(e, R_T6);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = SB(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 8;
+            return 2;
+        }
+        // move.b Dn,(xxx).l (16 cycles, 3 words; host baked, rig-verified).
+        if (smode == 0 && dmode == 7 && dreg == 1) {
+            uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            e->buf[e->len++] = LBU(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg + 3);
+            emit_abs_host(e, R_T3, abs);
+            emit_moveb_flags(e, R_T6);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+            e->buf[e->len++] = SB(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 6);
+            *cmax += 16;
+            return 6;
+        }
+        // move.b #imm,(xxx).l (20 cycles, 4 words; flags baked).
+        if (smode == 7 && sreg == 4 && dmode == 7 && dreg == 1) {
+            uint8_t imm = fetch16(pc + 2) & 0xFF;
+            uint32_t abs = ((uint32_t)fetch16(pc + 4) << 16) | fetch16(pc + 6);
+            e->buf[e->len++] = ORI(R_T6, R_ZERO, imm);
+            emit_abs_host(e, R_T3, abs);
+            e->buf[e->len++] = ORI(R_S7, R_ZERO, imm);
+            e->buf[e->len++] = LUI(R_S6, (uint16_t)(imm << 8));
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -20);
+            e->buf[e->len++] = SB(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 8);
+            *cmax += 20;
+            return 8;
+        }
+    }
+
+    // TST.b/.w (tst fast path 2608-2637 for (d16,An); Dn and abs.l forms
+    // are baked extensions, charges rig-verified. .l and TAS stay generic).
+    if ((op & 0xFF00) == 0x4A00 && (op & 0xC0) != 0x80 && (op & 0xC0) != 0xC0) {
+        int word = (op & 0xC0) == 0x40;
+        int mode = (op >> 3) & 7, reg = op & 7;
+
+        // tst.b/.w Dn (4 cycles, 1 word).
+        if (mode == 0) {
+            e->buf[e->len++] = word
+                ? LHU(R_T0, R_A0, M64K_OFF_DREGS + 4 * reg + 2)
+                : LBU(R_T0, R_A0, M64K_OFF_DREGS + 4 * reg + 3);
+            if (word) emit_movew_flags(e, R_T0);
+            else      emit_moveb_flags(e, R_T0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
+            *cmax += 4;
+            return 2;
+        }
+        // tst.b/.w (d16,An) (12 cycles, 2 words; word form bails on odd).
+        if (mode == 5) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * reg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            if (word)
+                emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = word ? LHU(R_T0, R_T3, 0) : LBU(R_T0, R_T3, 0);
+            if (word) emit_movew_flags(e, R_T0);
+            else      emit_moveb_flags(e, R_T0);
+            emit_break_check(e, e->goff + 4);
+            *cmax += 12;
+            return 4;
+        }
+        // tst.b/.w (xxx).l (16 cycles, 3 words; host baked, always even
+        // for the word form or we refuse).
+        if (mode == 7 && reg == 1) {
+            uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            if (word && (abs & 1))
+                return 0;
+            emit_abs_host(e, R_T3, abs);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+            e->buf[e->len++] = word ? LHU(R_T0, R_T3, 0) : LBU(R_T0, R_T3, 0);
+            if (word) emit_movew_flags(e, R_T0);
+            else      emit_moveb_flags(e, R_T0);
+            emit_break_check(e, e->goff + 6);
+            *cmax += 16;
+            return 6;
+        }
+    }
+
     // Bcc / BRA block enders (cond field from bcc_cctable, m64k_asm.S
     // ~3804-3870; flag encodings: C=bit32(s7), Z=(low32(s7)==0),
     // N=bit31(s6), N^V=bit63(s6), V=bit63^bit31). Displacement and both
@@ -552,14 +734,27 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         if (e.ended)
             break;
     }
-    if (ninsns == 0)
+    if (ninsns == 0) {
+        __m64k_dyn_stat_refused++;
+        #ifdef M64K_DYNSTAT
+        debugf("[DYNREF] pc=%06lx op=%04x head\n",
+               (unsigned long)(pc & 0xFFFFFF), fetch16(pc));
+        #endif
         return 0;
+    }
     // Minimum profitable length (spec): entry overhead (probe hit + gate +
     // tail) exceeds the dispatch savings of short blocks — measured
     // net-negative at 1-3 insn blocks (2026-08-07 480s A/B). Forced mode
     // (testsuite) keeps single-insn blocks for coverage.
-    if (!force && ninsns < 3)
+    if (!force && ninsns < 3) {
+        __m64k_dyn_stat_refused++;
+        #ifdef M64K_DYNSTAT
+        debugf("[DYNREF] pc=%06lx op=%04x short n=%d stop=%04x\n",
+               (unsigned long)(pc & 0xFFFFFF), fetch16(pc), ninsns,
+               fetch16(pc + guest_len));
+        #endif
         return 0;
+    }
 
     // Block frame: [C_max gate] body tail [bail stubs].
     uint32_t block[EMIT_MAXWORDS + 8 + 3 * EMIT_MAXFIX];
@@ -595,8 +790,16 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
             if (!e.chain[i].taken) continue;
             #endif
             uint32_t *host = dyn_lookup(e.chain[i].target);
-            if (host)
+            if (host) {
                 block[body_at + e.chain[i].at] = JABS(host);
+                __m64k_dyn_stat_chains++;
+                #ifdef DYN_CHAIN_LOG
+                debugf("[CHAIN] %06lx->%06lx %s emit\n",
+                       (unsigned long)(pc & 0xFFFFFF),
+                       (unsigned long)(e.chain[i].target & 0xFFFFFF),
+                       e.chain[i].taken ? "tk" : "ft");
+                #endif
+            }
         }
     }
     // Address-error bail stubs: m_pc -> the checking insn, then replay
@@ -645,11 +848,19 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
                 *dyn_pending[i].slot = JABS(dst);
                 data_cache_hit_writeback(dyn_pending[i].slot, 4);
                 inst_cache_hit_invalidate(dyn_pending[i].slot, 4);
+                __m64k_dyn_stat_chains++;
+                #ifdef DYN_CHAIN_LOG
+                debugf("[CHAIN] ->%06lx patch slot %p\n",
+                       (unsigned long)(pc & 0xFFFFFF),
+                       (void *)dyn_pending[i].slot);
+                #endif
                 dyn_pending[i] = dyn_pending[--dyn_npending];
                 i--;
             }
         }
     }
+    __m64k_dyn_stat_blocks++;
+    __m64k_dyn_stat_insns += ninsns;
     return ninsns;
 }
 
