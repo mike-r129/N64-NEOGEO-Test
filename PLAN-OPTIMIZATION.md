@@ -1,5 +1,77 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📐 OPHIST + FASTPATHS WAVE 3 (2026-08-06) — the icache cliff, measured
+
+Session goal (user-picked): start the 68k structural spike toward 60fps.
+Re-baseline after a month away was bucket-identical to July (39.5 fps modal
+fight bucket) — state reproduced, toolchain healthy.
+
+**New diagnostic: MVS64_OPHIST** — an exact 65536-slot per-opcode execution
+histogram (dispatch bump in m64k_asm.S, table + periodic dump in emu.c,
+analyze-ophist.py in the parent dir decodes forms and classifies fast-path
+coverage). Also new: `slices=` in [PERF] (m64k_run entries/frame) and a
+one-time [HEAP] free-RDRAM report. Key numbers from a 560s run:
+- **Existing fast paths cover ~55-60% of executed instructions.** The
+  uncovered remainder is a long tail; the top uncovered LONG-path forms
+  (RTS 3.0%, MOVE.w (An)+,(An) 2.7%, BTST #,(d16,An) 1.3%, ADDI/ANDI #,Dn
+  ~1.7%, JSR/BSR ~2.2%, CMP mem/reg ~1.8%, CLR mem ~0.7%, ...) total
+  ~15-17% in-fight. NOP (1.3%) and MOVEQ (1.5%) look uncovered but their
+  generic handlers are already 1-hop-minimal — no headroom there.
+- DBF alone is 7.7-11.9% of ALL executed instructions (loop-heavy code).
+- ~4MB of RDRAM headroom exists for a predecode table (heap span 7MB,
+  ~2.9MB used).
+
+**Wave 3 (full, 14 forms) REGRESSED: the icache cliff is real.** All 14
+fast paths built and testsuite-green (125/126 CHK-only, cycle diff 2.67%
+unchanged), but the full set grew m64k_asm.o text 13,208 → 15,320 bytes and
+the bucket-matched result was **−2.9..−3.9 fps** with the m68k bucket UP
+6-11 points. The interpreter shares the direct-mapped 16KB icache with the
+TLB/MMIO trap handlers (~1000 traps/frame) and per-slice event code: at
+13.2KB there was headroom, at 15.3KB the conflict/capacity misses swamp the
+~1ms of saved instructions. **LAW: total hot interpreter text is a hard
+budget (~13.5KB). Fast paths must REPLACE cost, not ADD text.**
+
+**Slim wave 3 KEPT (+0.1..+1.2 fps all buckets, m68k bucket −1..−2):** only
+the top-density paths stay default-on — RTS (inline pop+jmp_exec, 3.05%)
+and MOVE.w (An)+,(An) / (An)+,Dn (3.3%) — text 13,624 bytes. The other 11
+bodies are parked behind `M64K_W3_FULL` (default-OFF, still built+green in
+the m64k testsuite Makefile) as the debugged seed corpus for the predecode
+project.
+
+**BUG FOUND AND FIXED (crashed the first full-wave run in the ares gate,
+NOT the testsuite): the stale-dptr invariant.** Generic immediate/register
+ops re-set `dptr` every time (decode_imm/decode_dptr/ADDQ's dummy slot);
+dptr-blind rmw consumers (the shift path's dummy `lhu t0, 2(dptr)`) rely on
+the leftover being an EVEN host pointer. Ops like CMPM.b legally leave dptr
+ODD (guest pointer), and any fast path that skips a dptr-setting generic
+extends the odd value's lifetime → misaligned-lhu CPU exception (hit at
+BIOS RAM code, PC 0xC12598). Waves 2-3 both had this latently; every fast
+path that replaces a dptr-setter now restores dptr identically (1 insn
+each: CMPI×3, ADD, ADDQ/SUBQ, and the parked wave-3 forms). Lesson: the
+testsuite runs opcodes in isolation and cannot catch cross-instruction
+register-lifetime bugs — the ares boot/play gate is the real gate for
+interpreter-state invariants.
+
+**Predecode design implications (the structural project, next):**
+1. Budget: the specialized-handler set must fit ~13KB WITH dispatch —
+   i.e. predecode must REPLACE the generic decode paths, not sit beside
+   them. Compact operand-in-record handlers, hot-first layout.
+2. Phase 1 can be semantics-neutral: per-PC records that just point at the
+   EXISTING handler (raw opcode as operand) — testsuite-gated plumbing
+   (lazy per-page tables keyed off the TLB-mapped, PBROM-linear code
+   space; ~4MB RDRAM headroom; RAM-code pages fall back to classic
+   dispatch). Phase 2 specializes per OPHIST, respecting the text budget
+   by REMOVING the corresponding generic paths.
+3. Honest sizing: dispatch+decode is only part of the 73 cyc/insn; guest
+   dcache misses and handler-body icache remain. Expect predecode to be
+   worth a few fps, not a doubling — the 60fps gap also needs the Z80
+   (threaded-code) and draw walls.
+
+Remaining walls unchanged otherwise: m68k ~65-74% (this work), draw ~30-44%
+in fights, snd 52-68% (Z80 interpreter at floor), TMEM rotation
+(hardware-facing). Deliverable: play8 (slim wave 3 + the z80 snap repack
+that missed play7).
+
 ## ❌ SPRITE WALK-ON-RSP SHELVED (2026-07-10) — ucode correct, deadlocks the RSP audio
 
 The rank-3 lever (move the 381-sprite SCB walk off the CPU onto the RSP, ~12-19% of
