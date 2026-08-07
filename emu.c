@@ -228,6 +228,14 @@ uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
 // in m64k_asm.S (m64k_ophist_ptr points here). 256KB, diagnostic only.
 uint32_t m64k_ophist_tab[65536] __attribute__((aligned(16)));
 #endif
+#ifdef M64K_DYNSTAT
+// Dynarec coverage rig (m64k_asm.S dynstat_count): per-slot counts of
+// control-transfer targets seen at jmp_exec (= the dynarec probe's exact
+// visibility) + last-writer PC per slot for collision detection. 512KB,
+// diagnostic builds only. Dumped+reset every DYNSTAT_WINDOW frames.
+uint32_t m64k_dynstat_cnt[65536] __attribute__((aligned(16)));
+uint32_t m64k_dynstat_pc[65536] __attribute__((aligned(16)));
+#endif
 #ifdef MVS64_PERFCOUNT
 // m64k_run entries this frame: sizes the per-slice constant cost (icache
 // re-entry, register save/restore) vs the per-instruction marginal cost.
@@ -612,6 +620,46 @@ int main(int argc, char *argv[]) {
 			#else
 			(uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
 			#endif
+		#ifdef M64K_DYNSTAT
+		#define DYNSTAT_WINDOW 600
+		if (g_frame && (g_frame % DYNSTAT_WINDOW) == 0) {
+			// One pass: total + PC-region aggregates (the blueprint's
+			// P_ROM / WORK_RAM / PBROM-window split — decides whether
+			// bank-keyed translation must be pulled forward) and the
+			// top-16 hottest control-transfer targets.
+			uint64_t total = 0;
+			uint32_t reg_prom = 0, reg_ram = 0, reg_pbrom = 0, reg_bios = 0, reg_other = 0;
+			int top[16]; int ntop = 0;
+			for (int i = 0; i < 65536; i++) {
+				uint32_t n = m64k_dynstat_cnt[i];
+				if (!n) continue;
+				total += n;
+				uint32_t pc = m64k_dynstat_pc[i] & 0xFFFFFF;
+				if      (pc < 0x100000) reg_prom  += n;
+				else if (pc < 0x200000) reg_ram   += n;
+				else if (pc < 0x300000) reg_pbrom += n;
+				else if (pc >= 0xC00000 && pc < 0xC20000) reg_bios += n;
+				else reg_other += n;
+				int j = ntop;
+				while (j > 0 && m64k_dynstat_cnt[top[j-1]] < n) j--;
+				if (j < 16) {
+					if (ntop < 16) ntop++;
+					for (int k = ntop - 1; k > j; k--) top[k] = top[k-1];
+					top[j] = i;
+				}
+			}
+			framef("[DYNSTAT] win=%d total=%llu prom=%lu ram=%lu pbrom=%lu bios=%lu other=%lu\n",
+				DYNSTAT_WINDOW, (unsigned long long)total,
+				(unsigned long)reg_prom, (unsigned long)reg_ram,
+				(unsigned long)reg_pbrom, (unsigned long)reg_bios,
+				(unsigned long)reg_other);
+			for (int i = 0; i < ntop; i++)
+				framef("[DYNH] pc=%06lx n=%lu\n",
+					(unsigned long)(m64k_dynstat_pc[top[i]] & 0xFFFFFF),
+					(unsigned long)m64k_dynstat_cnt[top[i]]);
+			memset(m64k_dynstat_cnt, 0, sizeof(m64k_dynstat_cnt));
+		}
+		#endif
 		#ifdef M64K_TRACECRC
 		{
 			// Per-frame 68k state-trace hash (dynarec bit-exactness rig,

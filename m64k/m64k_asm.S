@@ -3640,6 +3640,9 @@ jmp_exec:
     lw t3, 8(t2)                       # way-1 tag
     beq t3, eaptr32, dyn_probe_hit
 #endif
+#ifdef M64K_DYNSTAT
+    jal dynstat_count                  # coverage rig: count this target PC
+#endif
     j main_loop
 idle_skip:
 #ifdef MVS64_PERFCOUNT
@@ -4539,6 +4542,30 @@ op_pack: op_rtm: op_trapcc: op_unpk:
 # from the dispatch hot text.
 ALIGN(dyn_probe_hit):
     j main_loop
+#endif
+
+#ifdef M64K_DYNSTAT
+# Dynarec coverage rig (diagnostic builds only, like MVS64_OPHIST): count
+# every control-transfer target seen at jmp_exec — deliberately the SAME
+# visibility as the dynarec block-table probe (taken Bcc and non-blockop-
+# fused DBcc route through branch_exec->jmp_exec; JMP/JSR/BSR/RTS generic
+# paths land here; rts_fast/bsr_fast bypass this exactly as they bypass the
+# probe). Tables live in emu.c ([DYNSTAT] dump); slot = (pc>>1) & 0xFFFF,
+# last-writer PC recorded for collision detection. Clobbers t0/t2/t3 and
+# ra — all dead on the jmp_exec -> main_loop edge.
+ALIGN(dynstat_count):
+    srl t2, eaptr32, 1
+    andi t2, 0xFFFF
+    sll t2, 2
+    la t3, m64k_dynstat_cnt
+    addu t3, t2
+    lw t0, 0(t3)
+    addiu t0, 1
+    sw t0, 0(t3)
+    la t3, m64k_dynstat_pc
+    addu t3, t2
+    sw eaptr32, 0(t3)
+    jr ra
 #endif
 
     # End-of-text marker: the TLB handler (hw_n64.S) uses [_m64k_asmrun,

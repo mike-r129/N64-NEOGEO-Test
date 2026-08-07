@@ -53,6 +53,24 @@ rig (ISViewer) demonstrated baseline-vs-baseline identical. Gates: build
 green both knob states; testsuite 125/126; bucket-matched fps flat with
 probes-in (≤0.3); hot-text audit ≤13.7KB; MMIO-stub test green.
 
+**PHASE 1 RESULTS (2026-08-07, landed 4dd7c9e + DYNSTAT commit):** all
+gates green — [DYNTEST] PASS (both EPC checks accept the arena; the first
+run's deliberate-style failure machine-proved tlb_readhwio's SAFE_MODE
+check enforces loads->t0 on emitted code); TRCRC determinism 2x240s, 6300
+frames, 0 mismatches; testsuite 125/126 both knob states (150s run needed
+when instrumented); fps A/B 480s dominant buckets -0.3 (probe cost priced
+in); hot text 13,704B. **[DYNSTAT] coverage (480s, samsho2 attract+fights,
+jmp_exec visibility):** in-game windows are 93-95% P_ROM / 5-6% BIOS
+(0xC0xxxx) / **ZERO WORK_RAM and ZERO PBROM-window targets** — ROM-only
+translation loses nothing and bank-keyed translation stays deferred
+(phase-3+ at most, for other games). Hot heads are concentrated (top-2 =
+0x0031FE+0x00335C ~15% of transfers; clusters 0x0318xx, 0x0045xx, all
+comfortably above the excluded page 0). Density: ~1 counted transfer per
+~5 executed insns in-game -> dynamic spans are SHORT; the C_max entry
+gate + probe must stay lean and direct chaining is the key phase-2/3
+escalation. BIOS region is immutable ROM: translate it in phase 2 (it is
+5-6% of transfers).
+
 **PHASE 2+:** per-form emitter from the debugged fast-path templates
 (collapse decode preambles; PC-relative/immediates baked at translate
 time), forced-superblock testsuite mode, then A's escalations gated on

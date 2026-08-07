@@ -60,6 +60,15 @@ endif
 ifdef TRCRC_ON
 CFLAGS += -DM64K_TRACECRC
 endif
+# Dynarec coverage rig ([DYNSTAT]/[DYNH], diagnostic like OPHIST — use the
+# counts, not the fps): counts control-transfer targets at jmp_exec with
+# the probe's exact visibility, dumps totals + PC-region split + top-16
+# heads every 600 frames. Opt-in: make ... DYNSTAT_ON=1.
+ifdef DYNSTAT_ON
+CFLAGS += -DM64K_DYNSTAT
+ASFLAGS += -DM64K_DYNSTAT
+N64_ASFLAGS += -DM64K_DYNSTAT
+endif
 endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 
