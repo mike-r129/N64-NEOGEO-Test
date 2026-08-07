@@ -98,6 +98,26 @@ Validation rig for every increment: testsuite (m64k) / WAV byte-identity
 BizHawk same-class check on deliverable builds. One commit per gated
 increment, pushed individually.
 
+**Session 1 results (2026-08-07 night):**
+- C step 1 (WP pack dead-store elision) LANDED: +0.2..+1.1 fps, dual-
+  compute green 37,888 chunks (7976315).
+- C step 2 (pms scan memo) LANDED: ~flat, dual-compute green (856e4e1).
+- **THE RSPQ LOST-WAKEUP IS FIXED** (7a7bc90 records the vendored-
+  libdragon patch): C step 2's timing shift made the latent race
+  DETERMINISTIC (wedge at frame 2668 every run, SP_STATUS=0x7003 =
+  HALTED|BROKE|SIG_MORE — both open-loop wakeup writes landed inside a
+  DMA-stretched mfc0->break window). Fix: closed-loop rspq_flush_internal
+  (re-clear HALT while SIG_MORE pending, bounded). Repro passes full
+  480s; same crash class found in four July logs (drawprof2, wpperf2/6/7).
+- **Track D UNBLOCKED**: walk + RSP audio survives a full 480s
+  (10,807 frames, zero wedges) — the shelving wedge WAS the lost-wakeup.
+  Perf is mixed: +0.7..+1.0 fps in 3000+ spr buckets, −1.6 in the modal
+  2000-3000 bucket (fixed kick/trailer-poll overhead). Walk stays
+  default-OFF until D step 3 (early kick after VRAM writeback, deferred
+  consume, no per-frame wait) removes the overhead; then re-A/B.
+- Next up: track A phase-1a scaffold (the big lever), D step 3,
+  C steps 3-5, B step 1.
+
 ## 📐 OPHIST + FASTPATHS WAVE 3 (2026-08-06) — the icache cliff, measured
 
 Session goal (user-picked): start the 68k structural spike toward 60fps.
