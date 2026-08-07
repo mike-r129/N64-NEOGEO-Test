@@ -3691,7 +3691,7 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 		int j, int n,
 		const u8 *lfo_pm_arr, u32 panl, u32 panr,
 		int i_memc, int i_om1, int i_om2, int i_oc1,
-		u32 eg_base, u32 eg_end) {
+		u32 eg_base, u32 eg_end, int wp) {
 	rspfm_ch_t * const p = &pbp->ch[j];
 	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
 	int s, i;
@@ -3707,18 +3707,24 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 	 * state OR sh this chunk (transitions only happen on due ticks), so the
 	 * RSP may skip it per tick. A never-due slot already at >= ENV_QUIET is
 	 * quiet-locked: env = vol_out + AM only grows, so its operator output
-	 * is exactly 0 for the whole chunk. */
-	for (s = 0; s < 4; s++) {
-		const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
-		int due = 0;
-		if (SL->state != EG_OFF) {
-			const u8 sh = SL->eg_shv[SL->state];
-			due = (eg_base >> sh) != (eg_end >> sh);
+	 * is exactly 0 for the whole chunk.
+	 *
+	 * Whole-pump callers (wp!=0) skip this: rspwp_kick_chunk overwrites
+	 * p->masks with 0x000F (no CPU-side skip knowledge), so the loop and
+	 * its SLOT-state dcache traffic are provably dead there. */
+	if (!wp) {
+		for (s = 0; s < 4; s++) {
+			const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
+			int due = 0;
+			if (SL->state != EG_OFF) {
+				const u8 sh = SL->eg_shv[SL->state];
+				due = (eg_base >> sh) != (eg_end >> sh);
+			}
+			if (due)
+				masks |= (u16) (1 << s);
+			else if (SL->vol_out >= ENV_QUIET)
+				masks |= (u16) (0x100 << s);
 		}
-		if (due)
-			masks |= (u16) (1 << s);
-		else if (SL->vol_out >= ENV_QUIET)
-			masks |= (u16) (0x100 << s);
 	}
 
 	if (CH->pms) {
@@ -3758,9 +3764,17 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 		p->pms_mask = 0;
 	}
 
-	p->op1_out[0] = CH->op1_out[0];
-	p->op1_out[1] = CH->op1_out[1];
-	p->mem_value = CH->mem_value;
+	/* Whole-pump: cmd_fm_wp overlays the RSP-resident dyn block over the
+	 * channel header (op1_out[0/1], mem_value) and the per-slot dynamics
+	 * (phase, volume, state) and recomputes vol_out = tl + volume on the
+	 * RSP (rsp_fm.S wp_slot_in/wp_apply), so packing those fields is dead
+	 * work in wp mode. The static fields (tl/sl/sh/sel/amflag, pans,
+	 * algo wiring, dp tables) are still consumed from this pack. */
+	if (!wp) {
+		p->op1_out[0] = CH->op1_out[0];
+		p->op1_out[1] = CH->op1_out[1];
+		p->mem_value = CH->mem_value;
+	}
 	p->maskL = (s32) panl;
 	p->maskR = (s32) panr;
 	p->i_memc = (u8) i_memc;
@@ -3770,14 +3784,18 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 	p->algo5 = (CH->ALGO & 7) == 5;
 	p->fb = CH->FB;
 	p->ams = CH->ams;
-	p->masks = masks;
+	if (!wp)
+		p->masks = masks;
 
 	for (s = 0; s < 4; s++) {
 		const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
 		rspfm_slot_t * const q = &p->slot[s];
-		q->phase = SL->phase;
-		q->volume = SL->volume;
-		q->vol_out = SL->vol_out;
+		if (!wp) {
+			q->phase = SL->phase;
+			q->volume = SL->volume;
+			q->vol_out = SL->vol_out;
+			q->state = SL->state;
+		}
 		q->tl = (u16) SL->tl;
 		q->sl = (u16) SL->sl;
 		q->sh[0] = SL->eg_shv[EG_REL];
@@ -3788,7 +3806,6 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 		q->sel[1] = SL->eg_sel_d2r;
 		q->sel[2] = SL->eg_sel_d1r;
 		q->sel[3] = SL->eg_sel_ar;
-		q->state = SL->state;
 		q->amflag = SL->AMmask ? 1 : 0;
 	}
 	return 1;
@@ -4394,7 +4411,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 		if (!rspfm_pack_chan(pb, OPN, CH, j, n, lfo_pm_arr,
 				OPN->pan[fmn2[j] * 2 + 0], OPN->pan[fmn2[j] * 2 + 1],
 				ccs_memc[algo], ccs_om1[algo], ccs_om2[algo],
-				ccs_oc1[algo], eg_base, OPN->eg_cnt)) {
+				ccs_oc1[algo], eg_base, OPN->eg_cnt, 1)) {
 			wp_hatch = 1;
 			rspwp_pack_hatches++;
 			return 0;
@@ -5005,7 +5022,7 @@ void YM2610Update_stream(int length) {
 							OPN->pan[fmn[j] * 2 + 1],
 							ccs_memc[algo], ccs_om1[algo],
 							ccs_om2[algo], ccs_oc1[algo],
-							eg_base, OPN->eg_cnt)) {
+							eg_base, OPN->eg_cnt, 0)) {
 						rspfm_pb.chmask |= (u8) (1 << j);
 						shipped++;
 					}
