@@ -834,6 +834,28 @@ mvs64_blockop_vram_copy_w:
 	sh t0, %gprel(reg_vram_addr)(gp)
 	jr ra
 
+# Same, but writing one constant value: the "move.w Dn,(An) / dbf" port
+# fill (masked 0x3080, hot at guest 0x3412 — 8k-24k rejected entries per
+# 600-frame window before this existed).
+# In:  t1 = 16-bit fill value
+#      t2 = word count (>= 1)
+# Clobbers: t0, t3, t7, t8, t9. Preserves all m64k fixed regs.
+	.global mvs64_blockop_vram_fill_w
+mvs64_blockop_vram_fill_w:
+	lhu t0, %gprel(reg_vram_addr)(gp)
+	lw t3, %gprel(reg_vram_bank)(gp)
+	lhu t8, %gprel(reg_vram_mod)(gp)
+	lhu t9, %gprel(reg_vram_mask)(gp)
+1:	sll t7, t0, 1
+	addu t7, t3
+	sh t1, 0(t7)
+	addu t0, t8                       # addr += modulo
+	and t0, t9                        # addr &= mask
+	addiu t2, -1
+	bnez t2, 1b
+	sh t0, %gprel(reg_vram_addr)(gp)
+	jr ra
+
 asm_pbrom_bankno_w:
 	# Check if the new bank is different from the current one
 	sll t6, 20

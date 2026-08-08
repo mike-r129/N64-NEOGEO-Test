@@ -81,6 +81,21 @@ mvs64_blockop_enable: .long 0
 #else
 mvs64_blockop_enable: .long 1
 #endif
+# Separate gate for the (An)+ -> (Am)+ long-copy fusion so its own fps
+# increment can be twinned independently of the established fusions.
+    .globl mvs64_blockop_copyl_enable
+#ifdef MVS64_COPYL_DISABLE
+mvs64_blockop_copyl_enable: .long 0
+#else
+mvs64_blockop_copyl_enable: .long 1
+#endif
+# Gate for the "move.w Dn,(An)" VRAM-port constant fill fusion.
+    .globl mvs64_blockop_fwp_enable
+#ifdef MVS64_FWP_DISABLE
+mvs64_blockop_fwp_enable: .long 0
+#else
+mvs64_blockop_fwp_enable: .long 1
+#endif
 #endif
 #if defined(M64K_BLOCKOPS) && (defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT))
 # Fused-blockop accounting ([BOSTAT]); diagnostic builds only.
@@ -4079,6 +4094,10 @@ dbcc_dec:
     beq t1, 0x3098, blockop_movew_port # move.w (As)+,(Ad)
     beq t1, 0x30C0, blockop_fill_w     # move.w Dn,(Ad)+
     beq t1, 0x20C0, blockop_fill_l     # move.l Dn,(Ad)+
+#ifndef MVS64_COPYL_NODISPATCH
+    beq t1, 0x20D8, blockop_copy_l     # move.l (As)+,(Ad)+
+#endif
+    beq t1, 0x3080, blockop_fillw_port # move.w Dn,(Ad)
 #if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
 bo_rej_dst:
     lw t8, blockop_rej_dst
@@ -4151,7 +4170,13 @@ blockop_movew_port:
     lw t8, blockop_fire
     addiu t8, 1
     sw t8, blockop_fire
-    li t8, 22                          # (restore t8: the commit reuses it)
+    lw t8, 0(t9)                       # re-load As: the counter bump clobbered
+                                       # it. (This was "li t8, 22" — restoring
+                                       # the BUDGET constant, not As — so every
+                                       # INSTRUMENTED build corrupted As := 22
+                                       # + 2K on each fire: the real source of
+                                       # the "diagnostic builds diverge
+                                       # content" forks, first fire ~f=385.)
 #endif
     sll result, t2, 1                  # As += 2K
     addu t8, result
@@ -4265,6 +4290,170 @@ blockop_fill_l:
     addiu t1, 4
     addiu t2, -1
     bnez t2, 1b
+    j main_loop
+
+blockop_copy_l:
+    # move.l (As)+,(Ad)+ / dbf: the block-unpack memcpy the game runs at
+    # 0x31B8 (count word from the stream, longs copied ROM/RAM -> work RAM).
+    # As = bits 2-0, Ad = bits 11-9. The same-register form (e.g. 0x20D8
+    # proper, move.l (a0)+,(a0)+) interleaves the two pointer bumps and does
+    # NOT have memcpy semantics: reject it. NOTE: every reject path below
+    # must leave t3 intact (branch_exec consumes it).
+    lw t8, mvs64_blockop_copyl_enable  # runtime A/B gate (twin fps builds)
+    beqz t8, dbcc_no_blockop
+    srl t7, t9, 7
+    andi t7, 7<<2                      # Ad index*4
+    andi t1, t9, 7
+    sll t1, 2                          # As index*4
+    beq t1, t7, dbcc_no_blockop
+    la_ctx t1, M64K_OFF_AREGS,t1       # &As
+    la_ctx t7, M64K_OFF_AREGS,t7       # &Ad
+    # Budget: K = min(count-1, (m_cycles-11)/30); keeps m_cycles > 0 so the
+    # interpreter always resumes at the loop body. 30 = move.l (As)+,(Ad)+
+    # [12 entry + 4 src (An)+ + 4 dst (An)+] + taken dbra [10], matching the
+    # interpreter's own charges (charge placement inside the fused span is
+    # unobservable: both spans are guarded RAM/ROM and can never trap).
+    addi t9, m_cycles, -11
+    blez t9, BO_REJ_BUD
+    li t8, 30
+    divu zero, t9, t8
+    mflo t9
+    beqz t9, BO_REJ_BUD
+    ble t2, t9, 1f
+    move t2, t9
+1:  lw t8, 0(t1)                       # As (full register value)
+    lw t9, 0(t7)                       # Ad (full register value)
+    or result, t8, t9                  # an odd long access would raise an
+    andi result, 1                     #  address error in the interpreter:
+    bnez result, dbcc_no_blockop       #  leave those loops interpreted
+    # Source span must stay inside an always-mapped window: P-ROM + work RAM
+    # (< 0x110000) or the PB-ROM bank window [0x200000,0x300000) — samsho2's
+    # 2MB P-ROM upper half lives there (the unpack loops at 0x31B8 read it,
+    # measured 1584 span-rejects/window before this was widened). The bank
+    # mapping can only change via an MMIO write, which the 1-insn loop body
+    # cannot issue, so the window is stable across the fused span.
+    sll eaptr32, t8, 8
+    srl eaptr32, 8                     # 24-bit source address (kept for map)
+    sll result, t2, 2                  # 4K bytes
+    addu result, eaptr32
+    li eaptr, 0x00110000
+    ble result, eaptr, 1f              # low window: end <= 0x110000
+    li eaptr, 0x00200000
+    blt eaptr32, eaptr, bo_cpl_rejsrc  # straddles/starts in unmapped gap
+    li eaptr, 0x00300000
+    bgt result, eaptr, bo_cpl_rejsrc   # PB-ROM window: end <= 0x300000
+1:
+    # Destination span must stay inside work RAM [0x100000,0x110000).
+    sll result, t9, 8
+    srl result, 8                      # 24-bit dest address (kept for map)
+    li eaptr, 0x00100000
+    blt result, eaptr, bo_cpl_rejdst
+    sll t9, t2, 2
+    addu t9, result
+    li eaptr, 0x00110000
+    bgt t9, eaptr, bo_cpl_rejdst
+    # ---- commit ----
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    lw t9, blockop_fire
+    addiu t9, 1
+    sw t9, blockop_fire
+#endif
+    sll t9, t2, 2                      # bytes = 4K
+    addu t8, t9                        # As += 4K
+    sw t8, 0(t1)
+    lw t8, 0(t7)
+    addu t8, t9                        # Ad += 4K
+    sw t8, 0(t7)
+    sub t8, t0, t2                     # counter = (old-1) - K
+    addi t8, -1
+    sh t8, 2(dptr)
+    li t8, 30                          # m_cycles -= 10 + 30K
+    multu t2, t8
+    mflo t8
+    sub m_cycles, t8
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    map_m68k eaptr32                   # mapped source
+    map_m68k result                    # mapped dest
+1:  lwl t8, 0(eaptr32)                 # unaligned-capable pairs, byte order
+    lwr t8, 3(eaptr32)                 #  identical to lw_m68k/sw_m68k; the
+    swl t8, 0(result)                  #  sequential forward long-by-long
+    swr t8, 3(result)                  #  order matches the interpreter, so
+    addiu eaptr32, 4                   #  overlapping src/dst behave the same
+    addiu result, 4
+    addiu t2, -1
+    bnez t2, 1b
+    j main_loop
+
+    # copy_l span-reject diagnostics: record WHICH bound rejected and the
+    # offending 24-bit address in the otherwise-unused [BOSTAT] t3/body
+    # slots (t3val = rejecting SRC, t9val = rejecting DST). Finding
+    # (2026-08-08): ALL of samsho2's (As)+,(Ad)+ DBF loops target PALETTE
+    # RAM (0x401558/0x401eb8) — trapped MMIO with conversion side effects,
+    # ~2 entries/frame in-fight — so copy_l has no RAM->RAM traffic in
+    # this game and stays as correct-but-idle infrastructure.
+bo_cpl_rejsrc:
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    sw eaptr32, blockop_t3val
+#endif
+    j BO_REJ_SPAN
+bo_cpl_rejdst:
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    sw result, blockop_t9val
+#endif
+    j BO_REJ_SPAN
+
+blockop_fillw_port:
+    # move.w Dn,(An) / dbf with An = the LSPC VRAM data port (0x3C0002):
+    # a constant-value fill through the port's auto-increment (the #1
+    # remaining un-fused DBF class: masked 0x3080 at guest 0x3412,
+    # 8k-24k rejected entries per 600-frame window in-fight, one TLB
+    # exception per word when interpreted). Same structure as the port
+    # copy: K = count-1 iterations run natively via the hw_n64.S helper
+    # (identical modulo/mask/bank semantics), the expiring iteration and
+    # any budget tail stay interpreted, charges match the interpreter
+    # exactly. NOTE: every reject path must leave t3 intact (branch_exec).
+    lw t8, mvs64_blockop_fwp_enable    # runtime A/B gate (twin fps builds)
+    beqz t8, dbcc_no_blockop
+    srl t1, t9, 7
+    andi t1, 7<<2
+    lw_ctx t1, M64K_OFF_AREGS,t1       # Ad
+    sll t1, 8
+    srl t1, 8                          # 24-bit address
+    li result, 0x003C0002
+    bne t1, result, BO_REJ_DST
+    # Budget: K = min(count-1, (m_cycles-11)/18); keeps m_cycles > 0 so
+    # the interpreter always resumes at the loop body. 18 = move.w
+    # Dn,(An) [4 entry + 0 Dn + 4 (An)] + taken dbra [10].
+    addi result, m_cycles, -11
+    blez result, BO_REJ_BUD
+    li t8, 18
+    divu zero, result, t8
+    mflo result
+    beqz result, BO_REJ_BUD
+    ble t2, result, 1f
+    move t2, result
+1:  # value = Dn.w (constant across the run: the body cannot change Dn)
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t1, M64K_OFF_DREGS,t1
+    lhu t1, 2(t1)                      # 16-bit fill value
+    # ---- commit ----
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    lw t8, blockop_fire
+    addiu t8, 1
+    sw t8, blockop_fire
+#endif
+    sub t8, t0, t2                     # counter = (old-1) - K
+    addi t8, -1
+    sh t8, 2(dptr)
+    li t8, 18                          # m_cycles -= 10 + 18K
+    multu t2, t8
+    mflo t8
+    sub m_cycles, t8
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    jal mvs64_blockop_vram_fill_w      # t1 = value, t2 = count
     j main_loop
 #endif
 
