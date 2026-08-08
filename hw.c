@@ -162,6 +162,34 @@ uint32_t read_hwio(uint32_t addr, int sz)  {
 		if (log) printf("[IO] pc=%06x a=%06x v=%04x\n", (unsigned)emu_pc(), (unsigned)addr, (unsigned)(v & 0xFFFF));
 	}
 #endif
+#if defined(N64) && defined(MVS64_IOLOG_N64)
+	// Population-independent divergence instrument: log every MMIO READ
+	// (addr, value, frame). Two builds' [IO] streams diff at the exact
+	// access that misreads a cycle-derived register (raster/timer) — the
+	// bisect-by-disabling-templates approach cannot localize such a bug
+	// because removing any template reshapes the whole block population.
+	{
+		// Volume filter: only registers whose VALUE depends on the
+		// mid-instruction clock or cross-chip timing can be the FIRST
+		// divergent read (raster/timer 0x3Cxxxx, Z80 reply 0x32xxxx).
+		// Input ports are frame-deterministic. Unfiltered logging
+		// (~230 reads/frame in BIOS) throttled ares to ~2 fps and the
+		// run never reached the divergence frame.
+		unsigned bank = (addr >> 16) & 0xFF;
+		extern int g_frame;
+		// Frame gate (threshold = the MVS64_IOLOG_N64 define value):
+		// streams are identical before the divergence by definition, so
+		// logging may start just before it. Logging from boot throttled
+		// ares below 5 fps and the run never reached the target frame.
+		// GUEST frame key (g_frame, emu.c) — NOT N64_FRAME: that is the
+		// host VI count and skews with wall speed; the first instrument
+		// run "diverged" on tags alone while the values were equal.
+		if (g_frame >= MVS64_IOLOG_N64 && (bank == 0x3C || bank == 0x32)) {
+			debugf("[IO] f=%d a=%06x v=%04x\n", g_frame,
+			       (unsigned)addr, (unsigned)(v & 0xFFFF));
+		}
+	}
+#endif
 	return v;
 }
 

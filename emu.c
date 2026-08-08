@@ -62,7 +62,9 @@ void cpu_start_trace(int cnt) {
 	cpu_trace_count = cnt;
 }
 
-static int g_frame;
+int g_frame;   // guest frame counter (non-static: the IOLOG gate in hw.c
+               // needs a GUEST-aligned key; N64_FRAME is the host VI count
+               // and skews with wall speed)
 
 #ifndef N64
 // --- Headless scripted input ---------------------------------------------

@@ -480,6 +480,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // AFTER the source post-inc commits, so it would see the bumped
         // value. A7 refused (word-align quirk stays generic).
         if (smode == 3 && dmode == 2 && sreg != 7 && sreg != dreg) {
+#ifdef M64K_DYN_NO_R2MEM
+            return 0;                   // TRCRC bisect knob
+#endif
             e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
             emit_bail_check(e, R_T4);
             e->buf[e->len++] = LW(R_T2, R_A0, M64K_OFF_AREGS + 4 * dreg);
@@ -487,11 +490,20 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             e->buf[e->len++] = ADDIU(R_T1, R_T4, 2);
             e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 4 * sreg);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
-            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            // Charge SPLIT 8/4 like the interpreter (entry+ea_011 before
+            // the read, dst ea before the write; the W3 path is explicit
+            // about it and the generic path composes the same). A lump
+            // -12 here is invisible to the rig (RAM never traps) but an
+            // MMIO source that derives its value from the cycle counter —
+            // the LSPC raster poll — reads a DIFFERENT value under it:
+            // the mid-instruction-clock law is architectural, not
+            // cosmetic.
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = MOVE(R_T6, R_T0);
             emit_movew_flags(e, R_T0);
             e->buf[e->len++] = OR(R_T3, R_T2, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
             e->buf[e->len++] = SH(R_T6, R_T3, 0);
             emit_break_check(e, e->goff + 2);
             *cmax += 12;
@@ -500,6 +512,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.w Dn,(xxx).l [4 + ea7_001 12 = 16 cycles, 3 words]: 2nd
         // hottest refused head (0xC1DF8A, ~91k/window, BIOS region).
         if (smode == 0 && dmode == 7 && dreg == 1) {
+#ifdef M64K_DYN_NO_R2MEM
+            return 0;                   // TRCRC bisect knob
+#endif
             uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
             if (abs & 1)
                 return 0;
@@ -859,6 +874,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // Flags = tst_long idiom on the 32-bit value; MOVEA sets none.
         // move.l (An),Dn / movea.l (An),Am [16 cycles] — 0x031802, 37k/win.
         if (top == 0x2 && (opmode == 0 || opmode == 1) && smode == 2) {
+#ifdef M64K_DYN_NO_R2MEM
+            return 0;                   // TRCRC bisect knob
+#endif
             int to_an = (opmode == 1);
             e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
             emit_bail_check(e, R_T4);
@@ -878,6 +896,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         }
         // move(a).l (d16,An),Dm/Am [movel_fsrc_d16, 20 cycles, 2 words].
         if (top == 0x2 && (opmode == 0 || opmode == 1) && smode == 5) {
+#ifdef M64K_DYN_NO_R2MEM
+            return 0;                   // TRCRC bisect knob
+#endif
             int to_an = (opmode == 1);
             int16_t d16 = (int16_t)fetch16(pc + 2);
             e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
@@ -900,6 +921,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.l Dn/An,(d16,Am) [movel_f_dst_d16, 20 cycles, 2 words] —
         // 0x001598, 17k/win.
         if (top == 0x2 && opmode == 5 && smode <= 1) {
+#ifdef M64K_DYN_NO_R2MEM
+            return 0;                   // TRCRC bisect knob
+#endif
             int16_t d16 = (int16_t)fetch16(pc + 2);
             int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg;
             e->buf[e->len++] = LW(R_T6, R_A0, off);
