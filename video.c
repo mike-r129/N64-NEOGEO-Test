@@ -58,6 +58,22 @@ uint32_t perf_dr_cache, perf_dr_rspq;
 uint32_t perf_dr_tiles, perf_dr_cells;
 uint32_t perf_dr_empty;   /* sprite tiles skipped as known-empty */
 uint32_t perf_dr_wwait;   /* RSP sprite walk: CPU time blocked in rspq_wait */
+// PLAN-DRAW-RDP Phase 0 decision counters ([PERF3] in emu.c):
+uint32_t perf_dr_recs;    /* records seen by consume (incl. empty-skipped) */
+uint32_t perf_dr_adjrep;  /* drawn records whose tnum == previous drawn */
+uint32_t perf_dr_maxrun;  /* longest consecutive same-tnum drawn run */
+uint32_t perf_dr_uniqx;   /* ~unique tnums (gen-stamped hash, collisions
+                             undercount uniques slightly) */
+uint32_t perf_dr_psw;     /* palette switches between consecutive draws */
+uint32_t perf_dr_modal;   /* drawn records matching the COPY-mode predicate
+                             (sw==16 && sh==16 && no flip) */
+uint32_t perf_dr_miss;    /* sprite-cache misses (PI DMA loads) */
+uint32_t perf_dr_missticks; /* ticks spent in the miss/DMA path */
+// Uniq table: 2048 gen-stamped entries accessed UNCACHED — heavy frames
+// touch most slots, and an 8KB cached resident table would evict the whole
+// dcache (PLAN-DRAW-RDP §9 law 1). Diagnostic builds only.
+static uint32_t perf_uniq_tab[2048] __attribute__((aligned(16)));
+static uint32_t perf_uniq_gen;
 #define DRAW_PERF 1
 #endif
 
@@ -267,10 +283,24 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 // Consume pass: identical tail of the historical loop — empty-tile skip,
 // then draw_sprite, in record order (cache side effects unchanged).
 static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
+#ifdef DRAW_PERF
+	// Phase 0 run/repeat/palette stats over the DRAWN stream (post
+	// empty-skip: that is the stream Phase 1's memo and Phase 3's mode
+	// runs would see). Reset per consume pass; gen bump ages the uniq
+	// table without clearing it.
+	uint32_t p0_last_tnum = ~0u, p0_last_pal = ~0u;
+	uint32_t p0_run = 0;
+	perf_uniq_gen++;
+	volatile uint32_t *p0_uniq =
+		(volatile uint32_t *)UncachedAddr(perf_uniq_tab);
+#endif
 	for (int i=0;i<nrec;i++) {
 		uint32_t w0 = recs[i].w0, w1 = recs[i].w1;
 		uint32_t tnum = w0 & 0xFFFFF;
 
+#ifdef DRAW_PERF
+		perf_dr_recs++;
+#endif
 		// Skip tiles known to decode to all-transparent
 		// pixels — the sprite-layer analogue of the fix
 		// skip above (ROM-stable fact, learned on first
@@ -283,6 +313,23 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 			continue;
 		}
 
+#ifdef DRAW_PERF
+		{
+			uint32_t pal = (w0 >> 20) & 0xFF;
+			uint32_t sw = ((w1 >> 24) & 0xF) + 1, sh = ((w1 >> 28) & 0xF) + 1;
+			if (tnum == p0_last_tnum) {
+				perf_dr_adjrep++;
+				if (++p0_run > perf_dr_maxrun) perf_dr_maxrun = p0_run;
+			} else
+				p0_run = 0;
+			if (pal != p0_last_pal) perf_dr_psw++;
+			if (sw == 16 && sh == 16 && !(w0 & (3u << 28))) perf_dr_modal++;
+			p0_last_tnum = tnum; p0_last_pal = pal;
+			uint32_t h = (tnum * 2654435761u) >> 21;
+			uint32_t key = (perf_uniq_gen << 20) | tnum;
+			if (p0_uniq[h] != key) { perf_dr_uniqx++; p0_uniq[h] = key; }
+		}
+#endif
 		draw_sprite(tnum, (w0 >> 20) & 0xFF,
 		            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
 		            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,

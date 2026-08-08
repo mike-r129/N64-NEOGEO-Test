@@ -783,6 +783,37 @@ int main(int argc, char *argv[]) {
 			perf_dr_cache = perf_dr_rspq = 0;
 			perf_dr_tiles = perf_dr_cells = perf_dr_empty = 0;
 			perf_dr_wwait = 0;
+
+			// PLAN-DRAW-RDP Phase 0 decision data ([PERF3]): drawn-stream
+			// run/repeat/palette/modal stats (video.c consume), cache-miss
+			// split (roms.c), and RDP busy fractions from the free-running
+			// 24-bit DPC counters (delta per window, wrap-safe at >=4fps).
+			// dppipe/dpclk ~= RDP pipe busy fraction; dptmem = TMEM loads.
+			{
+				extern uint32_t perf_dr_recs, perf_dr_adjrep, perf_dr_maxrun;
+				extern uint32_t perf_dr_uniqx, perf_dr_psw, perf_dr_modal;
+				extern uint32_t perf_dr_miss, perf_dr_missticks;
+				static uint32_t dpc_clk0, dpc_pipe0, dpc_tmem0;
+				uint32_t clk  = *(volatile uint32_t*)0xA4100010 & 0xFFFFFF;
+				uint32_t pipe = *(volatile uint32_t*)0xA4100018 & 0xFFFFFF;
+				uint32_t tmem = *(volatile uint32_t*)0xA410001C & 0xFFFFFF;
+				framef("[PERF3] recs=%lu rep=%lu maxrun=%lu uniq=%lu psw=%lu modal=%lu miss=%lu dmat=%lu dpclk=%lu dppipe=%lu dptmem=%lu\n",
+					(unsigned long)perf_dr_recs,
+					(unsigned long)perf_dr_adjrep,
+					(unsigned long)perf_dr_maxrun,
+					(unsigned long)perf_dr_uniqx,
+					(unsigned long)perf_dr_psw,
+					(unsigned long)perf_dr_modal,
+					(unsigned long)perf_dr_miss,
+					(unsigned long)(perf_dr_missticks / fb),
+					(unsigned long)((clk  - dpc_clk0)  & 0xFFFFFF),
+					(unsigned long)((pipe - dpc_pipe0) & 0xFFFFFF),
+					(unsigned long)((tmem - dpc_tmem0) & 0xFFFFFF));
+				dpc_clk0 = clk; dpc_pipe0 = pipe; dpc_tmem0 = tmem;
+				perf_dr_recs = perf_dr_adjrep = perf_dr_maxrun = 0;
+				perf_dr_uniqx = perf_dr_psw = perf_dr_modal = 0;
+				perf_dr_miss = perf_dr_missticks = 0;
+			}
 		}
 		#endif
 		#ifdef MVS64_OPHIST

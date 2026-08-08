@@ -157,9 +157,25 @@ uint8_t* crom_get_sprite(int spritenum) {
 
 	#ifdef N64
 	profile_dma_load -= TICKS_READ();
+	#ifdef MVS64_PERFCOUNT
+	{
+		// PLAN-DRAW-RDP Phase 0: per-frame miss count + DMA ticks
+		// ([PERF3], emu.c) — sizes the unique-tile floor Phase 1
+		// compresses the cache bucket toward.
+		extern uint32_t perf_dr_miss, perf_dr_missticks;
+		perf_dr_miss++;
+		perf_dr_missticks -= TICKS_READ();
+	}
+	#endif
 	dfs_seek(crom_file, spritenum*8*16, SEEK_SET);
 	dfs_read(pix, 1, 8*16, crom_file);
 	data_cache_hit_writeback_invalidate(pix, 8*16);  // FIXME: should not be required
+	#ifdef MVS64_PERFCOUNT
+	{
+		extern uint32_t perf_dr_missticks;
+		perf_dr_missticks += TICKS_READ();
+	}
+	#endif
 	profile_dma_load += TICKS_READ();
 	#else
 	fseek(crom_file, spritenum*8*16, SEEK_SET);
