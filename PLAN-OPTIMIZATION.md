@@ -50,12 +50,21 @@ body. Fixed all six constants (guard, body fetch, three m_pc rollbacks).
 **Gate: TRCRC fused-vs-unfused IDENTICAL over 5576 frames** (bit- AND
 cycle-exact). Runtime twin gate added (`mvs64_blockop_enable` /
 -DMVS64_BLOCKOP_DISABLE, layout-identical binaries) plus `BLOCKOPS_OFF=1`.
-It now fires — but only tens of times per window so far, with thousands
-still rejected on the destination test (`dstval` shows ordinary RAM
-addresses like 0x61D0, not the 0x3C0002 VRAM port), so the remaining
-question is whether samsho2's hot loop targets the port at all. If it does
-not, the follow-up is a general (An)+→(Am) work-RAM copy fusion alongside
-the port one.
+It now fires (38→142 per window, rising with game progress) while thousands
+of candidates still reject on the DESTINATION test. Final window of the
+480s run: `seen=40756 shape=35401 fire=142 rej_dst=5166 t3=-12 body=3898
+dstval=003080` — **body=3898 is exactly the target shape** `move.w
+(An)+,(Am)`, so the -6 fix demonstrably works and the only thing between
+that loop class and fusion is the hard-coded 0x3C0002 destination
+(observed destinations: 0x003080, 0x0061D0 — never the port).
+CAVEAT: that run never reached a real fight (zero PROFILE lines at
+PC:0031fe/003200), so the hot loop's OWN destination is still unsampled —
+do not conclude samsho2 avoids the port until an in-fight capture exists.
+NEXT: (1) in-fight dstval capture for 0x31FE (longer run or wsl-fight.sh
+input); (2) if it is work RAM, add a general (An)+→(Am) copy fusion beside
+the port one — the source span check already constrains to <0x110000, so a
+destination work-RAM range check is the direct analogue. No fps claim is
+made for the fix as it stands.
 
 ## 📊 DYNAREC RESIDENCY ESCALATION SESSION 2026-08-07 night (aa54fe1) — VERDICT: FLAT
 
