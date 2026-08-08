@@ -324,3 +324,17 @@ fps flatline kill Phase 3 items — but do let a DPC busy-% flatline.
 ## RESULTS
 
 (append per increment: date, commit, phase/step, gates, per-bucket delta, verdict)
+
+- 2026-08-08 e2cd212 **Phase 0 COMPLETE** — [PERF3] counters landed
+  (recs/adjacent-rep/maxrun/~uniq/psw/modal/miss/dmat/DPC deltas); 480s
+  baseline archived (runs/ares-drawbase.txt, 11225 instrumented frames).
+  DECISION DATA: adjacent-repeat rate **0-1% in every bucket** →
+  **Phase 1a KILLED** (threshold was <10%); uniques ~57-65% of records
+  with ~0 in-fight misses → the cache bucket is pure lookup time at ~1
+  dcache miss/lookup, and a flat table is ALSO 1 miss/lookup →
+  **Phase 1b CLOSED** (no lever without fewer lookups; repeats say fewer
+  lookups don't exist). **Modal share 50-95%** (huge Phase 3.2 target);
+  psw ~133-140/frame (TLUT preload viable); **DPC counters read 0 in
+  ares** (paraLLEl-RDP doesn't model them) — Phase 3 go/no-go is
+  hardware-only as §7 anticipated. **Next executable step: Phase 2**
+  (BATCHDBG verify rig first, then the batch ucode).
