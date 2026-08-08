@@ -13,6 +13,7 @@
         RSPQ_DefineCommand cmd_pal_convert, 8  # 0x3
         RSPQ_DefineCommand cmd_sprite_begin, 4 # 0x4
         RSPQ_DefineCommand cmd_sprite_walk, 12 # 0x5
+        RSPQ_DefineCommand cmd_sprite_batch, 12 # 0x6
 	RSPQ_EndOverlayHeader
 
 RSPQ_BeginSavedState
@@ -652,6 +653,99 @@ sprite_draw:
     .endfunc
 
 
+
+#########################################################################
+# SPRITE BATCH (PLAN-DRAW-RDP Phase 2: one command per record chunk)
+#########################################################################
+#
+# cmd_sprite_batch replaces the per-tile rspq_write dispatch: the CPU
+# resolves tile pointers once (uncached parallel u32 ptrs[], 0 = skip:
+# empty tile), then issues ONE command per chunk of <=64 SprWalkRec
+# records. The ucode DMAs both arrays into DMEM and jal's the EXISTING
+# cmd_sprite_draw body per non-empty record — the per-record RDP stream
+# is bit-identical by construction (same code, same args, same order),
+# which is what the MVS64_BATCHDBG triple-journal gate checks.
+#
+# DMEM: records stage in WALK_LIST (512B) — DEAD SHARING invariant: batch
+# commands are only issued after the walk's collect (sentinel wait) in
+# the same frame, and pal_convert touches only PAL_BUFFER. BATCH_PTRS is
+# dedicated (256B). Loop state lives in DMEM because the draw body +
+# RDPQ_Send clobber nearly every scalar register; three loads per record
+# is noise against the ~100-instruction body.
+#
+# Command: 0x6, 12 bytes
+#   a0: records RDRAM phys (SprWalkRec[], 8 bytes each)
+#   a1: resolved-pointer array RDRAM phys (u32[], parallel; 0 = skip)
+#   a2: record count in this chunk (1..64)
+
+    .bss
+    .align 3
+BATCH_PTRS:  .dcb.b 256
+    .align 2
+BATCH_STATE: .dcb.b 12        # rec cursor / ptr cursor / remaining
+
+    .text
+
+    .func cmd_sprite_batch
+cmd_sprite_batch:
+    move s0, a0
+    li s4, %lo(WALK_LIST)
+    sll t0, a2, 3
+    jal DMAIn
+    addi t0, -1               # DMA_SIZE(n*8, 1)
+
+    move s0, a1
+    li s4, %lo(BATCH_PTRS)
+    sll t0, a2, 2
+    jal DMAIn
+    addi t0, -1               # DMA_SIZE(n*4, 1)
+
+    li t1, %lo(WALK_LIST)
+    li t2, %lo(BATCH_PTRS)
+    sw t1, %lo(BATCH_STATE)+0
+    sw t2, %lo(BATCH_STATE)+4
+    sw a2, %lo(BATCH_STATE)+8
+
+batch_loop:
+    lw t1, %lo(BATCH_STATE)+0
+    lw t2, %lo(BATCH_STATE)+4
+    lw a0, 0(t2)              # resolved pixel pointer (phys), 0 = skip
+    lw t7, 0(t1)              # w0: tnum[0..19] pal[20..27] fx[28] fy[29]
+    lw t8, 4(t1)              # w1: x[0..11] y[12..23] sw-1[24..27] sh-1[28..31]
+    addi t1, 8
+    addi t2, 4
+    sw t1, %lo(BATCH_STATE)+0
+    sw t2, %lo(BATCH_STATE)+4
+    beqz a0, batch_next
+    nop
+    # a1 = pal<<24 | x<<12 | y  (exactly what rsp_sprite_draw packs)
+    srl t0, t7, 20
+    andi t0, 0xFF
+    sll a1, t0, 24
+    andi t0, t8, 0xFFF
+    sll t0, 12
+    or a1, t0
+    srl t0, t8, 12
+    andi t0, 0xFFF
+    or a1, t0
+    # a2 = (sw-1)|((sh-1)<<4) | flips — (w1>>24)&0xFF passes both size
+    # fields through; flips relocate from w0[28..29] to bits [8..9].
+    srl a2, t8, 24
+    andi a2, 0xFF
+    srl t0, t7, 20
+    andi t0, 0x300
+    or a2, t0
+    jal cmd_sprite_draw       # body tail-jumps RDPQ_Send -> jr ra -> here
+    nop
+batch_next:
+    lw t0, %lo(BATCH_STATE)+8
+    addi t0, -1
+    sw t0, %lo(BATCH_STATE)+8
+    bgtz t0, batch_loop
+    nop
+    j RSPQ_Loop
+    nop
+    .endfunc
 
 #########################################################################
 # SPRITE WALK (SCB -> visible-tile record list)

@@ -283,6 +283,14 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 // Consume pass: identical tail of the historical loop — empty-tile skip,
 // then draw_sprite, in record order (cache side effects unchanged).
 static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
+#if defined(N64) && defined(MVS64_SPRBATCH)
+	// Phase 2 batch path (video_n64.c): resolve pointers once, one RSP
+	// command per chunk. PC build always keeps the C path (plan §9 law 8).
+	if (mvs64_batch_enable) {
+		sprite_walk_consume_batch(recs, nrec);
+		return;
+	}
+#endif
 #ifdef DRAW_PERF
 	// Phase 0 run/repeat/palette stats over the DRAWN stream (post
 	// empty-skip: that is the stream Phase 1's memo and Phase 3's mode

@@ -87,6 +87,65 @@ static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
 	return (int)nrec;
 }
 
+#ifdef MVS64_SPRBATCH
+// PLAN-DRAW-RDP Phase 2: batch consume — resolve tile pointers once on the
+// CPU, then one cmd_sprite_batch per <=64-record chunk; the RSP loops the
+// records and reuses the cmd_sprite_draw body per non-empty record.
+// Compile-gated (feature absent without MVS64_SPRBATCH) and UNGATED until
+// the BATCHDBG rig passes; runtime twin knob for layout-identical A/Bs.
+#ifdef MVS64_BATCH_DISABLE
+int mvs64_batch_enable = 0;
+#else
+int mvs64_batch_enable = 1;
+#endif
+#define SPRBATCH_CHUNK 64
+static uint32_t sprbatch_ptrs[SPRWALK_MAX_RECS] __attribute__((aligned(16)));
+
+static void sprite_walk_consume_batch(const SprWalkRec *recs, int nrec) {
+	// Pointer-lifetime invariant (PLAN-DRAW-RDP §9 law 5) — VERIFIED in
+	// sprite_cache.c: both eviction paths (tick-scatter pop and the
+	// forced pop inside sprite_cache_insert) only remove entries whose
+	// tick delta exceeds a cutoff >= 1, so entries touched THIS tick —
+	// every pointer this pass resolves — cannot be evicted. Consumption
+	// is same-frame: chunks are kicked below, before the next tick.
+	// Pointers are written through the uncached segment (§9 law 1: no
+	// cached streaming writes in the frame loop; the batch-arena killer).
+	volatile uint32_t *up = (volatile uint32_t *)UncachedAddr(sprbatch_ptrs);
+	for (int i = 0; i < nrec; i++) {
+		uint32_t tnum = recs[i].w0 & 0xFFFFF;
+		if (crom_tile_empty(tnum)) {
+#ifdef DRAW_PERF
+			perf_dr_empty++;
+#endif
+			up[i] = 0;
+			continue;
+		}
+#ifdef DRAW_PERF
+		uint32_t _c0 = TICKS_READ();
+#endif
+		uint8_t *src = crom_get_sprite(tnum);
+#ifdef DRAW_PERF
+		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
+		perf_dr_tiles++;
+#endif
+		up[i] = PhysicalAddr(src);
+	}
+	// Records may be cached (C-produced walk): write back before the RSP
+	// DMAs them. RSP-produced lists were already invalidated at collect;
+	// writeback of uncached-clean lines is a no-op.
+	data_cache_hit_writeback((void *)recs,
+	                         ((unsigned)nrec * sizeof(SprWalkRec) + 15) & ~15u);
+	for (int off = 0; off < nrec; off += SPRBATCH_CHUNK) {
+		int n = nrec - off;
+		if (n > SPRBATCH_CHUNK) n = SPRBATCH_CHUNK;
+		rspq_write(RSP_OVL_ID, 0x6,
+		           PhysicalAddr((void *)(recs + off)),
+		           PhysicalAddr((uint8_t *)sprbatch_ptrs + off * 4), n);
+	}
+	rspq_flush();
+}
+#endif // MVS64_SPRBATCH
+
 static bool rdp_mode_copy = false;
 static int rdp_tex_slot = 0;
 static int rdp_pal_slot = 0;
