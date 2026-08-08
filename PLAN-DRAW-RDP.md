@@ -338,3 +338,14 @@ fps flatline kill Phase 3 items — but do let a DPC busy-% flatline.
   ares** (paraLLEl-RDP doesn't model them) — Phase 3 go/no-go is
   hardware-only as §7 anticipated. **Next executable step: Phase 2**
   (BATCHDBG verify rig first, then the batch ucode).
+- 2026-08-08 399a4ec **Phase 2 step 1** — cmd_sprite_batch machinery
+  landed compile-gated (-DMVS64_SPRBATCH) and UNGATED: CPU resolve pass
+  (uncached ptrs[], pointer-lifetime invariant VERIFIED in
+  sprite_cache.c — current-tick entries cannot be evicted, either path),
+  one command per <=64-record chunk, ucode jal's the existing
+  cmd_sprite_draw body per record (stream identical by construction).
+  WALK_LIST dead-shared; RSPASFLAGS now get EXTRA_DEFINES (for the
+  ucode-side BATCHDBG journal). Smoke: 180s ares with batch LIVE, 6,881
+  frames boot→fight, zero wedges. NEXT: BATCHDBG triple-journal rig +
+  10k-frame soak + DET screenshot A/B, THEN bucket-matched fps A/B and
+  the default-ON decision (§6 kill bar: heavy >= +1, modal >= flat).
