@@ -1,5 +1,41 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 DYNAREC RESIDENCY ESCALATION SESSION 2026-08-07 night (aa54fe1) — VERDICT: FLAT
+
+Option-A escalation step 1 landed and measured. The wall was POPULATION,
+not translation quality: 480s translated 18-32 blocks total (mailbox =
+one head/slice, last-writer-wins; hot tried heads win the lottery;
+~zero chains ever resolved). Landed, one gate cycle:
+- **Chain-target seeding** (DYN_SEEDS_PER_SLICE=4): the pending-link
+  list is the web frontier; dyn_service translates pending targets
+  directly, patches resolved links, drops permanently-refused ones.
+  Tried-filter 16384 bits (same fixed 8KB block).
+- **Min-length filter removed** for ender blocks (it refused the
+  hottest shapes — 2-insn tst+bcc poll loops, 0x0318A6 ~55/frame; the
+  straight-line-tail hazard is already covered by ender-only policy).
+- **Call/jump enders**: JMP (d16,PC)/(xxx).l, JSR (d16,PC)/(xxx).l,
+  BSR.b/.w (W3-body transcriptions; abs targets store recomputed
+  pc_diff — now .globl), LEA (xxx).l,An template, max_insns 8→24.
+Population 480s: 32 blk/138 insns/10 chains → 79/213/44. Gates all
+green: rig 83/83 (8 new call/jump/LEA seqs), testsuite 125/126,
+JSR/JMP/BSR/RTS/Bcc/DBcc btests through the ender templates, TRCRC
+IDENTICAL 7066 frames.
+**PERF: twin-binary bucket-matched 480s = FLAT** (dominant 38.7/38.7,
+light +0.6, heavy +0.1/+0.2 — at the ±0.3 line). 213 resident insns vs
+~8-11k executed/frame is too small a fraction; webs break at every RTS
+(×14 top refusal) and at coverage edges. LESSON: population/chaining
+infrastructure alone does not pay at this coverage level — fps arrives
+only if the resident fraction becomes a large share of executed insns.
+NEXT (value order): (1) RTS ender (inline 2-way probe + jr t3; odd-
+target raise design needed — pc_address_error entry from arena), (2)
+template breadth at refusal heads (BTST/CLR/NOT/ANDI/MOVE.w dst forms,
+ADD (An)+ forms), (3) fallthrough-chain root-cause (TRCRC bisect,
+DYN_CHAIN_FALLTHROUGH still quarantined), (4) register caching once
+residency is long. Measurement notes: ~9fps early-boot phase is the
+normal UniBIOS/conversion stretch in every build; TRCRC frame-count
+deltas across runs are load artifacts (ref ran under concurrent load)
+— only solo twin runs count.
+
 ## 📊 CAMPAIGN DAY 2026-08-07 — SESSION RECORD (25 commits, 9bed4a5..2b55962)
 
 State: ~39-40 fps modal / 34-36 heavy (unchanged deliverable). Landed:
