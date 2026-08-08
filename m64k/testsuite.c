@@ -495,6 +495,20 @@ static void run_emitter_differential(void)
              "move.l a6,(8,a5); movea.l (8,a5),a5");
     diff_run((const uint16_t[]){0x2B43, 0x0004, 0x222D, 0x0004}, 4, 2, 150,
              "move.l d3,(4,a5); (4,a5),d1 (Z)");
+    // Register-cache (rung 1) shapes: cached post-inc bump visibility via
+    // store-store-readback (a stale slot would land both stores at the same
+    // address and the negative-d16 readbacks see it), in-slot ADDA, and
+    // LEA/MOVEA binding invalidation. Eviction rotation exercises the LRU.
+    diff_run((const uint16_t[]){0x30C0, 0x30C1, 0x3428, 0xFFFC, 0x3628, 0xFFFE},
+             6, 4, 200, "d0,(a0)+; d1,(a0)+; (-4,a0),d2; (-2,a0),d3 (rc bump)");
+    diff_run((const uint16_t[]){0x3014, 0x7004, 0xD8C0, 0x3214}, 4, 4, 150,
+             "(a4),d0; moveq #4,d0; adda.w d0,a4; (a4),d1 (rc adda)");
+    diff_run((const uint16_t[]){0x3212, 0x45F9, 0x0000, 0x4404, 0x3412}, 5, 3, 150,
+             "(a2),d1; lea (abs).l,a2; (a2),d2 (rc invalidate)");
+    diff_run((const uint16_t[]){0x3216, 0x2C4D, 0x3416}, 3, 3, 250,
+             "(a6),d1; movea.l a5,a6; (a6),d2 (rc set-invalidate, ADDRERR)");
+    diff_run((const uint16_t[]){0x3010, 0x3211, 0x3412, 0x3613, 0x3810},
+             5, 5, 200, "(a0)..(a3),(a0) rotation (rc LRU eviction)");
     // Odd-address bails through the new memory templates (a5 = 0x4501).
     diff_run((const uint16_t[]){0x2A15}, 1, 1, 200, "move.l (a5),d5 ADDRERR");
     diff_run((const uint16_t[]){0x2B46, 0x0000}, 2, 1, 200,

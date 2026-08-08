@@ -27,9 +27,11 @@ uint32_t __m64k_dyn_table[M64K_DYN_TABLE_SETS * 4] __attribute__((aligned(8192))
 static struct dyn_statics {
     uint32_t arena_used;
     int      npending;
+    int      rc_enable;    // register-cache rung 1 (set once at init; lives
+                           // here so the knob shifts no .bss — layout law)
     struct { uint32_t *slot; uint32_t target; } pending[512];
     uint8_t  tried[2048];
-    uint8_t  pad[8192 - 8 - 512 * 8 - 2048];   // keep sizeof == 8KB forever
+    uint8_t  pad[8192 - 12 - 512 * 8 - 2048];  // keep sizeof == 8KB forever
 } __attribute__((aligned(8192))) dyn_s;
 #define dyn_arena_used (dyn_s.arena_used)
 #define dyn_npending   (dyn_s.npending)
@@ -87,6 +89,13 @@ void __m64k_dynrec_init(void)
     __m64k_dyn_mailbox = 0;
     dyn_arena_used = 0;
     dyn_npending = 0;
+    // Register-cache twin knob: compile-time default differs by one
+    // immediate only, so ON and OFF binaries stay layout-identical.
+#ifdef M64K_DYN_RC_DISABLE
+    dyn_s.rc_enable = 0;
+#else
+    dyn_s.rc_enable = 1;
+#endif
 }
 
 static uint32_t *dyn_lookup(uint32_t pc)
@@ -109,6 +118,9 @@ static uint32_t *dyn_lookup(uint32_t pc)
 #define R_T4   12  // eaptr32 (interpreter alias; plain scratch inside blocks)
 #define R_T5   13  // m_pc
 #define R_T6   14  // result: canonical MMIO store source
+#define R_T7   15  // regcache slot (trap-safe: hw_n64.S saves/restores $15/$24/$25)
+#define R_T8   24  // regcache slot
+#define R_T9   25  // regcache slot
 #define R_V1   3   // zx64_mask (0x00000000FFFFFFFF)
 #define R_S2   18  // dptr: must stay a valid even host pointer (stale-dptr law)
 #define R_S6   22  // flag_nv
@@ -141,6 +153,7 @@ static uint32_t *dyn_lookup(uint32_t pc)
 #define SRLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x02)
 #define BGEZ(rs,off)      ITYPE(0x01,rs,1,off)
 #define BLTZ(rs,off)      ITYPE(0x01,rs,0,off)
+#define ADDU(rd,rs,rt)    RTYPE(rs,rt,rd,0,0x21)
 #define MOVE(rd,rs)       RTYPE(rs,R_ZERO,rd,0,0x21)  // addu: 32-bit move (sign-extends)
 #define DMOVE(rd,rs)      RTYPE(rs,R_ZERO,rd,0,0x25)  // or: 64-bit move (flag values!)
 #define SLLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x00)
@@ -189,6 +202,12 @@ typedef struct {
     int ended;          // a block-ender (Bcc/BRA) was emitted: stop decoding
     struct { int at; uint32_t target; int taken; } chain[4];  // exit J slots
     int nchain;
+    // Register cache (rung 1, see block comment below): guest An index held
+    // by each slot (t7/t8/t9) or -1, LRU ages, translate-time hit count.
+    int rc_on;
+    int8_t rc_slot[3];
+    uint8_t rc_age[3], rc_tick;
+    int rc_hits;
 } emit_t;
 
 // Baked branch targets that match the interpreter's jmp_exec idle-skip
@@ -248,6 +267,83 @@ static void emit_moveb_flags(emit_t *e, int reg)
 {
     e->buf[e->len++] = MOVE(R_S7, reg);
     e->buf[e->len++] = SLLI(R_S6, reg, 24);
+}
+
+// ---- Register cache (rung 1) ---------------------------------------------
+// Guest ADDRESS registers cached full-width (canonical sign-extended LW
+// form) in t7/t8/t9 for the lifetime of one emitted block. The design
+// rests on three facts:
+//  - t7/t8/t9 are per-instruction scratch in the interpreter (never live
+//    across insn boundaries) and the hw_n64.S TLB/MMIO trap handler
+//    saves/restores $15/$24/$25 around the C handlers, so cached values
+//    survive a trapping guest access mid-block.
+//  - WRITE-THROUGH: every guest-visible An update still stores to ctx at
+//    the template's commit point, so ctx is architecturally current at
+//    every exit (ADDRERR bail stubs, slice-break checks, chain exits) —
+//    there is no flush code anywhere and the bail/replay contract is
+//    untouched.
+//  - The cache is a translate-time construct: fills are ordinary body
+//    instructions, so every runtime (re-)entry — including chained
+//    self-loops — refills from ctx; no state crosses block entries.
+// Dn stays uncached in this rung: templates read b/w/l slices whose
+// canonicalization would cost about what the load costs.
+// Eviction is LRU over 3 slots; templates keep at most 2 An live at once
+// (the mem-to-mem MOVEs), and the just-touched slot has max age, so a
+// live registerd An can never be evicted mid-template.
+static const uint8_t rc_hostreg[3] = { R_T7, R_T8, R_T9 };
+
+// Host reg holding full An; emits the fill LW on a miss. pref = the
+// scratch the uncached path loads into (rc off reproduces the historical
+// template emission). The returned register is READ-ONLY to templates —
+// updates go through rc_an_commit/rc_an_set.
+static int rc_an(emit_t *e, int an, int pref)
+{
+    if (!e->rc_on) {
+        e->buf[e->len++] = LW(pref, R_A0, M64K_OFF_AREGS + 4 * an);
+        return pref;
+    }
+    int v = 0;
+    for (int i = 0; i < 3; i++) {
+        if (e->rc_slot[i] == an) {
+            e->rc_age[i] = ++e->rc_tick;
+            e->rc_hits++;
+            return rc_hostreg[i];
+        }
+        if (e->rc_age[i] < e->rc_age[v])
+            v = i;
+    }
+    e->rc_slot[v] = an;
+    e->rc_age[v] = ++e->rc_tick;
+    e->buf[e->len++] = LW(rc_hostreg[v], R_A0, M64K_OFF_AREGS + 4 * an);
+    return rc_hostreg[v];
+}
+
+// Post-inc/dec commit An := h + delta (h = what rc_an returned for this
+// An). Cached: bump the slot in place and write it through, so later
+// insns see the new value for free. Uncached: classic scratch + store.
+// Call only AFTER every use of the OLD value (address materialization,
+// bail checks) — the slot is updated in place.
+static void rc_an_commit(emit_t *e, int an, int h, int delta, int scratch)
+{
+    if (e->rc_on) {
+        e->buf[e->len++] = ADDIU(h, h, delta);
+        e->buf[e->len++] = SW(h, R_A0, M64K_OFF_AREGS + 4 * an);
+    } else {
+        e->buf[e->len++] = ADDIU(scratch, h, delta);
+        e->buf[e->len++] = SW(scratch, R_A0, M64K_OFF_AREGS + 4 * an);
+    }
+}
+
+// An := value in v (canonical 32-bit form): write-through store + drop any
+// stale binding. No rebind — a MOVE into a slot would cost the insn the
+// cache exists to save; LEA/MOVEA destinations simply refill on next use.
+static void rc_an_set(emit_t *e, int an, int v)
+{
+    e->buf[e->len++] = SW(v, R_A0, M64K_OFF_AREGS + 4 * an);
+    if (e->rc_on)
+        for (int i = 0; i < 3; i++)
+            if (e->rc_slot[i] == an && rc_hostreg[i] != v)
+                e->rc_slot[i] = -1;
 }
 
 // ADD-family flags (add_f_* idiom): result(t6) = daddu of zero-extended
@@ -341,9 +437,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.w Dn,(An)  [movew_f_dst_an, 8 cycles, 1 word].
         if (smode == 0 && dmode == 2) {
             e->buf[e->len++] = LHU(R_T2, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, dreg, R_T4);
+            emit_bail_check(e, h);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
             e->buf[e->len++] = MOVE(R_T6, R_T2);
             emit_movew_flags(e, R_T2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
@@ -357,11 +453,10 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // its word-align quirk generic; post-inc commits BEFORE the store.
         if (smode == 0 && dmode == 3 && dreg != 7) {
             e->buf[e->len++] = LHU(R_T2, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = ADDIU(R_T1, R_T4, 2);
-            e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, dreg, R_T4);
+            emit_bail_check(e, h);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
+            rc_an_commit(e, dreg, h, 2, R_T1);
             e->buf[e->len++] = MOVE(R_T6, R_T2);
             emit_movew_flags(e, R_T2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
@@ -374,11 +469,10 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.w (An)+,Dn  [movew_fanp_dn, 8 cycles, 1 word]: post-inc
         // commits BEFORE the load (ea_011 order); bail before any mutation.
         if (smode == 3 && dmode == 0) {
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = ADDIU(R_T2, R_T4, 2);
-            e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, sreg, R_T4);
+            emit_bail_check(e, h);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
+            rc_an_commit(e, sreg, h, 2, R_T2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
@@ -392,8 +486,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // baked from the code stream at translate time.
         if (smode == 5 && dmode == 0) {
             int16_t d16 = (int16_t)fetch16(pc + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int h = rc_an(e, sreg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
             emit_bail_check(e, R_T4);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
@@ -410,8 +504,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         if (smode == 0 && dmode == 5) {
             int16_t d16 = (int16_t)fetch16(pc + 2);
             e->buf[e->len++] = LHU(R_T2, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int h = rc_an(e, dreg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
             emit_bail_check(e, R_T4);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
             e->buf[e->len++] = MOVE(R_T6, R_T2);
@@ -435,9 +529,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         }
         // move.w (An),Dn (8 cycles, 1 word; rig-verified charge).
         if (smode == 2 && dmode == 0) {
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, sreg, R_T4);
+            emit_bail_check(e, h);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
@@ -483,13 +577,12 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
 #ifdef M64K_DYN_NO_R2MEM
             return 0;                   // TRCRC bisect knob
 #endif
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = LW(R_T2, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            emit_bail_check(e, R_T2);
-            e->buf[e->len++] = ADDIU(R_T1, R_T4, 2);
-            e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int hs = rc_an(e, sreg, R_T4);
+            emit_bail_check(e, hs);
+            int hd = rc_an(e, dreg, R_T2);  // <=2 live An: cannot evict hs
+            emit_bail_check(e, hd);
+            e->buf[e->len++] = OR(R_T3, hs, R_A2);
+            rc_an_commit(e, sreg, hs, 2, R_T1);
             // Charge SPLIT 8/4 like the interpreter (entry+ea_011 before
             // the read, dst ea before the write; the W3 path is explicit
             // about it and the generic path composes the same). A lump
@@ -502,7 +595,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = MOVE(R_T6, R_T0);
             emit_movew_flags(e, R_T0);
-            e->buf[e->len++] = OR(R_T3, R_T2, R_A2);
+            e->buf[e->len++] = OR(R_T3, hd, R_A2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
             e->buf[e->len++] = SH(R_T6, R_T3, 0);
             emit_break_check(e, e->goff + 2);
@@ -531,9 +624,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.w #imm,(An)  [movew_fsrc_other tail, 12 cycles, 2 words].
         if (smode == 7 && sreg == 4 && dmode == 2) {
             uint16_t imm = fetch16(pc + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, dreg, R_T4);
+            emit_bail_check(e, h);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
             e->buf[e->len++] = ORI(R_T6, R_ZERO, imm);
             emit_movew_flags(e, R_T6);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
@@ -608,7 +701,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
         e->buf[e->len++] = LUI(R_T0, abs >> 16);
         e->buf[e->len++] = ORI(R_T0, R_T0, abs & 0xFFFF);
-        e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_AREGS + 4 * an);
+        rc_an_set(e, an, R_T0);
         e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
         *cmax += 12;
         return 6;
@@ -634,10 +727,9 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.b (An)+,Dn (8 cycles, 1 word; A7 generic): post-inc by 1
         // BEFORE the load (ea_011 order).
         if (smode == 3 && dmode == 0 && sreg != 7) {
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = ADDIU(R_T2, R_T4, 1);
-            e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, sreg, R_T4);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
+            rc_an_commit(e, sreg, h, 1, R_T2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
             e->buf[e->len++] = LBU(R_T0, R_T3, 0);
             e->buf[e->len++] = SB(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 3);
@@ -649,8 +741,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.b (d16,An),Dn (12 cycles, 2 words).
         if (smode == 5 && dmode == 0) {
             int16_t d16 = (int16_t)fetch16(pc + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int h = rc_an(e, sreg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
             e->buf[e->len++] = LBU(R_T0, R_T3, 0);
@@ -665,8 +757,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         if (smode == 0 && dmode == 5) {
             int16_t d16 = (int16_t)fetch16(pc + 2);
             e->buf[e->len++] = LBU(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg + 3);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int h = rc_an(e, dreg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
             emit_moveb_flags(e, R_T6);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
@@ -678,8 +770,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // move.b Dn,(An) (8 cycles, 1 word; charge rig-verified).
         if (smode == 0 && dmode == 2) {
             e->buf[e->len++] = LBU(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg + 3);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, dreg, R_T4);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
             emit_moveb_flags(e, R_T6);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
             e->buf[e->len++] = SB(R_T6, R_T3, 0);
@@ -747,8 +839,8 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         // tst.b/.w (d16,An) (12 cycles, 2 words; word form bails on odd).
         if (mode == 5) {
             int16_t d16 = (int16_t)fetch16(pc + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * reg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int h = rc_an(e, reg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
             if (word)
                 emit_bail_check(e, R_T4);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
@@ -811,10 +903,17 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         if (top == 0xD && smode == 0 && opmode == 3) {
             e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_AREGS + 4 * dreg);
             e->buf[e->len++] = ITYPE(0x21, R_A0, R_T0, M64K_OFF_DREGS + 4 * sreg + 2); // lh
-            e->buf[e->len++] = LW(R_T1, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            e->buf[e->len++] = MOVE(R_T2, R_T0);
-            e->buf[e->len++] = RTYPE(R_T1, R_T2, R_T2, 0, 0x21);  // addu t2,t1,t2
-            e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            int h = rc_an(e, dreg, R_T1);
+            if (e->rc_on) {
+                // In-slot sum keeps the binding live (addu re-sign-extends,
+                // preserving the canonical cached form).
+                e->buf[e->len++] = ADDU(h, h, R_T0);
+                e->buf[e->len++] = SW(h, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            } else {
+                e->buf[e->len++] = MOVE(R_T2, R_T0);
+                e->buf[e->len++] = ADDU(R_T2, h, R_T2);
+                e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            }
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
             *cmax += 8;
             return 2;
@@ -854,9 +953,14 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         }
         // MOVEA.l Dn/An,Am (charge 12 - rig-measured flat .l rate; no flags).
         if (top == 0x2 && opmode == 1 && smode <= 1) {
-            int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg;
-            e->buf[e->len++] = LW(R_T0, R_A0, off);
-            e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            int h;
+            if (smode)
+                h = rc_an(e, sreg, R_T0);
+            else {
+                e->buf[e->len++] = LW(R_T0, R_A0, M64K_OFF_DREGS + 4 * sreg);
+                h = R_T0;
+            }
+            rc_an_set(e, dreg, h);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
             *cmax += 12;
             return 2;
@@ -865,7 +969,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         if (top == 0x3 && opmode == 1 && smode <= 1) {
             int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg + 2;
             e->buf[e->len++] = ITYPE(0x21, R_A0, R_T0, off);  // lh (sign-extends)
-            e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            rc_an_set(e, dreg, R_T0);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
             *cmax += 4;
             return 2;
@@ -878,15 +982,16 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             return 0;                   // TRCRC bisect knob
 #endif
             int to_an = (opmode == 1);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            emit_bail_check(e, R_T4);
-            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            int h = rc_an(e, sreg, R_T4);
+            emit_bail_check(e, h);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
             e->buf[e->len++] = LWL(R_T0, R_T3, 0);   // lw_m68k pair
             e->buf[e->len++] = LWR(R_T0, R_T3, 3);
-            e->buf[e->len++] = SW(R_T0, R_A0, (to_an ? M64K_OFF_AREGS
-                                                     : M64K_OFF_DREGS) + 4 * dreg);
-            if (!to_an) {
+            if (to_an)
+                rc_an_set(e, dreg, R_T0);
+            else {
+                e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg);
                 e->buf[e->len++] = MOVE(R_S6, R_T0);
                 e->buf[e->len++] = AND(R_S7, R_T0, R_V1);
             }
@@ -901,16 +1006,17 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
 #endif
             int to_an = (opmode == 1);
             int16_t d16 = (int16_t)fetch16(pc + 2);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int h = rc_an(e, sreg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
             emit_bail_check(e, R_T4);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -20);
             e->buf[e->len++] = LWL(R_T0, R_T3, 0);
             e->buf[e->len++] = LWR(R_T0, R_T3, 3);
-            e->buf[e->len++] = SW(R_T0, R_A0, (to_an ? M64K_OFF_AREGS
-                                                     : M64K_OFF_DREGS) + 4 * dreg);
-            if (!to_an) {
+            if (to_an)
+                rc_an_set(e, dreg, R_T0);
+            else {
+                e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg);
                 e->buf[e->len++] = MOVE(R_S6, R_T0);
                 e->buf[e->len++] = AND(R_S7, R_T0, R_V1);
             }
@@ -925,17 +1031,22 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             return 0;                   // TRCRC bisect knob
 #endif
             int16_t d16 = (int16_t)fetch16(pc + 2);
-            int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg;
-            e->buf[e->len++] = LW(R_T6, R_A0, off);
-            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
-            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            int hv;
+            if (smode)
+                hv = rc_an(e, sreg, R_T6);
+            else {
+                e->buf[e->len++] = LW(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg);
+                hv = R_T6;
+            }
+            int hd = rc_an(e, dreg, R_T4);   // <=2 live An: cannot evict hv
+            e->buf[e->len++] = ADDIU(R_T4, hd, d16);
             emit_bail_check(e, R_T4);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
-            e->buf[e->len++] = MOVE(R_S6, R_T6);
-            e->buf[e->len++] = AND(R_S7, R_T6, R_V1);
+            e->buf[e->len++] = MOVE(R_S6, hv);
+            e->buf[e->len++] = AND(R_S7, hv, R_V1);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -20);
-            e->buf[e->len++] = SWL(R_T6, R_T3, 0);   // sw_m68k pair
-            e->buf[e->len++] = SWR(R_T6, R_T3, 3);
+            e->buf[e->len++] = SWL(hv, R_T3, 0);   // sw_m68k pair
+            e->buf[e->len++] = SWR(hv, R_T3, 3);
             emit_break_check(e, e->goff + 4);
             *cmax += 20;
             return 4;
@@ -1155,14 +1266,14 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
 #ifdef M64K_DYN_NO_RTS
         return 0;                       // TRCRC bisect knob
 #endif
-        e->buf[e->len++] = LW(R_T2, R_A0, M64K_OFF_AREGS + 7 * 4);
-        emit_bail_check(e, R_T2);       // clobbers t1 only
+        int h = rc_an(e, 7, R_T2);
+        emit_bail_check(e, h);          // clobbers t1 only
         e->buf[e->len++] = ORI(R_T1, R_ZERO, 0x4E75);
         e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_IR);
         e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
-        e->buf[e->len++] = ADDIU(R_T1, R_T2, 4);
-        e->buf[e->len++] = OR(R_T3, R_T2, R_A2);   // map_m68k of the OLD sp
-        e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 7 * 4);
+        e->buf[e->len++] = ADDIU(R_T1, h, 4);
+        e->buf[e->len++] = OR(R_T3, h, R_A2);      // map_m68k of the OLD sp
+        rc_an_set(e, 7, R_T1);
         e->buf[e->len++] = LWL(R_T0, R_T3, 0);     // lw_m68k: loads->t0 law
         e->buf[e->len++] = LWR(R_T0, R_T3, 3);
         e->buf[e->len++] = MOVE(R_T4, R_T0);       // eaptr32 = target
@@ -1263,13 +1374,13 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         if (e->nchain > 3)
             return 0;
         uint32_t ret = pc + glen;       // return address (guest space)
-        e->buf[e->len++] = LW(R_T1, R_A0, M64K_OFF_AREGS + 7 * 4);
-        e->buf[e->len++] = ADDIU(R_T2, R_T1, -4);
+        int h = rc_an(e, 7, R_T1);
+        e->buf[e->len++] = ADDIU(R_T2, h, -4);
         emit_bail_check(e, R_T2);
         e->buf[e->len++] = LUI(R_T6, ret >> 16);
         e->buf[e->len++] = ORI(R_T6, R_T6, ret & 0xFFFF);
         e->buf[e->len++] = ADDIU(R_A1, R_A1, -pre);
-        e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 7 * 4);
+        rc_an_set(e, 7, R_T2);
         e->buf[e->len++] = OR(R_T3, R_T2, R_A2);
         e->buf[e->len++] = SWL(R_T6, R_T3, 0);  // sw_m68k result idiom
         e->buf[e->len++] = SWR(R_T6, R_T3, 3);
@@ -1393,15 +1504,27 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     if ((pc & 0x00FFFFFF) < 0x80)   // vector-swap page: never translated
         return 0;
 
-    emit_t e = { .len = 0, .goff = 0, .nfix = 0 };
+    emit_t e = { .len = 0, .goff = 0, .nfix = 0,
+                 .rc_on = dyn_s.rc_enable,
+                 .rc_slot = { -1, -1, -1 } };
     int ninsns = 0, cmax = 0, guest_len = 0;
     while (ninsns < max_insns && e.len < EMIT_MAXWORDS - 24 && e.nfix < EMIT_MAXFIX - 4) {
         int save = e.len, savefix = e.nfix;
+        // Regcache rollback snapshot: a refused form must not leave stale
+        // bindings whose fill instructions were rolled back with e.len.
+        int8_t save_rc[3] = { e.rc_slot[0], e.rc_slot[1], e.rc_slot[2] };
+        uint8_t save_age[3] = { e.rc_age[0], e.rc_age[1], e.rc_age[2] };
+        uint8_t save_tick = e.rc_tick;
+        int save_hits = e.rc_hits;
         e.goff = guest_len;
         int gl = emit_insn(fetch16(pc + guest_len), pc + guest_len, &e, &cmax);
         if (gl == 0) {
             e.len = save;
             e.nfix = savefix;
+            memcpy(e.rc_slot, save_rc, sizeof(save_rc));
+            memcpy(e.rc_age, save_age, sizeof(save_age));
+            e.rc_tick = save_tick;
+            e.rc_hits = save_hits;
             break;
         }
         guest_len += gl;
@@ -1553,6 +1676,13 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     }
     __m64k_dyn_stat_blocks++;
     __m64k_dyn_stat_insns += ninsns;
+    #ifdef M64K_DYNSTAT
+    // Regcache fire evidence (vacuous-gate law): translate-time count of
+    // An loads eliminated in this block.
+    if (e.rc_hits)
+        debugf("[DYNRC] pc=%06lx hits=%d\n",
+               (unsigned long)(pc & 0xFFFFFF), e.rc_hits);
+    #endif
     return ninsns;
 }
 
