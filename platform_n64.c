@@ -558,16 +558,47 @@ void plat_save_screenshot(const char *fn) {
 uint8_t *g_screen_ptr;
 int g_screen_pitch;
 
+#ifdef MVS64_FBCRC
+static surface_t *fbcrc_disp;
+#endif
+
 void plat_beginframe(void) {
     surface_t *rdp_disp = display_get();
 
 	g_screen_ptr = rdp_disp->buffer;
 	g_screen_pitch = 320*2;
+#ifdef MVS64_FBCRC
+	fbcrc_disp = rdp_disp;
+#endif
 
     rdpq_attach(rdp_disp, NULL);
 	rdpq_set_scissor(0, 0, 320, 224);
 }
 
 void plat_endframe(void) {
+#ifdef MVS64_FBCRC
+	// Pixel-identity gate rig (PLAN-DRAW-RDP §6): drain the RDP, hash the
+	// finished frame, then show. FNV-1a over the visible 320x224 region,
+	// read uncached (the RDP wrote RDRAM behind the CPU cache). The drain
+	// and the ~35k uncached reads change emulation speed, so this rig is
+	// only meaningful in -DMVS64_DET_AUDIO builds (wall-channel law) and
+	// its fps means nothing.
+	rdpq_detach_wait();
+	static uint32_t fbcrc_frame;
+	uint32_t crc = 0x811C9DC5u;
+	const uint8_t *row = (const uint8_t *)UncachedAddr(fbcrc_disp->buffer);
+	for (int y = 0; y < 224; y++) {
+		const uint32_t *p = (const uint32_t *)row;
+		for (int x = 0; x < 320*2/4; x++) {
+			crc ^= p[x];
+			crc *= 16777619u;
+		}
+		row += fbcrc_disp->stride;
+	}
+	plat_log("[FBCRC] %lu %08lx\n", (unsigned long)fbcrc_frame++,
+	         (unsigned long)crc);
+	display_show(fbcrc_disp);
+#else
 	rdpq_detach_show();
+#endif
 }
