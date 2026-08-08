@@ -1,5 +1,52 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🔥 THE WALL-CHANNEL LAW — frame-377 fully mechanized (2026-08-08, 3ff9dc7)
+
+The last unexplained divergence class is closed. A clean dynarec-vs-
+interpreter TRCRC pair (coverage templates on) forked at f=377 — but:
+[IO] read streams (raster/Z80 banks) IDENTICAL for ~2900 frames; each
+binary SELF-deterministic; and a -DMVS64_DET_AUDIO pair is TRCRC
+IDENTICAL over 3851 frames. Mechanism: the non-DET plat_audio_pump's
+wall-clock-driven fill turns cross-build SPEED differences into guest-
+content differences at marginal frames (the lsr-unlocked BIOS blocks
+made the eye-catcher faster; content forked where the pump behavior
+crossed a threshold). This RETROACTIVELY explains: the original
+frame-377 "fallthrough attractor" (chaining changed speed, not
+correctness) and most likely the blockops-ON/OFF f=3153 fork (the
+"IRQ-coarsening" hypothesis is now second-choice; re-verify with a DET
+pair when convenient).
+
+STANDING LAWS:
+- TRCRC content gates comparing builds of DIFFERENT SPEED must pin the
+  pump: build both sides with -DMVS64_DET_AUDIO. Same-speed pairs
+  (initializer-flip twins that measure fps-flat) may skip it.
+- fps twins whose knob changes speed also need DET pinning to stay
+  content-matched (the covPON run reached only 2784/8116 fight frames
+  vs its twin; the DET rebuild gave EXACTLY 2784 fight frames on both
+  sides — perfect bucket matching).
+- Diagnostic: M64K_TRCRC_SPLIT adds a content-only hash ([TRCCON],
+  regs/SR without pc/cycles) to separate timing displacement from state
+  corruption; MVS64_IOLOG_N64=<frame> diffs the IO-read streams.
+
+## COVERAGE RUNG LANDED (2026-08-08, 3ff9dc7) — [DYNTERM]-driven
+
+New instrument: [DYNTERM] (DYNSTAT builds) logs head/stop-pc/opcode for
+every block refused for lack of an ender — the exact template work list,
+heat-weighted via [DYNH]. Top 4 forms = 250k heat/window, all landed:
+add.b (An)+,Dn (131k, BIOS checksum), cmp.w (d16,An),Dn (64k, in-game
+list search — regcache-hot A4 traffic), lsr.w #imm,Dn (8+2c — the
+shift-imm charge's -2 arm is LONG-only, rig-measured) and subi.w #imm,Dn
+(46k raster polls). Deferred: the 00b7cc chain (needs ROXL + pre-dec +
+ANDI, 12k heat). Rig 116/0 with carry-sensitive canaries; DET TRCRC
+identical 3851f; residency execpf 390→643 (+65%).
+
+**fps: +0.5 in the sole measurable bucket** (DET twins, 39.8→40.3) —
+the new residency is BIOS-era-heavy. The DYNTERM loop (measure →
+template in-fight heads → repeat) is now cheap; but with in-fight
+residency still ~6-8%, each rung buys little until the ladder reaches
+in-fight majority share. Judgment call pending: keep climbing vs pivot
+to PLAN-DRAW-RDP (draw = 27-66% in-fight).
+
 ## REGISTER-CACHE RUNG 1 LANDED — CORRECT, GATED, fps-FLAT (2026-08-08, 537a98c)
 
 Write-through An caching in t7/t8/t9 across emitted blocks (dynrec.c).
