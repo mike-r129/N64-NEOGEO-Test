@@ -1468,14 +1468,17 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     // Ender exits already set m_pc; resolve their chain slots now if the
     // target block exists (forced/testsuite blocks never chain: they have
     // no C_max gate, so a chained loop would never re-check the budget).
-    // Chain policy: TAKEN exits only. Bisected 2026-08-07: full chaining
-    // (fallthrough included) diverges TRCRC at frame 377; taken-only and
-    // no-chain are both bit-exact over 6300 frames. Fallthrough chaining
-    // stays behind DYN_CHAIN_FALLTHROUGH until the divergence is
-    // root-caused; taken chains carry the hot loop back-edges anyway.
+    // Chain policy: ALL exits (taken + fallthrough). The 2026-08-07
+    // frame-377 quarantine of fallthrough chaining was an instrumentation
+    // artifact: the bisect builds carried the BOSTAT/DYNSTAT As-corruption
+    // (port-blockop fire counter clobbered t8 = As, "restored" as the
+    // constant 22 — fixed 2026-08-08), which forks guest content at the
+    // first fired port copy. Clean matched-pair retest: TRCRC identical
+    // over the full 9573-frame overlap with fallthrough chaining on.
+    // Bisect knob kept: -DDYN_CHAIN_TAKEN_ONLY restores the old policy.
     if (!force) {
         for (int i = 0; i < e.nchain; i++) {
-            #ifndef DYN_CHAIN_FALLTHROUGH
+            #ifdef DYN_CHAIN_TAKEN_ONLY
             if (!e.chain[i].taken) continue;
             #endif
             uint32_t *host = dyn_lookup(e.chain[i].target);
@@ -1521,7 +1524,7 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         // then patch any earlier blocks waiting on this head (a self-loop
         // registers above and resolves here, landing on its own gate).
         for (int i = 0; i < e.nchain; i++) {
-            #ifndef DYN_CHAIN_FALLTHROUGH
+            #ifdef DYN_CHAIN_TAKEN_ONLY
             if (!e.chain[i].taken) continue;
             #endif
             if (block[body_at + e.chain[i].at] == JABS(main_loop)
