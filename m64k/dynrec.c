@@ -38,6 +38,10 @@ static struct dyn_statics {
 #define dyn_npending   (dyn_s.npending)
 #define dyn_pending    (dyn_s.pending)
 #define dyn_tried      (dyn_s.tried)
+
+// Exact tried-tag table (see dyn_tried_test_set): 16KB, 8KB-aligned per
+// the layout law's big-array rule.
+static uint16_t dyn_tried2[8192] __attribute__((aligned(8192)));
 _Static_assert(sizeof(struct dyn_statics) == 8192, "dynrec statics must stay 8KB");
 
 // Runtime translation gate: compile-time default only differs by one
@@ -64,11 +68,15 @@ void __m64k_dyn_publish(void *dst, const void *src, int len)
     inst_cache_hit_invalidate(dst, len);
 }
 
-// Translation-trigger mailbox: the jmp_exec probe's miss edge stores the
-// missed target here (last-writer-wins within a slice); m64k_run services
-// it at slice boundaries (the deferred-work law: never translate/reclaim
+// Translation-trigger mailboxes: the jmp_exec probe's miss edge stores the
+// missed target in [0] (last-writer-wins within a slice) and every 61st
+// miss in [1] ([2] holds the countdown) — an unbiased sample of the miss
+// population, so hot mid-frame heads the slice-end-biased lottery never
+// picks (the 00cee0 VRAM-upload function's inner loops, 80k misses/window)
+// get attempted proportionally to their miss share. m64k_run services both
+// at slice boundaries (the deferred-work law: never translate/reclaim
 // while guest code may be mid-flight in the arena).
-uint32_t __m64k_dyn_mailbox;
+uint32_t __m64k_dyn_mailbox[3];
 // (tried-filter, pending chain links and arena bump pointer live in the
 // fixed-size dyn_s block above — layout-invariance law.)
 
@@ -86,8 +94,10 @@ uint32_t __m64k_dyn_stat_exec;
 void __m64k_dynrec_init(void)
 {
     memset(__m64k_dyn_table, 0xFF, sizeof(__m64k_dyn_table));
-    memset(dyn_tried, 0, sizeof(dyn_tried));
-    __m64k_dyn_mailbox = 0;
+    memset(dyn_tried2, 0, sizeof(dyn_tried2));
+    __m64k_dyn_mailbox[0] = 0;
+    __m64k_dyn_mailbox[1] = 0;
+    __m64k_dyn_mailbox[2] = 61;   // sampling countdown (see mailbox comment)
     dyn_arena_used = 0;
     dyn_npending = 0;
     // Register-cache twin knob: compile-time default differs by one
@@ -693,6 +703,32 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         *cmax += 8;
         return 4;
     }
+    // BTST #imm,Dn [8 cycles rig-measured (4 + bits_impl 8 - no-writeback
+    // 4; the Dn +2 opmask arm does NOT fire), 2 words]: only Z is
+    // affected — bits_impl idiom: keep C
+    // (upper bits of flag_zc), replace the Z field with the RAW masked
+    // bit (low32 nonzero <=> bit set). N/V/X untouched. Bit index mod 32
+    // for the Dn form. Unlocks function-entry heads (00cee0/00cf22, the
+    // in-fight VRAM-upload function) whose refusal starved the chain
+    // seeder of the 80k-heat inner loops.
+    if ((op & 0xFFF8) == 0x0800) {
+        int reg = op & 7;
+        int bit = fetch16(pc + 2) & 31;
+        e->buf[e->len++] = MOVE(R_S2, R_A0);
+        e->buf[e->len++] = LW(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg);
+        if (bit < 16)
+            e->buf[e->len++] = ORI(R_T2, R_ZERO, 1u << bit);
+        else
+            e->buf[e->len++] = LUI(R_T2, 1u << (bit - 16));
+        e->buf[e->len++] = AND(R_T1, R_T1, R_T2);
+        e->buf[e->len++] = DSRL32(R_T0, R_S7, 0);
+        e->buf[e->len++] = DSLL32(R_T0, R_T0, 0);
+        e->buf[e->len++] = OR(R_S7, R_T0, R_T1);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+        *cmax += 8;
+        return 4;
+    }
+
     // SUBI.w #imm,Dn [8 cycles, 2 words]: ADDI's mirror — full SUB flags
     // including the borrow X (op_sub_rmwimpl idiom). Rig-gated like ADDI.
     if ((op & 0xFFF8) == 0x0440) {
@@ -1518,17 +1554,38 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
 }
 
 // ---- Translation service (slice boundaries) ------------------------------
-// Tried-filter: one translation attempt ever per head (translation is
-// deterministic, so a refusal is permanent). Returns true if pc was
-// already tried; marks it tried otherwise. Hash-shadowing loses the
-// shadowed head — sized so that stays rare.
-static bool dyn_tried_test_set(uint32_t pc)
+// Tried-filter: one translation attempt per head (translation is
+// deterministic, so a refusal is stable). EXACT tag table — the original
+// 16K-bit bitmap silently hash-shadowed heads (the 00ceec/00cf2e upload
+// loops, 80k misses/window, collided with 0x4EEC-class heads and were
+// never attempted). 23-bit head key = 13-bit slot + 10-bit tag + valid;
+// a collision REPLACES the previous tag, so a shadowed head retries later
+// instead of being blacklisted forever (bounded re-translate churn).
+// (Array lives with the other big aligned statics near dyn_s; dyn_s.tried
+// is retired but kept in the struct for layout stability.)
+//
+// Entries carry the OUTCOME (bit14 = refused): a head marked translated
+// whose block is no longer in the table was EVICTED by a set conflict —
+// it must be eligible for re-translation, or a 2-way set war permanently
+// silences a hot head with the filter still claiming it was handled
+// (observed: the 00ceec/00cf2e upload loops at full miss heat with no
+// DYNREF). Known-refused heads stay skipped (translation deterministic).
+static bool dyn_tried_check(uint32_t pc)
 {
-    uint32_t h = (pc >> 1) & (8 * sizeof(dyn_tried) - 1);
-    if (dyn_tried[h >> 3] & (1u << (h & 7)))
-        return true;
-    dyn_tried[h >> 3] |= 1u << (h & 7);
-    return false;
+    uint32_t h = (pc & 0xFFFFFF) >> 1;
+    uint16_t e = dyn_tried2[h & 8191];
+    uint16_t tag = (uint16_t)((h >> 13) | 0x8000u);
+    if (e == (uint16_t)(tag | 0x4000))
+        return true;                    // known-refused
+    if (e == tag && dyn_lookup(pc))
+        return true;                    // translated and still live
+    return false;                       // untried, shadowed, or evicted
+}
+static void dyn_tried_record(uint32_t pc, bool refused)
+{
+    uint32_t h = (pc & 0xFFFFFF) >> 1;
+    dyn_tried2[h & 8191] =
+        (uint16_t)((h >> 13) | 0x8000u | (refused ? 0x4000u : 0));
 }
 
 // Drop every pending chain link waiting on a target that can never get a
@@ -1563,12 +1620,36 @@ void __m64k_dyn_service(m64k_t *m64k)
     if (!__m64k_dyn_enable)
         return;
     int budget = DYN_SEEDS_PER_SLICE;
-    uint32_t pc = __m64k_dyn_mailbox;
-    if (pc) {
-        __m64k_dyn_mailbox = 0;
-        if (!dyn_tried_test_set(pc)) {
+    for (int mb = 0; mb < 2; mb++) {
+        uint32_t pc = __m64k_dyn_mailbox[mb];
+        if (!pc)
+            continue;
+        __m64k_dyn_mailbox[mb] = 0;
+        #ifdef M64K_DYNSTAT
+        // Service visibility (bounded): RAW mailbox value (unmasked — a
+        // mapped 0xFFxxxxxx here would explain a lot), tried verdict,
+        // translate outcome. Unconditional for the two mystery heads.
+        {
+            static int mblog;
+            int interesting = ((pc & 0xFFFFFF) == 0xCEEC)
+                           || ((pc & 0xFFFFFF) == 0xCF2E);
+            if (mblog < 30 || interesting) {
+                if (mblog < 1000) mblog++;
+                int tried = dyn_tried_check(pc);
+                debugf("[DYNMB] mb=%d raw=%08lx tried=%d\n",
+                       mb, (unsigned long)pc, tried);
+            }
+        }
+        #endif
+        if (!dyn_tried_check(pc)) {
             budget--;
-            m64k_dyn_translate(m64k, pc, M64K_DYN_MAXINSN, false);
+            int n = m64k_dyn_translate(m64k, pc, M64K_DYN_MAXINSN, false);
+            dyn_tried_record(pc, n == 0);
+            #ifdef M64K_DYNSTAT
+            if (((pc & 0xFFFFFF) == 0xCEEC) || ((pc & 0xFFFFFF) == 0xCF2E))
+                debugf("[DYNMB] translate %06lx -> %d\n",
+                       (unsigned long)(pc & 0xFFFFFF), n);
+            #endif
         }
     }
     // Chain-target seeding (deferred-work law holds: this is the same
@@ -1586,12 +1667,14 @@ void __m64k_dyn_service(m64k_t *m64k)
             dyn_pending[i] = dyn_pending[--dyn_npending];
             continue;
         }
-        if (dyn_tried_test_set(t)) {    // refused before (or shadowed):
-            dyn_pending_drop(t);        // can never resolve — drop
+        if (dyn_tried_check(t)) {       // known-refused (host==NULL above
+            dyn_pending_drop(t);        // rules out live): drop
             continue;
         }
         budget--;
-        if (m64k_dyn_translate(m64k, t, M64K_DYN_MAXINSN, false) == 0)
+        int n = m64k_dyn_translate(m64k, t, M64K_DYN_MAXINSN, false);
+        dyn_tried_record(t, n == 0);
+        if (n == 0)
             dyn_pending_drop(t);
     }
 }
@@ -1752,8 +1835,24 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     __m64k_dyn_publish(dst, block, bytes);
 
     // Table insert: code published above, tag written LAST (publish order).
+    // Victim way when the set is full: keyed by pc bit 1, not fixed way 0 —
+    // a three-head set with a fixed victim evicts the same resident every
+    // time (and the tried-filter then has to keep re-translating it).
     uint32_t *set = &__m64k_dyn_table[((pc >> 1) & (M64K_DYN_TABLE_SETS - 1)) * 4];
-    int way = (set[0] != 0xFFFFFFFF && set[2] == 0xFFFFFFFF) ? 1 : 0;
+    int way;
+    if (set[0] == 0xFFFFFFFF)      way = 0;
+    else if (set[2] == 0xFFFFFFFF) way = 1;
+    else                           way = (pc >> 1) & 1;
+    #ifdef M64K_DYNSTAT
+    if (set[way * 2] != 0xFFFFFFFF) {
+        static int evlog;
+        if (evlog < 40)
+            { evlog++; debugf("[DYNEV] set=%lu evict=%06lx for=%06lx\n",
+                (unsigned long)((pc >> 1) & (M64K_DYN_TABLE_SETS - 1)),
+                (unsigned long)(set[way * 2] & 0xFFFFFF),
+                (unsigned long)(pc & 0xFFFFFF)); }
+    }
+    #endif
     set[way * 2 + 1] = (uint32_t)(uintptr_t)dst;
     set[way * 2 + 0] = pc;
 

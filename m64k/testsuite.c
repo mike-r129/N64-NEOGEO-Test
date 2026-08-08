@@ -525,6 +525,20 @@ static void run_emitter_differential(void)
              "subi.w #1,d3 (borrow C/X/N)");
     diff_run((const uint16_t[]){0x0441, 0x7FFF}, 2, 1, 100,
              "subi.w #0x7FFF,d1 (V)");
+    // BTST #imm,Dn (population rung): Z from the tested bit, C preserved
+    // (bits_impl upper-half idiom), mod-32 index, sign-bit parity (the
+    // interpreter's sllv mask sign-extends at bit 31 — the template
+    // reproduces it exactly).
+    diff_run((const uint16_t[]){0x0801, 0x0000}, 2, 1, 100, "btst #0,d1 (set)");
+    diff_run((const uint16_t[]){0x0801, 0x0001}, 2, 1, 100, "btst #1,d1 (Z)");
+    diff_run((const uint16_t[]){0x0801, 0x001C}, 2, 1, 100, "btst #28,d1 (hi)");
+    diff_run((const uint16_t[]){0x0801, 0x0021}, 2, 1, 100, "btst #33,d1 (mod32)");
+    diff_run((const uint16_t[]){0xB244, 0x0801, 0x0010}, 3, 2, 100,
+             "cmp.w d4,d1; btst #16,d1 (C preserved)");
+    diff_run((const uint16_t[]){0x70FF, 0xB244, 0x0800, 0x001F}, 4, 3, 100,
+             "moveq #-1,d0; cmp; btst #31,d0 (sign-bit parity)");
+    diff_run((const uint16_t[]){0x0800, 0x000F, 0x6602, 0x7001, 0x4E71}, 5, 2, 100,
+             "btst #15,d0; bne (upload-fn entry shape)");
     // The BIOS raster-poll shape end-to-end (lsr feeds subi feeds bne).
     diff_run((const uint16_t[]){0xEE49, 0x0441, 0x0122, 0x6602, 0x7001, 0x4E71},
              6, 3, 150, "lsr/subi/bne (raster-poll shape)");

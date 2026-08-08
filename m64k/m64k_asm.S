@@ -3709,9 +3709,22 @@ jmp_exec:
     lw t3, 8(t2)                       # way-1 tag
     beq t3, eaptr32, dyn_probe_hit1
     # Miss: note the target for the C-side translator (serviced at slice
-    # boundaries; last-writer-wins is fine — hot heads recur every frame).
+    # boundaries). Slot 0 = last-writer-wins (biased to slice-end heads).
+    # Slot 1 = every-61st-miss SAMPLE ([2] is the countdown): unbiased
+    # rotation over the whole miss population, so hot mid-frame heads the
+    # lottery never picks (the 00ceec/00cf2e upload loops, 80k misses/
+    # window) get attempted proportionally to their miss share. (A
+    # first-writer-when-empty design was tried first and WEDGES: the
+    # first miss of every slice is the same recurring head, and if that
+    # head is already tried-and-refused the frontier never advances.)
     la t2, __m64k_dyn_mailbox
     sw eaptr32, 0(t2)
+    lw t3, 8(t2)
+    addiu t3, -1
+    bgtz t3, 1f
+    sw eaptr32, 4(t2)
+    li t3, 61
+1:  sw t3, 8(t2)
 #endif
 #ifdef M64K_DYNSTAT
     jal dynstat_count                  # coverage rig: count this target PC
