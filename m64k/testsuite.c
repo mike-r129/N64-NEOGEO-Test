@@ -438,6 +438,40 @@ static void run_emitter_differential(void)
     // ALU + ender loop: addq.w #1,d5; cmp.w d5,d1; bne -6 (budget-bounded).
     diff_run((const uint16_t[]){0x5245, 0xB245, 0x66FA}, 3, 3, 300,
              "addq/cmp/bne loop");
+    // Call/jump enders (JMP/JSR/BSR): the callee runs interpreted; final
+    // PC/SSP/pushed-return/cycles must match. Targets land on moveq
+    // markers so a wrong target changes D0 visibly.
+    diff_run((const uint16_t[]){0x4EFA, 0x000E, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7042}, 9, 1, 100,
+             "jmp (14,pc)");
+    diff_run((const uint16_t[]){0x4EF9, 0x0000, 0x2010, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7043}, 9, 1, 100,
+             "jmp (abs).l");
+    diff_run((const uint16_t[]){0x4EBA, 0x000E, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7044}, 9, 1, 100,
+             "jsr (14,pc)");
+    diff_run((const uint16_t[]){0x4EB9, 0x0000, 0x2010, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7045}, 9, 1, 100,
+             "jsr (abs).l");
+    diff_run((const uint16_t[]){0x610E, 0x4E71, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7046}, 9, 1, 100,
+             "bsr.b +14");
+    diff_run((const uint16_t[]){0x6100, 0x000E, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7047}, 9, 1, 100,
+             "bsr.w +14");
+    // Call after straight-line body (mid-block goff accounting) and a
+    // call+rts round trip (RTS interpreted; return lands after the call).
+    diff_run((const uint16_t[]){0x7005, 0x4EBA, 0x000A, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x7048}, 8, 2, 150,
+             "moveq; jsr (10,pc)");
+    diff_run((const uint16_t[]){0x4EBA, 0x0006, 0x7049, 0x4E71, 0x74AA,
+                                0x4E75}, 6, 1, 50,
+             "jsr (6,pc); rts round trip");
+    // LEA (xxx).l,An (no flags; raw 32-bit into An).
+    diff_run((const uint16_t[]){0x43F9, 0x0001, 0x4321}, 3, 1, 100,
+             "lea (abs).l,a1");
+    diff_run((const uint16_t[]){0x4DF9, 0x0000, 0x4400, 0x3C16}, 4, 2, 100,
+             "lea (abs).l,a6; move.w (a6),d6");
     debugf("%s emitter differential: %d sequences, %d fails\n",
            diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
 }

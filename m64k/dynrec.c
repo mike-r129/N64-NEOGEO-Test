@@ -28,8 +28,8 @@ static struct dyn_statics {
     uint32_t arena_used;
     int      npending;
     struct { uint32_t *slot; uint32_t target; } pending[512];
-    uint8_t  tried[1024];
-    uint8_t  pad[8192 - 8 - 512 * 8 - 1024];   // keep sizeof == 8KB forever
+    uint8_t  tried[2048];
+    uint8_t  pad[8192 - 8 - 512 * 8 - 2048];   // keep sizeof == 8KB forever
 } __attribute__((aligned(8192))) dyn_s;
 #define dyn_arena_used (dyn_s.arena_used)
 #define dyn_npending   (dyn_s.npending)
@@ -88,19 +88,6 @@ static uint32_t *dyn_lookup(uint32_t pc)
     return NULL;
 }
 
-void __m64k_dyn_service(m64k_t *m64k)
-{
-    uint32_t pc = __m64k_dyn_mailbox;
-    if (!pc || !__m64k_dyn_enable)
-        return;
-    __m64k_dyn_mailbox = 0;
-    uint32_t h = (pc >> 1) & 8191;
-    if (dyn_tried[h >> 3] & (1u << (h & 7)))
-        return;
-    dyn_tried[h >> 3] |= 1u << (h & 7);
-    m64k_dyn_translate(m64k, pc, 8, false);
-}
-
 // ---- MIPS encoders -------------------------------------------------------
 #define R_ZERO 0
 #define R_A0   4   // ctx
@@ -132,6 +119,8 @@ void __m64k_dyn_service(m64k_t *m64k)
 #define LBU(rt,base,off)  ITYPE(0x24,base,rt,off)
 #define LHU(rt,base,off)  ITYPE(0x25,base,rt,off)
 #define SW(rt,base,off)   ITYPE(0x2B,base,rt,off)
+#define SWL(rt,base,off)  ITYPE(0x2A,base,rt,off)
+#define SWR(rt,base,off)  ITYPE(0x2E,base,rt,off)
 #define SH(rt,base,off)   ITYPE(0x29,base,rt,off)
 #define SB(rt,base,off)   ITYPE(0x28,base,rt,off)
 #define LUI(rt,imm)       ITYPE(0x0F,0,rt,imm)
@@ -156,6 +145,13 @@ static inline uint16_t fetch16(uint32_t a)
 {
     return *(uint16_t *)(uintptr_t)(((a) & 0x00FFFFFF) + M64K_CONFIG_MEMORY_BASE);
 }
+
+// The interpreter's pc_diff cell (.sdata, m64k_asm.S): guest_pc = m_pc +
+// pc_diff. Delta exits preserve it; absolute-target enders (JMP/JSR
+// (xxx).l) must store the recomputed constant, so its address is baked.
+extern int32_t pc_diff;
+#define HI16(a)  ((uint16_t)((((uint32_t)(a)) + 0x8000) >> 16))
+#define LO16(a)  ((uint16_t)((uint32_t)(a) & 0xFFFF))
 
 // ---- Templates -----------------------------------------------------------
 // Emission context for one block. Address-error checks branch forward to a
@@ -527,6 +523,20 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
         *cmax += 4;
         return 2;
+    }
+
+    // LEA (xxx).l,An (W3 lea fast path: ea7_001's flat 12, OP(lea) itself
+    // charges nothing at accuracy 0; no flags; raw 32-bit stored). Sits at
+    // function preambles, so refusing it kept whole callees untranslated.
+    if ((op & 0xF1FF) == 0x41F9) {
+        int an = (op >> 9) & 7;
+        uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+        e->buf[e->len++] = LUI(R_T0, abs >> 16);
+        e->buf[e->len++] = ORI(R_T0, R_T0, abs & 0xFFFF);
+        e->buf[e->len++] = SW(R_T0, R_A0, M64K_OFF_AREGS + 4 * an);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+        *cmax += 12;
+        return 6;
     }
 
     // MOVE.b family: byte accesses cannot raise address errors (no bail);
@@ -985,7 +995,205 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         e->ended = 1;
         return glen;
     }
+
+    // JMP (d16,PC) / JMP (xxx).l block enders (jmp_exec path; TIMING_
+    // ACCURACY 0 charges: 2 + ea = 10 / 14). Static targets baked like
+    // BRA; the abs form leaves the delta window, so it materializes the
+    // mapped m_pc (lui sign-extends like map_m68k's or-with-mask) and
+    // stores the recomputed pc_diff constant. Both exits chainable.
+    if (op == 0x4EFA || op == 0x4EF9) {
+        int is_abs = (op == 0x4EF9);
+        uint32_t target; int glen, charge, tk_delta = 0;
+        if (is_abs) {
+            target = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            glen = 6; charge = 14;
+        } else {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            target = pc + 2 + d16;
+            tk_delta = e->goff + 2 + d16;
+            glen = 4; charge = 10;
+            if (target & 0xFF000000)    // 32-bit wrap: pc_diff changes
+                return 0;
+            if (tk_delta < -32000 || tk_delta > 32000)
+                return 0;
+        }
+        if (dyn_target_is_spin(target) || (target & 1))
+            return 0;
+        if (e->nchain > 3)
+            return 0;
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -charge);
+        if (is_abs) {
+            uint32_t host = target | 0xFF000000u;
+            uint32_t diff = target - host;      // 32-bit subu semantics
+            e->buf[e->len++] = LUI(R_T5, host >> 16);
+            e->buf[e->len++] = ORI(R_T5, R_T5, host & 0xFFFF);
+            e->buf[e->len++] = LUI(R_T1, diff >> 16);
+            e->buf[e->len++] = ORI(R_T1, R_T1, diff & 0xFFFF);
+            e->buf[e->len++] = LUI(R_T2, HI16(&pc_diff));
+            e->buf[e->len++] = SW(R_T1, R_T2, LO16(&pc_diff));
+        } else {
+            e->buf[e->len++] = ADDIU(R_T5, R_T5, tk_delta);
+        }
+        e->chain[e->nchain].at = e->len;
+        e->chain[e->nchain].target = target;
+        e->chain[e->nchain].taken = 1;
+        e->nchain++;
+        e->buf[e->len++] = JABS(main_loop);
+        e->buf[e->len++] = NOP;
+        *cmax += charge;
+        e->ended = 1;
+        return glen;
+    }
+
+    // JSR (d16,PC) / JSR (xxx).l / BSR.b/.w block enders (call edges).
+    // Body transcribed from the W3 jsr/bsr fast paths (m64k_asm.S): odd
+    // new-SP bails BEFORE any mutation (generic replay then decrements SP
+    // and raises write_address_error itself); charges land pre-push
+    // (16/20/16) + 2 (jmp_exec_cycles) before the target update, so an
+    // MMIO trap on the push observes the interpreter's exact mid-insn
+    // clock. Return address = next-insn guest pc, baked. The a1 slice-
+    // break check runs AFTER m_pc moves to the callee, so its stub is a
+    // plain J main_loop at the interpreter's own exit boundary.
+    if (op == 0x4EBA || op == 0x4EB9 || (op & 0xFF00) == 0x6100) {
+        uint32_t target; int glen, pre, is_abs = 0, tk_delta = 0;
+        if (op == 0x4EBA) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            target = pc + 2 + d16; glen = 4; pre = 16;
+            tk_delta = e->goff + 2 + d16;
+        } else if (op == 0x4EB9) {
+            target = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            glen = 6; pre = 20; is_abs = 1;
+        } else {                        // BSR
+            int8_t d8 = (int8_t)(op & 0xFF);
+            if (d8 == 0) {
+                int16_t d16 = (int16_t)fetch16(pc + 2);
+                target = pc + 2 + d16; glen = 4;
+                tk_delta = e->goff + 2 + d16;
+            } else {
+                target = pc + 2 + d8; glen = 2;
+                tk_delta = e->goff + 2 + d8;
+            }
+            pre = 16;
+        }
+        if (!is_abs) {
+            if (target & 0xFF000000)
+                return 0;
+            if (tk_delta < -32000 || tk_delta > 32000)
+                return 0;
+        }
+        if (dyn_target_is_spin(target) || (target & 1))
+            return 0;
+        if (e->nchain > 3)
+            return 0;
+        uint32_t ret = pc + glen;       // return address (guest space)
+        e->buf[e->len++] = LW(R_T1, R_A0, M64K_OFF_AREGS + 7 * 4);
+        e->buf[e->len++] = ADDIU(R_T2, R_T1, -4);
+        emit_bail_check(e, R_T2);
+        e->buf[e->len++] = LUI(R_T6, ret >> 16);
+        e->buf[e->len++] = ORI(R_T6, R_T6, ret & 0xFFFF);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -pre);
+        e->buf[e->len++] = SW(R_T2, R_A0, M64K_OFF_AREGS + 7 * 4);
+        e->buf[e->len++] = OR(R_T3, R_T2, R_A2);
+        e->buf[e->len++] = SWL(R_T6, R_T3, 0);  // sw_m68k result idiom
+        e->buf[e->len++] = SWR(R_T6, R_T3, 3);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -2);
+        if (is_abs) {
+            uint32_t host = target | 0xFF000000u;
+            uint32_t diff = target - host;
+            e->buf[e->len++] = LUI(R_T5, host >> 16);
+            e->buf[e->len++] = ORI(R_T5, R_T5, host & 0xFFFF);
+            e->buf[e->len++] = LUI(R_T1, diff >> 16);
+            e->buf[e->len++] = ORI(R_T1, R_T1, diff & 0xFFFF);
+            e->buf[e->len++] = LUI(R_T2, HI16(&pc_diff));
+            e->buf[e->len++] = SW(R_T1, R_T2, LO16(&pc_diff));
+        } else {
+            e->buf[e->len++] = ADDIU(R_T5, R_T5, tk_delta);
+        }
+        emit_break_check(e, 0);         // m_pc already at the callee
+        e->chain[e->nchain].at = e->len;
+        e->chain[e->nchain].target = target;
+        e->chain[e->nchain].taken = 1;
+        e->nchain++;
+        e->buf[e->len++] = JABS(main_loop);
+        e->buf[e->len++] = NOP;
+        *cmax += pre + 2;
+        e->ended = 1;
+        return glen;
+    }
     return 0;
+}
+
+// ---- Translation service (slice boundaries) ------------------------------
+// Tried-filter: one translation attempt ever per head (translation is
+// deterministic, so a refusal is permanent). Returns true if pc was
+// already tried; marks it tried otherwise. Hash-shadowing loses the
+// shadowed head — sized so that stays rare.
+static bool dyn_tried_test_set(uint32_t pc)
+{
+    uint32_t h = (pc >> 1) & (8 * sizeof(dyn_tried) - 1);
+    if (dyn_tried[h >> 3] & (1u << (h & 7)))
+        return true;
+    dyn_tried[h >> 3] |= 1u << (h & 7);
+    return false;
+}
+
+// Drop every pending chain link waiting on a target that can never get a
+// block (refused/shadowed): the slots stay J main_loop, which is correct.
+static void dyn_pending_drop(uint32_t target)
+{
+    for (int i = 0; i < dyn_npending; ) {
+        if (dyn_pending[i].target == target)
+            dyn_pending[i] = dyn_pending[--dyn_npending];
+        else
+            i++;
+    }
+}
+
+// Per-slice translation budget. The mailbox admits at most one head per
+// slice and hot already-tried heads win its last-writer lottery almost
+// every time — measured 2026-08-07 at 18 blocks per 480s, far too slow
+// for chain webs to form. Seeding closes the loop: the pending list IS
+// the frontier of the web (every unresolved exit of every block), so
+// translating pending targets directly grows a connected web around each
+// mailbox seed instead of waiting for each successor to win the lottery.
+#define DYN_SEEDS_PER_SLICE 4
+
+void __m64k_dyn_service(m64k_t *m64k)
+{
+    if (!__m64k_dyn_enable)
+        return;
+    int budget = DYN_SEEDS_PER_SLICE;
+    uint32_t pc = __m64k_dyn_mailbox;
+    if (pc) {
+        __m64k_dyn_mailbox = 0;
+        if (!dyn_tried_test_set(pc)) {
+            budget--;
+            m64k_dyn_translate(m64k, pc, 24, false);
+        }
+    }
+    // Chain-target seeding (deferred-work law holds: this is the same
+    // slice-boundary call site). A successful translate patches and
+    // removes every pending entry for that target (insert path), so the
+    // index only advances past entries this pass cannot retire.
+    for (int i = 0; i < dyn_npending && budget > 0; ) {
+        uint32_t t = dyn_pending[i].target;
+        uint32_t *host = dyn_lookup(t);
+        if (host) {                     // target got a block: patch now
+            *dyn_pending[i].slot = JABS(host);
+            data_cache_hit_writeback(dyn_pending[i].slot, 4);
+            inst_cache_hit_invalidate(dyn_pending[i].slot, 4);
+            __m64k_dyn_stat_chains++;
+            dyn_pending[i] = dyn_pending[--dyn_npending];
+            continue;
+        }
+        if (dyn_tried_test_set(t)) {    // refused before (or shadowed):
+            dyn_pending_drop(t);        // can never resolve — drop
+            continue;
+        }
+        budget--;
+        if (m64k_dyn_translate(m64k, t, 24, false) == 0)
+            dyn_pending_drop(t);
+    }
 }
 
 // ---- Translator ----------------------------------------------------------
@@ -1026,13 +1234,6 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         #endif
         return 0;
     }
-    // Minimum profitable length: entry overhead and, dominantly, the
-    // arena<->interpreter icache interleave (phase-3d verdict: short
-    // blocks at scale cost ~2x m68k time) exceed dispatch savings.
-    // Sweepable via -DM64K_DYN_MINLEN=n for the interleave-curve A/Bs.
-    #ifndef M64K_DYN_MINLEN
-    #define M64K_DYN_MINLEN 3
-    #endif
     // Ender-terminated blocks only (phase-3d lesson): a block that ends at
     // an unsupported form ("straight-line tail") on a hot loop head gets
     // re-entered through the probe EVERY iteration, paying entry+gate+tail
@@ -1043,15 +1244,13 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         __m64k_dyn_stat_refused++;
         return 0;
     }
-    if (!force && ninsns < M64K_DYN_MINLEN) {
-        __m64k_dyn_stat_refused++;
-        #ifdef M64K_DYNSTAT
-        debugf("[DYNREF] pc=%06lx op=%04x short n=%d stop=%04x\n",
-               (unsigned long)(pc & 0xFFFFFF), fetch16(pc), ninsns,
-               fetch16(pc + guest_len));
-        #endif
-        return 0;
-    }
+    // No min-length filter (was M64K_DYN_MINLEN=3): it guarded against
+    // straight-line tails re-entering the probe every loop iteration
+    // (the phase-3d collapse), but the ender-only policy above already
+    // refuses those, and an ENDER-terminated short block chains (incl.
+    // to itself) so its entry overhead is paid once, not per iteration.
+    // The hottest guest shapes are 2-insn poll loops (tst+bcc, e.g.
+    // 0x0318A6 at ~55 transfers/frame) that minlen=3 refused wholesale.
 
     // Block frame: [C_max gate] body tail [bail stubs].
     uint32_t block[EMIT_MAXWORDS + 8 + 3 * EMIT_MAXFIX];

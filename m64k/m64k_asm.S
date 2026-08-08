@@ -50,6 +50,9 @@
 # after ANY build used for fps numbers; steer with -DM64K_SDATA_PAD=<bytes>.
     .space M64K_SDATA_PAD
 #endif
+# .globl: dynrec.c bakes &pc_diff into absolute-target enders (JMP/JSR
+# (xxx).l recompute it; delta exits preserve it).
+    .globl pc_diff
 pc_diff:      .long 0
 #ifdef MVS64_PERFCOUNT
 # Per-frame diagnostic counters (read+reset by emu.c's [PERF] print):
