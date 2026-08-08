@@ -50,21 +50,24 @@ body. Fixed all six constants (guard, body fetch, three m_pc rollbacks).
 **Gate: TRCRC fused-vs-unfused IDENTICAL over 5576 frames** (bit- AND
 cycle-exact). Runtime twin gate added (`mvs64_blockop_enable` /
 -DMVS64_BLOCKOP_DISABLE, layout-identical binaries) plus `BLOCKOPS_OFF=1`.
-It now fires (38→142 per window, rising with game progress) while thousands
-of candidates still reject on the DESTINATION test. Final window of the
-480s run: `seen=40756 shape=35401 fire=142 rej_dst=5166 t3=-12 body=3898
-dstval=003080` — **body=3898 is exactly the target shape** `move.w
-(An)+,(Am)`, so the -6 fix demonstrably works and the only thing between
-that loop class and fusion is the hard-coded 0x3C0002 destination
-(observed destinations: 0x003080, 0x0061D0 — never the port).
-CAVEAT: that run never reached a real fight (zero PROFILE lines at
-PC:0031fe/003200), so the hot loop's OWN destination is still unsampled —
-do not conclude samsho2 avoids the port until an in-fight capture exists.
-NEXT: (1) in-fight dstval capture for 0x31FE (longer run or wsl-fight.sh
-input); (2) if it is work RAM, add a general (An)+→(Am) copy fusion beside
-the port one — the source span check already constrains to <0x110000, so a
-destination work-RAM range check is the direct analogue. No fps claim is
-made for the fix as it stands.
+**MEASURED POSITIVE (layout-identical twins, mvs64_blockop_enable flip,
+420s each, both reaching gameplay with ~9.6k in-fight samples):
+median fps 41.0 -> 42.4 (+1.4), late-run 39.0 -> 40.4 (+1.4), and the
+in-fight m68k share 59.9% -> 54.6% (-5.3 points).** The m68k-share drop is
+the decisive number: it only moves that far if the 239-iteration/frame
+copy loop is actually being fused, which also settles the destination
+question — A4 IS the 0x3C0002 VRAM data port, exactly as the disassembly
+predicts (0x31EA writes the modulo at A4+2, 0x31F4 the VRAM address at
+A4-2, 0x31FE streams to A4).
+CAVEAT: not bucket-matched — analyze-buckets.py needs [PERF2], which only
+PERFCOUNT builds emit, and the DYNSTAT/BOSTAT rigs run ~3x slower so the
+autoinput harness never reaches a fight in them (that is why the direct
+in-fight [BOSTAT] fire count is still uncaptured; the fps/m68k twins
+answer the same question better). Redo as PERFCOUNT twins for a
+bucket-matched number before treating +1.4 as final.
+SECOND LEVER FOUND: 0x0031B8 `move.l (A0)+,(A1)+ / dbra` is a genuine long
+memcpy that NO blockop shape covers (0x20D8 vs the fill's 0x20C0) — adding
+an (An)+->(Am)+ copy fusion is the obvious follow-up.
 
 ## 📊 DYNAREC RESIDENCY ESCALATION SESSION 2026-08-07 night (aa54fe1) — VERDICT: FLAT
 

@@ -679,7 +679,13 @@ int main(int argc, char *argv[]) {
 				__m64k_dyn_stat_exec = 0;
 			}
 			#endif
-			#ifdef M64K_BLOCKOPS
+		}
+		#endif
+		#if defined(M64K_BLOCKOPS) && (defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT))
+		// Own window: the DYNSTAT rig costs a jal per control transfer and
+		// runs ~3x slower, which stops the autoinput harness reaching a
+		// fight at all — so blockop accounting must be usable without it.
+		if (g_frame && (g_frame % 600) == 0) {
 			{
 				// Why the fused VRAM-port copy declines: a rejected
 				// blockop is silent everywhere else (the loop just runs
@@ -688,8 +694,9 @@ int main(int argc, char *argv[]) {
 				extern uint32_t blockop_rej_bud, blockop_rej_span;
 				extern uint32_t blockop_rej_dstval, blockop_rej_shape;
 				extern uint32_t blockop_seen, blockop_t3val, blockop_t9val;
+				extern uint32_t blockop_rej_pc;
 				framef("[BOSTAT] seen=%lu shape=%lu fire=%lu rej_dst=%lu rej_bud=%lu"
-				       " rej_span=%lu t3=%ld body=%04lx dstval=%06lx\n",
+				       " rej_span=%lu t3=%ld body=%04lx dstval=%06lx rejpc=%06lx\n",
 					(unsigned long)blockop_seen,
 					(unsigned long)blockop_rej_shape,
 					(unsigned long)blockop_fire,
@@ -698,12 +705,12 @@ int main(int argc, char *argv[]) {
 					(unsigned long)blockop_rej_span,
 					(long)(int32_t)blockop_t3val,
 					(unsigned long)blockop_t9val,
-					(unsigned long)blockop_rej_dstval);
+					(unsigned long)blockop_rej_dstval,
+					(unsigned long)(blockop_rej_pc & 0xFFFFFF));
 				blockop_fire = blockop_rej_dst = 0;
 				blockop_rej_bud = blockop_rej_span = 0;
 				blockop_seen = blockop_rej_shape = 0;
 			}
-			#endif
 		}
 		#endif
 		#ifdef M64K_TRACECRC

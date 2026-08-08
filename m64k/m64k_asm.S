@@ -82,7 +82,7 @@ mvs64_blockop_enable: .long 0
 mvs64_blockop_enable: .long 1
 #endif
 #endif
-#if defined(M64K_BLOCKOPS) && defined(M64K_DYNSTAT)
+#if defined(M64K_BLOCKOPS) && (defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT))
 # Fused-blockop accounting ([BOSTAT]); diagnostic builds only.
     .globl blockop_fire
 blockop_fire:     .long 0
@@ -102,6 +102,8 @@ blockop_seen:     .long 0
 blockop_t3val:    .long 0
     .globl blockop_t9val
 blockop_t9val:    .long 0
+    .globl blockop_rej_pc
+blockop_rej_pc:   .long 0
 #endif
 #ifdef MVS64_IDLEPROBE
 # Idle-spin probe: detects a branch/jump target hit many times CONSECUTIVELY
@@ -4017,7 +4019,7 @@ dbcc_dec:
 # VRAM-port copy has three guards, and a silent rejection is invisible in
 # every other metric — the loop just runs interpreted. Route each guard to
 # its own counting stub so [BOSTAT] says WHICH one declines.
-#ifdef M64K_DYNSTAT
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
 #define BO_REJ_DST   bo_rej_dst
 #define BO_REJ_BUD   bo_rej_bud
 #define BO_REJ_SPAN  bo_rej_span
@@ -4050,8 +4052,13 @@ dbcc_dec:
     # the normal interpreter, so flags, PC and register state at every
     # observable boundary are bit-exact. Restricted to DBF (cc can never
     # become true mid-loop; other DBcc react to flags the body changes).
-#ifdef M64K_DYNSTAT
-    lw t8, blockop_seen                # every taken, non-expiring DBF
+#if defined(M64K_DYNSTAT) && defined(M64K_BOSTAT_SEEN)
+    # COSTS REAL TIME: this fires on EVERY taken non-expiring DBF (8.8M per
+    # 600-frame window through the BIOS RAM test). It slowed the build
+    # enough that the autoinput harness never reached a fight — content is
+    # wall-speed-sensitive here. Opt-in only; the rejection counters below
+    # are on the rare paths and are always safe to leave enabled.
+    lw t8, blockop_seen
     addiu t8, 1
     sw t8, blockop_seen
     sw t3, blockop_t3val               # loop-shape delta actually seen
@@ -4072,12 +4079,16 @@ dbcc_dec:
     beq t1, 0x3098, blockop_movew_port # move.w (As)+,(Ad)
     beq t1, 0x30C0, blockop_fill_w     # move.w Dn,(Ad)+
     beq t1, 0x20C0, blockop_fill_l     # move.l Dn,(Ad)+
-#ifdef M64K_DYNSTAT
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
 bo_rej_dst:
     lw t8, blockop_rej_dst
     addiu t8, 1
     sw t8, blockop_rej_dst
     sw t1, blockop_rej_dstval          # the destination that did not match
+    lw t7, pc_diff                     # ...and WHICH loop it came from:
+    addu t7, m_pc                      # guest pc of the body = m_pc+diff-6
+    addiu t7, -6
+    sw t7, blockop_rej_pc
     j dbcc_no_blockop
 bo_rej_bud:
     lw t8, blockop_rej_bud
@@ -4090,9 +4101,11 @@ bo_rej_span:
     sw t8, blockop_rej_span
     j dbcc_no_blockop
 bo_rej_shape:
-    lw t8, blockop_rej_shape
+#ifdef M64K_BOSTAT_SEEN
+    lw t8, blockop_rej_shape           # hot: same cost caveat as blockop_seen
     addiu t8, 1
     sw t8, blockop_rej_shape
+#endif
     j dbcc_no_blockop
 #endif
 dbcc_no_blockop:
@@ -4134,7 +4147,7 @@ blockop_movew_port:
     li eaptr32, 0x00110000
     bgt result, eaptr32, BO_REJ_SPAN
     # ---- commit ----
-#ifdef M64K_DYNSTAT
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
     lw t8, blockop_fire
     addiu t8, 1
     sw t8, blockop_fire
