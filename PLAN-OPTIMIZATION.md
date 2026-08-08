@@ -1,5 +1,51 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🎯 DIVERGENCE SITE FOUND + RUNG-2 FPS VERDICT (2026-08-08 早)
+
+### THE WALL→GUEST CHANNEL: plat_audio_pump's lead-driven fill loop
+The wall-profile-sensitive channel behind the 377/3153 attractor forks (and
+July's "run-content divergence" note) is in `platform_n64.c`:
+- The fill loop stops on `lead = aring_wr - aring_rd` vs TARGET_LEAD, but
+  **aring_rd advances in the AI interrupt at real VR4300 rate**. How many
+  `sound_gen_samples()` passes run per guest frame therefore depends on
+  wall-clock load (logging overhead, dynarec speed, ares scheduling).
+- Each pass steps the Z80/YM2610; the 68k **observes** Z80 phase through
+  its 0x320000 sound-reply polls → a marginal handshake read lands on a
+  different reply → guest content forks. Frames 377/3153 are moments where
+  the handshake is content-marginal.
+- Second wall coupling at the same site: the underrun governor
+  (`sound_silent` from aring_pad / underrun_streak).
+CONFIRMATION KNOB: `-DMVS64_DET_AUDIO` — fixed guest-frame sample quantum
+(`audio_get_frequency()/60` with carry accumulator), pass budget effectively
+unbounded, `sound_silent`/`underrun_streak` pinned, aring_push overflow
+guards at both push sites (host-side drop only — guest state untouched).
+Causal test = remove-the-channel: previously-forking profile deltas
+(IOLOG-vs-not; dynarec-vs-interpreter) must match past their attractors
+under DET. **VERDICT: CONFIRMED.** detA(IOLOG)-vs-detB: TRCRC IDENTICAL
+over 4981 frames (past 3153). detC(dynarec)-vs-detB: TRCRC IDENTICAL over
+the full 6270-frame overlap (past 377 AND 3153) — a *cross-profile*
+interpreter-vs-dynarec pair matching perfectly once the audio channel is
+pinned. Every attractor-frame "divergence" chased this campaign is
+explained; cross-profile TRCRC gating is now VALID when both builds carry
+-DMVS64_DET_AUDIO. (The fallthrough-chaining quarantine retest, task #2,
+should use DET builds.)
+NOTE: DET_AUDIO is a **gate instrument**, not a shipping mode — real
+hardware wants the lead-driven loop for latency; determinism only matters
+for cross-profile TRCRC comparison.
+
+### RUNG-2 FPS VERDICT: FLAT (bucket-matched, solo twins r2ON/r2OFF)
+36.1→36.1 / 37.2→38.0 / 35.6→36.0 / 30.0→30.1 / 29.0→29.5 across spr
+buckets; m68k share −2..−3 pts. Consistent with rung-1: **~10-13%
+residency is real but too small to move fps** — the residency-share law
+holds (need several ×10% more, i.e. register caching + chain webs, for
+the projected +6-10). Rung-2 stays merged but dynarec remains DEFAULT-OFF.
+
+### BLOCKOP FIX CONFIRMED (bucket-matched PERFCOUNT twins pcbON/pcbOFF)
++0.9 fps dominant bucket (2000-3000 spr), **+3.2** in 1000-2000, +1.4-1.8
+in heavy buckets (3000-6500); m68k share −4..−7 pts. The fused-DBF class
+is validated as a real lever → next cheap fusion: (An)+→(Am)+ long memcpy
+(`0x20D8` at 0x31B8).
+
 ## ⚖️ TRCRC MATCHED-PAIR LAW + RUNG-2 GATED (2026-08-07 late night, 6a4e2be)
 
 **The frame-377/3153 'divergences' were largely a broken gate, not broken
