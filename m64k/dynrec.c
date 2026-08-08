@@ -29,9 +29,10 @@ static struct dyn_statics {
     int      npending;
     int      rc_enable;    // register-cache rung 1 (set once at init; lives
                            // here so the knob shifts no .bss — layout law)
+    int      cov_enable;   // coverage-rung templates (fps twin knob)
     struct { uint32_t *slot; uint32_t target; } pending[512];
     uint8_t  tried[2048];
-    uint8_t  pad[8192 - 12 - 512 * 8 - 2048];  // keep sizeof == 8KB forever
+    uint8_t  pad[8192 - 16 - 512 * 8 - 2048];  // keep sizeof == 8KB forever
 } __attribute__((aligned(8192))) dyn_s;
 #define dyn_arena_used (dyn_s.arena_used)
 #define dyn_npending   (dyn_s.npending)
@@ -96,6 +97,11 @@ void __m64k_dynrec_init(void)
 #else
     dyn_s.rc_enable = 1;
 #endif
+#ifdef M64K_DYN_COV_DISABLE
+    dyn_s.cov_enable = 0;
+#else
+    dyn_s.cov_enable = 1;
+#endif
 }
 
 static uint32_t *dyn_lookup(uint32_t pc)
@@ -158,6 +164,7 @@ static uint32_t *dyn_lookup(uint32_t pc)
 #define DMOVE(rd,rs)      RTYPE(rs,R_ZERO,rd,0,0x25)  // or: 64-bit move (flag values!)
 #define SLLI(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x00)
 #define DSLL(rd,rt,sa)    RTYPE(0,rt,rd,sa,0x38)
+#define DSLL32(rd,rt,sa)  RTYPE(0,rt,rd,sa,0x3C)  // shift (sa+32)
 #define DSRL32(rd,rt,sa)  RTYPE(0,rt,rd,sa,0x3E)  // shift (sa+32)
 #define DADDU(rd,rs,rt)   RTYPE(rs,rt,rd,0,0x2D)
 #define DSUBU(rd,rs,rt)   RTYPE(rs,rt,rd,0,0x2F)
@@ -686,6 +693,57 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         *cmax += 8;
         return 4;
     }
+    // SUBI.w #imm,Dn [8 cycles, 2 words]: ADDI's mirror — full SUB flags
+    // including the borrow X (op_sub_rmwimpl idiom). Rig-gated like ADDI.
+    if ((op & 0xFFF8) == 0x0440) {
+#if defined(M64K_DYN_NO_COV) || defined(M64K_DYN_NO_SUBI)
+        return 0;                   // TRCRC bisect knob (coverage rung)
+#endif
+        if (!dyn_s.cov_enable)
+            return 0;               // runtime fps-twin knob (layout-identical)
+        int reg = op & 7;
+        uint16_t imm = fetch16(pc + 2);
+        e->buf[e->len++] = MOVE(R_S2, R_A0);
+        e->buf[e->len++] = ORI(R_T0, R_ZERO, imm);
+        e->buf[e->len++] = LHU(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = DSUBU(R_T6, R_T1, R_T0);
+        emit_sub_flags(e, 16, 1);
+        e->buf[e->len++] = SH(R_T6, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+        *cmax += 8;
+        return 4;
+    }
+
+    // LSR.w #imm,Dn [shift-imm group: 8+2c cycles at accuracy 0 —
+    // rig-measured; the use_cycles_opmask -2 arm applies to LONG, not
+    // word]. lsr_rmwimpl flag idiom: C = last
+    // bit shifted out (bit32 of flag_zc), Z = 16-bit result, N = result
+    // bit15 via sll 16 (V clear), X = C (imm count is always >= 1). dptr =
+    // &DREGS[n] (rmw_eadst parity). Terminates the BIOS raster-poll loops
+    // (c1e2bc/c0996e — DYNTERM #3).
+    if ((op & 0xF1F8) == 0xE048) {
+#if defined(M64K_DYN_NO_COV) || defined(M64K_DYN_NO_LSR)
+        return 0;                   // TRCRC bisect knob (coverage rung)
+#endif
+        if (!dyn_s.cov_enable)
+            return 0;               // runtime fps-twin knob (layout-identical)
+        int reg = op & 7;
+        int c = (((op >> 9) - 1) & 7) + 1;
+        e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_DREGS + 4 * reg);
+        e->buf[e->len++] = LHU(R_T1, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = SRLI(R_T6, R_T1, c);          // 16-bit result
+        e->buf[e->len++] = SRLI(R_T0, R_T1, c - 1);
+        e->buf[e->len++] = ANDI(R_T0, R_T0, 1);          // carry = last bit out
+        e->buf[e->len++] = DMOVE(R_S8, R_T0);            // X = carry
+        e->buf[e->len++] = DSLL32(R_T0, R_T0, 0);
+        e->buf[e->len++] = OR(R_S7, R_T0, R_T6);         // zc = carry<<32 | res
+        e->buf[e->len++] = SLLI(R_S6, R_T6, 16);         // N = bit15, V clear
+        e->buf[e->len++] = SH(R_T6, R_A0, M64K_OFF_DREGS + 4 * reg + 2);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -(8 + 2 * c));
+        *cmax += 8 + 2 * c;
+        return 2;
+    }
+
     // NOP (op_nop: charge 4).
     if (op == 0x4E71) {
         e->buf[e->len++] = ADDIU(R_A1, R_A1, -4);
@@ -880,6 +938,54 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         int opmode = (op >> 6) & 7;
         static const int shtab[3] = { 24, 16, 0 };
 
+        // ADD.b (An)+,Dn [4 + ea_011 byte 4 = 8 cycles; A7 byte quirk stays
+        // generic]: the c11c4e BIOS checksum loop body (DYNTERM top heat).
+        // Post-inc commits BEFORE the read (ea_011 order); byte access
+        // cannot ADDRERR; break check after the (possibly MMIO) read.
+        if (top == 0xD && smode == 3 && opmode == 0 && sreg != 7) {
+#if defined(M64K_DYN_NO_COV) || defined(M64K_DYN_NO_ADDB)
+        return 0;                   // TRCRC bisect knob (coverage rung)
+#endif
+            if (!dyn_s.cov_enable)
+                return 0;           // runtime fps-twin knob (layout-identical)
+            int h = rc_an(e, sreg, R_T4);
+            e->buf[e->len++] = OR(R_T3, h, R_A2);
+            rc_an_commit(e, sreg, h, 1, R_T2);
+            e->buf[e->len++] = ADDIU(R_S2, R_A0, M64K_OFF_DREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -8);
+            e->buf[e->len++] = LBU(R_T0, R_T3, 0);
+            e->buf[e->len++] = LBU(R_T1, R_A0, M64K_OFF_DREGS + 4 * dreg + 3);
+            e->buf[e->len++] = DADDU(R_T6, R_T0, R_T1);
+            emit_store_dn(e, R_T6, dreg, 0);
+            emit_add_flags(e, 24);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 8;
+            return 2;
+        }
+        // CMP.w (d16,An),Dn [4 + ea d16 8 = 12 cycles, 2 words; no store,
+        // no X]: the 0038ba in-game linked-list search loop (DYNTERM #2,
+        // and its A4 traffic is regcache-hot).
+        if (top == 0xB && opmode == 1 && smode == 5) {
+#if defined(M64K_DYN_NO_COV) || defined(M64K_DYN_NO_CMPW)
+        return 0;                   // TRCRC bisect knob (coverage rung)
+#endif
+            if (!dyn_s.cov_enable)
+                return 0;           // runtime fps-twin knob (layout-identical)
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            int h = rc_an(e, sreg, R_T4);
+            e->buf[e->len++] = ADDIU(R_T4, h, d16);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = MOVE(R_S2, R_A0);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = LHU(R_T0, R_T3, 0);
+            e->buf[e->len++] = LHU(R_T1, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
+            e->buf[e->len++] = DSUBU(R_T6, R_T1, R_T0);
+            emit_sub_flags(e, 16, 0);
+            emit_break_check(e, e->goff + 4);
+            *cmax += 12;
+            return 4;
+        }
         // ADD/SUB Dn,Dm (opmode 0-2, src Dn).
         if ((top == 0xD || top == 0x9) && smode == 0 && opmode <= 2) {
             int size = opmode, sh = shtab[size];
@@ -1548,6 +1654,15 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
     // are 3+ insns). Blocks must earn their entry with an emitted ender.
     if (!force && !e.ended) {
         __m64k_dyn_stat_refused++;
+        #ifdef M64K_DYNSTAT
+        // Coverage work list: the form that terminated decoding before an
+        // ender (the whole block is refused, so this opcode is exactly what
+        // keeps this head untranslated). Correlate head= with [DYNH] heat.
+        debugf("[DYNTERM] head=%06lx stop=%06lx op=%04x n=%d\n",
+               (unsigned long)(pc & 0xFFFFFF),
+               (unsigned long)((pc + guest_len) & 0xFFFFFF),
+               fetch16(pc + guest_len), ninsns);
+        #endif
         return 0;
     }
     // No min-length filter (was M64K_DYN_MINLEN=3): it guarded against

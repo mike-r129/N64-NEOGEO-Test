@@ -495,6 +495,39 @@ static void run_emitter_differential(void)
              "move.l a6,(8,a5); movea.l (8,a5),a5");
     diff_run((const uint16_t[]){0x2B43, 0x0004, 0x222D, 0x0004}, 4, 2, 150,
              "move.l d3,(4,a5); (4,a5),d1 (Z)");
+    // Coverage-rung forms (DYNTERM-driven 2026-08-08): ADD.b (An)+,Dn /
+    // CMP.w (d16,An),Dn / LSR.w #imm,Dn / SUBI.w #imm,Dn — each with
+    // C/X/Z/N/V edges; memory effects proven by store-then-read shapes.
+    diff_run((const uint16_t[]){0x1081, 0xD018}, 2, 2, 100,
+             "move.b d1,(a0); add.b (a0)+,d0");
+    diff_run((const uint16_t[]){0x1084, 0xD818}, 2, 2, 100,
+             "move.b d4,(a0); add.b (a0)+,d4 (C/X wrap)");
+    diff_run((const uint16_t[]){0x1083, 0xD618}, 2, 2, 100,
+             "move.b d3,(a0); add.b (a0)+,d3 (Z)");
+    diff_run((const uint16_t[]){0x3942, 0x0004, 0xB06C, 0x0004}, 4, 2, 100,
+             "move.w d2,(4,a4); cmp.w (4,a4),d0");
+    diff_run((const uint16_t[]){0x3940, 0x0004, 0xB06C, 0x0004}, 4, 2, 100,
+             "move.w d0,(4,a4); cmp.w (4,a4),d0 (Z)");
+    diff_run((const uint16_t[]){0x3941, 0x0004, 0xB86C, 0x0004}, 4, 2, 100,
+             "move.w d1,(4,a4); cmp.w (4,a4),d4");
+    diff_run((const uint16_t[]){0xEE49}, 1, 1, 100, "lsr.w #7,d1");
+    diff_run((const uint16_t[]){0xE24C}, 1, 1, 100, "lsr.w #1,d4 (C/X)");
+    diff_run((const uint16_t[]){0xE04B}, 1, 1, 100, "lsr.w #8,d3 (Z)");
+    // Canary-sensitive carry edges: 0x9111 has bit(c-1) != bit(c) at c=1
+    // (b0=1,b1=0) and c=4 (b3=0,b4=1) — an off-by-one carry bit FAILS here
+    // (the first canary round passed because every value above had equal
+    // adjacent bits at the tested positions).
+    diff_run((const uint16_t[]){0xE249}, 1, 1, 100, "lsr.w #1,d1 (C=b0=1,b1=0)");
+    diff_run((const uint16_t[]){0xE849}, 1, 1, 100, "lsr.w #4,d1 (C=b3=0,b4=1)");
+    diff_run((const uint16_t[]){0x0444, 0xFFFF}, 2, 1, 100,
+             "subi.w #0xFFFF,d4 (Z)");
+    diff_run((const uint16_t[]){0x0443, 0x0001}, 2, 1, 100,
+             "subi.w #1,d3 (borrow C/X/N)");
+    diff_run((const uint16_t[]){0x0441, 0x7FFF}, 2, 1, 100,
+             "subi.w #0x7FFF,d1 (V)");
+    // The BIOS raster-poll shape end-to-end (lsr feeds subi feeds bne).
+    diff_run((const uint16_t[]){0xEE49, 0x0441, 0x0122, 0x6602, 0x7001, 0x4E71},
+             6, 3, 150, "lsr/subi/bne (raster-poll shape)");
     // Register-cache (rung 1) shapes: cached post-inc bump visibility via
     // store-store-readback (a stale slot would land both stores at the same
     // address and the negative-d16 readbacks see it), in-slot ADDA, and

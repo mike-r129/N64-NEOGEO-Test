@@ -726,6 +726,16 @@ int main(int argc, char *argv[]) {
 				(unsigned long)__m64k_tracecrc_slices);
 			__m64k_tracecrc = 2166136261u;
 			__m64k_tracecrc_slices = 0;
+			#ifdef M64K_TRCRC_SPLIT
+			{
+				// Content-only hash (regs/SR, no pc/cycles): separates
+				// timing displacement from real state divergence.
+				extern uint32_t __m64k_tracecrc_content;
+				framef("[TRCCON] f=%d crc=%08lx\n", g_frame,
+					(unsigned long)__m64k_tracecrc_content);
+				__m64k_tracecrc_content = 2166136261u;
+			}
+			#endif
 		}
 		#endif
 		#ifdef MVS64_PERFCOUNT
