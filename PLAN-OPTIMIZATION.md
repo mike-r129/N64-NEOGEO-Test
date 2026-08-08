@@ -1,5 +1,62 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🔬 RUNG-2 SESSION 2026-08-07 night — two findings, one shipped-blocked
+
+### 1. THE GATE WAS LYING: rig builds ≠ game builds (m64k/Makefile)
+The emitter-differential rig — the standing gate for every template without
+a TomHarte suite — compiles the testsuite with **-DM64K_W3_FULL**, which the
+GAME build does NOT define (game = M64K_FASTPATHS only). So the rig has been
+comparing emitted blocks against a *different interpreter* than samsho2 runs:
+any template whose charge or order is fast-path-config-dependent can be
+rig-green and still diverge in-game. Knob added: `make ... W3_OFF=1` builds
+the testsuite with the game's fast-path set. **Run the rig BOTH ways before
+trusting any new template.** This is the prime suspect for the frame-377
+divergences (both this session's and the historical fallthrough one — same
+frame, same bug class: a template that only becomes reachable when coverage
+widens).
+
+### 2. RUNG 2 (RTS ender + hot templates): DOES NOT SHIP — TRCRC diverges
+Built: RTS ender (tail-jumps jmp_exec, so returns chain dynamically through
+the existing probe and keep the idle-skip; IR=0x4E75 stored so
+addrerr_fixup_rts is reached), MOVE.w (An)+,(Am) mem-to-mem, MOVE.w
+Dn,(xxx).l, MOVE.l (An)/(d16,An) src + (d16,An) dst, service max_insns 8→24,
+plus an emitted **residency counter** (`[DYNSTAT2] exec/execpf`) — the metric
+that was missing all along: translated-block counts say nothing, only
+executed-in-block insns/frame vs the ~8-11k dispatched do.
+- Residency: ~0 → **901-1303 insns/frame in-fight (~10-13%)**. Seeding +
+  enders + templates genuinely work.
+- Gates: rig 96/96 (W3_FULL build), testsuite 125/126, all six control-flow
+  btests green through the ender templates.
+- **TRCRC DIVERGES at frame 377** → withheld. Dynarec stays DEFAULT-OFF so
+  the deliverable is unaffected. Bisect knobs added: `M64K_DYN_NO_RTS`,
+  `M64K_DYN_MAXINSN`. Start the bisect by re-running the rig with W3_OFF=1.
+DATA-DRIVEN TEMPLATE METHOD (keep this): cross-reference `[DYNREF]` refused
+heads against the `[DYNH]` hot-head histogram — it ranks refusals by actual
+execution frequency instead of by count, and is what surfaced 0x0031FE.
+
+### 3. BLOCKOPS HAS NEVER FIRED — shape guard off by two (FIXED, bit-exact)
+Chasing the #1 refused-and-hot head (0x0031FE, `move.w (a0)+,(a4)` / `dbra`,
+**13.7% of all control transfers**, 239 iterations/frame) led into the fused
+DBF copy path, which the dynarec deliberately refuses ("BLOCKOPS handles
+it"). New `[BOSTAT]` instrumentation: **fire=0** over 293k taken DBFs per
+window, 94% rejected at the shape guard. Cause: the guard tests `t3 == -4`,
+but dispatch_body's `addi m_pc,2` plus OP(dbcc)'s own put m_pc at body+6, so
+a 1-word-body loop yields **-6**; -4 can only match a DBF branching to its
+own opcode (a zero-body `dbra dn,*`), which is why the "body opcode" fetch
+read back 0x51C8 (the DBF itself). The per-iteration charges are the
+independent proof: 22 = move.w mem-to-mem (12) + taken dbra (10), and 18 =
+move.w Dn,(An)+ (8) + 10 — those only balance for a REAL one-instruction
+body. Fixed all six constants (guard, body fetch, three m_pc rollbacks).
+**Gate: TRCRC fused-vs-unfused IDENTICAL over 5576 frames** (bit- AND
+cycle-exact). Runtime twin gate added (`mvs64_blockop_enable` /
+-DMVS64_BLOCKOP_DISABLE, layout-identical binaries) plus `BLOCKOPS_OFF=1`.
+It now fires — but only tens of times per window so far, with thousands
+still rejected on the destination test (`dstval` shows ordinary RAM
+addresses like 0x61D0, not the 0x3C0002 VRAM port), so the remaining
+question is whether samsho2's hot loop targets the port at all. If it does
+not, the follow-up is a general (An)+→(Am) work-RAM copy fusion alongside
+the port one.
+
 ## 📊 DYNAREC RESIDENCY ESCALATION SESSION 2026-08-07 night (aa54fe1) — VERDICT: FLAT
 
 Option-A escalation step 1 landed and measured. The wall was POPULATION,

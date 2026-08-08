@@ -472,6 +472,35 @@ static void run_emitter_differential(void)
              "lea (abs).l,a1");
     diff_run((const uint16_t[]){0x4DF9, 0x0000, 0x4400, 0x3C16}, 4, 2, 100,
              "lea (abs).l,a6; move.w (a6),d6");
+    // RTS ender: push a return address with jsr, then rts back. The whole
+    // round trip is one block, so both call and return enders execute.
+    diff_run((const uint16_t[]){0x4E75}, 1, 1, 100, "rts (bare, from seed sp)");
+    diff_run((const uint16_t[]){0x4EBA, 0x0004, 0x7051, 0x4E71, 0x4E75},
+             5, 1, 200, "jsr (4,pc) -> rts");
+    // Hot in-game refusals now templated (see DYNSTAT cross-reference):
+    // mem-to-mem move.w (the 0x0031FE copy loop), abs.l word store, and
+    // the MOVE.l memory forms. Store-then-read-back proves the memory
+    // effect and the post-increment.
+    diff_run((const uint16_t[]){0x3898, 0x3814}, 2, 1, 100,
+             "move.w (a0)+,(a4); (a4),d4");
+    diff_run((const uint16_t[]){0x3899, 0x3814}, 2, 1, 100,
+             "move.w (a1)+,(a4); (a4),d4");
+    diff_run((const uint16_t[]){0x33C0, 0x0000, 0x4406, 0x3239, 0x0000, 0x4406},
+             6, 1, 150, "move.w d0,(abs).l; readback");
+    diff_run((const uint16_t[]){0x33C3, 0x0000, 0x4406}, 3, 1, 150,
+             "move.w d3,(abs).l (Z)");
+    diff_run((const uint16_t[]){0x2210}, 1, 1, 100, "move.l (a0),d1");
+    diff_run((const uint16_t[]){0x2250}, 1, 1, 100, "movea.l (a0),a1");
+    diff_run((const uint16_t[]){0x2B4E, 0x0008, 0x2A6D, 0x0008}, 4, 2, 150,
+             "move.l a6,(8,a5); movea.l (8,a5),a5");
+    diff_run((const uint16_t[]){0x2B43, 0x0004, 0x222D, 0x0004}, 4, 2, 150,
+             "move.l d3,(4,a5); (4,a5),d1 (Z)");
+    // Odd-address bails through the new memory templates (a5 = 0x4501).
+    diff_run((const uint16_t[]){0x2A15}, 1, 1, 200, "move.l (a5),d5 ADDRERR");
+    diff_run((const uint16_t[]){0x2B46, 0x0000}, 2, 1, 200,
+             "move.l d6,(0,a5) ADDRERR");
+    diff_run((const uint16_t[]){0x3A9C}, 1, 1, 200,
+             "move.w (a4)+,(a5) ADDRERR dst");
     debugf("%s emitter differential: %d sequences, %d fails\n",
            diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
 }

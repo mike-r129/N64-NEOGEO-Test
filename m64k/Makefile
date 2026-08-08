@@ -23,7 +23,16 @@ M64K_CONFIG += -DM64K_FASTPATHS
 # icache regression outweighed the saved instructions — see
 # PLAN-OPTIMIZATION.md 2026-08-06). Kept testsuite-covered as the seed
 # handler corpus for the predecode project.
+#
+# GATE HAZARD (2026-08-07): the GAME build does NOT define this — only
+# M64K_FASTPATHS. So with W3_FULL on, the emitter-differential rig compares
+# emitted blocks against a DIFFERENT interpreter than samsho2 runs, and any
+# template whose charge/behaviour is config-dependent can be rig-green and
+# still diverge in-game (suspected cause of the frame-377 TRCRC failures).
+# Build with W3_OFF=1 to reproduce the game's fast-path set.
+ifndef W3_OFF
 M64K_CONFIG += -DM64K_W3_FULL
+endif
 # M64K_PREDECODE (killed 2026-08-07, kept opt-in): the phase-1a record
 # dispatch was testsuite-green (125/126) but regressed -5.5..-5.9 fps in
 # every bucket — the per-PC record stream adds ~20+ cyc/insn of dcache

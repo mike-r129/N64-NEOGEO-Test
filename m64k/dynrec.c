@@ -47,6 +47,10 @@ int __m64k_dyn_enable = 1;
 #endif
 
 extern char main_loop[];
+// jmp_exec (m64k_asm.S): maps a 32-bit guest target into m_pc, updates
+// pc_diff, raises the PC address error, runs the idle-skip compares and
+// the dynarec probe. The RTS ender tail-jumps here with eaptr32 set.
+extern char jmp_exec[];
 
 // Publish primitive: emitted code must be written back from dcache and the
 // stale icache lines invalidated BEFORE the table tag makes it reachable.
@@ -70,6 +74,11 @@ uint32_t __m64k_dyn_mailbox;
 // (2026-08-07: zero chains resolved in 240s attract — density-limited).
 uint32_t __m64k_dyn_stat_blocks, __m64k_dyn_stat_insns;
 uint32_t __m64k_dyn_stat_chains, __m64k_dyn_stat_refused;
+// EXECUTED guest insns inside blocks (emitted bump at every block entry,
+// DYNSTAT builds only). Translated-block counts say nothing about
+// residency; this over frames-in-window vs the ~8-11k insns/frame the
+// interpreter dispatches is the only number that predicts an fps win.
+uint32_t __m64k_dyn_stat_exec;
 
 void __m64k_dynrec_init(void)
 {
@@ -121,6 +130,8 @@ static uint32_t *dyn_lookup(uint32_t pc)
 #define SW(rt,base,off)   ITYPE(0x2B,base,rt,off)
 #define SWL(rt,base,off)  ITYPE(0x2A,base,rt,off)
 #define SWR(rt,base,off)  ITYPE(0x2E,base,rt,off)
+#define LWL(rt,base,off)  ITYPE(0x22,base,rt,off)
+#define LWR(rt,base,off)  ITYPE(0x26,base,rt,off)
 #define SH(rt,base,off)   ITYPE(0x29,base,rt,off)
 #define SB(rt,base,off)   ITYPE(0x28,base,rt,off)
 #define LUI(rt,imm)       ITYPE(0x0F,0,rt,imm)
@@ -160,8 +171,14 @@ extern int32_t pc_diff;
 // m_pc to the *current* insn and jumps to main_loop so the generic path
 // replays it from scratch and raises ADDRERR bit-exactly (check_addr_bail
 // semantics; dispatch stores IR itself on the replay).
-#define EMIT_MAXWORDS 160
-#define EMIT_MAXFIX   20
+// Sized for max_insns=24 blocks: the widest template emits ~16 words and
+// up to 3 fixups (two ADDRERR bails + one slice-break check). The decode
+// loop's headroom guards below MUST stay >= those per-insn worsts —
+// emit_bail_check drops the fix entry when the table is full but still
+// emits its BNE, so an under-sized guard leaves a branch patched to
+// offset 0, i.e. a jump into the middle of the block.
+#define EMIT_MAXWORDS 384
+#define EMIT_MAXFIX   40
 
 typedef struct {
     uint32_t buf[EMIT_MAXWORDS];
@@ -448,6 +465,49 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             e->buf[e->len++] = LHU(R_T0, R_T3, 0);
             e->buf[e->len++] = SH(R_T0, R_A0, M64K_OFF_DREGS + 4 * dreg + 2);
             emit_movew_flags(e, R_T0);
+            emit_break_check(e, e->goff + 6);
+            *cmax += 16;
+            return 6;
+        }
+        // move.w (An)+,(Am) [generic movew body, 4+4+4 = 12 cycles]: the
+        // single hottest refused head in samsho2 (0x0031FE, ~143k probe
+        // transfers per DYNSTAT window — the per-frame copy loop). Generic
+        // order: src EA (post-inc commits) -> src odd check -> read ->
+        // flags -> dst EA -> dst odd check -> store. Both odd checks are
+        // hoisted ahead of every mutation so a bail replays cleanly (the
+        // predicates are unchanged: ea_011 leaves eaptr32 = the ORIGINAL
+        // An). sreg == dreg is refused: the generic reads the dst register
+        // AFTER the source post-inc commits, so it would see the bumped
+        // value. A7 refused (word-align quirk stays generic).
+        if (smode == 3 && dmode == 2 && sreg != 7 && sreg != dreg) {
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = LW(R_T2, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            emit_bail_check(e, R_T2);
+            e->buf[e->len++] = ADDIU(R_T1, R_T4, 2);
+            e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -12);
+            e->buf[e->len++] = LHU(R_T0, R_T3, 0);
+            e->buf[e->len++] = MOVE(R_T6, R_T0);
+            emit_movew_flags(e, R_T0);
+            e->buf[e->len++] = OR(R_T3, R_T2, R_A2);
+            e->buf[e->len++] = SH(R_T6, R_T3, 0);
+            emit_break_check(e, e->goff + 2);
+            *cmax += 12;
+            return 2;
+        }
+        // move.w Dn,(xxx).l [4 + ea7_001 12 = 16 cycles, 3 words]: 2nd
+        // hottest refused head (0xC1DF8A, ~91k/window, BIOS region).
+        if (smode == 0 && dmode == 7 && dreg == 1) {
+            uint32_t abs = ((uint32_t)fetch16(pc + 2) << 16) | fetch16(pc + 4);
+            if (abs & 1)
+                return 0;
+            e->buf[e->len++] = LHU(R_T6, R_A0, M64K_OFF_DREGS + 4 * sreg + 2);
+            emit_abs_host(e, R_T3, abs);
+            emit_movew_flags(e, R_T6);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+            e->buf[e->len++] = SH(R_T6, R_T3, 0);
             emit_break_check(e, e->goff + 6);
             *cmax += 16;
             return 6;
@@ -795,6 +855,67 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             *cmax += 4;
             return 2;
         }
+        // MOVE.l memory forms (generic base 12 + EA: (An) 4, (d16,An) 8).
+        // Flags = tst_long idiom on the 32-bit value; MOVEA sets none.
+        // move.l (An),Dn / movea.l (An),Am [16 cycles] — 0x031802, 37k/win.
+        if (top == 0x2 && (opmode == 0 || opmode == 1) && smode == 2) {
+            int to_an = (opmode == 1);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+            e->buf[e->len++] = LWL(R_T0, R_T3, 0);   // lw_m68k pair
+            e->buf[e->len++] = LWR(R_T0, R_T3, 3);
+            e->buf[e->len++] = SW(R_T0, R_A0, (to_an ? M64K_OFF_AREGS
+                                                     : M64K_OFF_DREGS) + 4 * dreg);
+            if (!to_an) {
+                e->buf[e->len++] = MOVE(R_S6, R_T0);
+                e->buf[e->len++] = AND(R_S7, R_T0, R_V1);
+            }
+            emit_break_check(e, e->goff + 2);
+            *cmax += 16;
+            return 2;
+        }
+        // move(a).l (d16,An),Dm/Am [movel_fsrc_d16, 20 cycles, 2 words].
+        if (top == 0x2 && (opmode == 0 || opmode == 1) && smode == 5) {
+            int to_an = (opmode == 1);
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * sreg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -20);
+            e->buf[e->len++] = LWL(R_T0, R_T3, 0);
+            e->buf[e->len++] = LWR(R_T0, R_T3, 3);
+            e->buf[e->len++] = SW(R_T0, R_A0, (to_an ? M64K_OFF_AREGS
+                                                     : M64K_OFF_DREGS) + 4 * dreg);
+            if (!to_an) {
+                e->buf[e->len++] = MOVE(R_S6, R_T0);
+                e->buf[e->len++] = AND(R_S7, R_T0, R_V1);
+            }
+            emit_break_check(e, e->goff + 4);
+            *cmax += 20;
+            return 4;
+        }
+        // move.l Dn/An,(d16,Am) [movel_f_dst_d16, 20 cycles, 2 words] —
+        // 0x001598, 17k/win.
+        if (top == 0x2 && opmode == 5 && smode <= 1) {
+            int16_t d16 = (int16_t)fetch16(pc + 2);
+            int off = (smode ? M64K_OFF_AREGS : M64K_OFF_DREGS) + 4 * sreg;
+            e->buf[e->len++] = LW(R_T6, R_A0, off);
+            e->buf[e->len++] = LW(R_T4, R_A0, M64K_OFF_AREGS + 4 * dreg);
+            e->buf[e->len++] = ADDIU(R_T4, R_T4, d16);
+            emit_bail_check(e, R_T4);
+            e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
+            e->buf[e->len++] = MOVE(R_S6, R_T6);
+            e->buf[e->len++] = AND(R_S7, R_T6, R_V1);
+            e->buf[e->len++] = ADDIU(R_A1, R_A1, -20);
+            e->buf[e->len++] = SWL(R_T6, R_T3, 0);   // sw_m68k pair
+            e->buf[e->len++] = SWR(R_T6, R_T3, 3);
+            emit_break_check(e, e->goff + 4);
+            *cmax += 20;
+            return 4;
+        }
         // MOVE.l Dn,Dm (charge 12 - rig-measured flat .l rate; flags =
         // tst_long idiom).
         if (top == 0x2 && opmode == 0 && smode == 0) {
@@ -996,6 +1117,38 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         return glen;
     }
 
+    // RTS block ender (generic OP(rts): use_cycles 16, pop32, j jmp_exec).
+    // The return target is dynamic, so there is no static chain slot —
+    // instead the ender jumps to jmp_exec itself, which does map_m68k +
+    // pc_diff + the PC address-error raise + the idle-skip compares + the
+    // dynarec probe. That probe is what chains the return dynamically.
+    // IR is stored explicitly (0x4E75): dispatch normally maintains it and
+    // address_error's fixup dispatches on it (addrerr_fixup_rts) — emitted
+    // blocks never touch IR, so without this an odd return address would
+    // take the wrong fixup. Odd SP bails before any mutation (rts_fast's
+    // contract: the generic replay raises read_address_error itself).
+    if (op == 0x4E75) {
+#ifdef M64K_DYN_NO_RTS
+        return 0;                       // TRCRC bisect knob
+#endif
+        e->buf[e->len++] = LW(R_T2, R_A0, M64K_OFF_AREGS + 7 * 4);
+        emit_bail_check(e, R_T2);       // clobbers t1 only
+        e->buf[e->len++] = ORI(R_T1, R_ZERO, 0x4E75);
+        e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_IR);
+        e->buf[e->len++] = ADDIU(R_A1, R_A1, -16);
+        e->buf[e->len++] = ADDIU(R_T1, R_T2, 4);
+        e->buf[e->len++] = OR(R_T3, R_T2, R_A2);   // map_m68k of the OLD sp
+        e->buf[e->len++] = SW(R_T1, R_A0, M64K_OFF_AREGS + 7 * 4);
+        e->buf[e->len++] = LWL(R_T0, R_T3, 0);     // lw_m68k: loads->t0 law
+        e->buf[e->len++] = LWR(R_T0, R_T3, 3);
+        e->buf[e->len++] = MOVE(R_T4, R_T0);       // eaptr32 = target
+        e->buf[e->len++] = JABS(jmp_exec);
+        e->buf[e->len++] = NOP;
+        *cmax += 16;
+        e->ended = 1;
+        return 2;
+    }
+
     // JMP (d16,PC) / JMP (xxx).l block enders (jmp_exec path; TIMING_
     // ACCURACY 0 charges: 2 + ea = 10 / 14). Static targets baked like
     // BRA; the abs form leaves the delta window, so it materializes the
@@ -1158,6 +1311,12 @@ static void dyn_pending_drop(uint32_t target)
 // mailbox seed instead of waiting for each successor to win the lottery.
 #define DYN_SEEDS_PER_SLICE 4
 
+// Block length cap (TRCRC bisect knob: rung-2 raised it 8 -> 24, which
+// widens which templates actually run as blocks).
+#ifndef M64K_DYN_MAXINSN
+#define M64K_DYN_MAXINSN 24
+#endif
+
 void __m64k_dyn_service(m64k_t *m64k)
 {
     if (!__m64k_dyn_enable)
@@ -1168,7 +1327,7 @@ void __m64k_dyn_service(m64k_t *m64k)
         __m64k_dyn_mailbox = 0;
         if (!dyn_tried_test_set(pc)) {
             budget--;
-            m64k_dyn_translate(m64k, pc, 24, false);
+            m64k_dyn_translate(m64k, pc, M64K_DYN_MAXINSN, false);
         }
     }
     // Chain-target seeding (deferred-work law holds: this is the same
@@ -1191,7 +1350,7 @@ void __m64k_dyn_service(m64k_t *m64k)
             continue;
         }
         budget--;
-        if (m64k_dyn_translate(m64k, t, 24, false) == 0)
+        if (m64k_dyn_translate(m64k, t, M64K_DYN_MAXINSN, false) == 0)
             dyn_pending_drop(t);
     }
 }
@@ -1212,7 +1371,7 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
 
     emit_t e = { .len = 0, .goff = 0, .nfix = 0 };
     int ninsns = 0, cmax = 0, guest_len = 0;
-    while (ninsns < max_insns && e.len < EMIT_MAXWORDS - 20 && e.nfix < EMIT_MAXFIX - 2) {
+    while (ninsns < max_insns && e.len < EMIT_MAXWORDS - 24 && e.nfix < EMIT_MAXFIX - 4) {
         int save = e.len, savefix = e.nfix;
         e.goff = guest_len;
         int gl = emit_insn(fetch16(pc + guest_len), pc + guest_len, &e, &cmax);
@@ -1262,6 +1421,16 @@ int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force)
         block[n++] = JABS(main_loop);           // bail: interpreter runs it
         block[n++] = NOP;
     }
+    #ifdef M64K_DYNSTAT
+    // Residency counter, past the gate so only real entries count (t0/t1
+    // are dead here: the gate owns t0, chained entries land on the gate).
+    if (!force) {
+        block[n++] = LUI(R_T0, HI16(&__m64k_dyn_stat_exec));
+        block[n++] = LW(R_T1, R_T0, LO16(&__m64k_dyn_stat_exec));
+        block[n++] = ADDIU(R_T1, R_T1, ninsns);
+        block[n++] = SW(R_T1, R_T0, LO16(&__m64k_dyn_stat_exec));
+    }
+    #endif
     int body_at = n;
     memcpy(block + n, e.buf, e.len * 4);
     n += e.len;
