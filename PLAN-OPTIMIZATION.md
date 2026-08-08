@@ -1,5 +1,41 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## REGISTER-CACHE RUNG 1 LANDED — CORRECT, GATED, fps-FLAT (2026-08-08, 537a98c)
+
+Write-through An caching in t7/t8/t9 across emitted blocks (dynrec.c).
+Design: t7/t8/t9 are per-insn interpreter scratch AND explicitly
+saved/restored by the hw_n64.S TLB/MMIO trap path, so cached values
+survive trapping accesses; write-through means ctx is architecturally
+current at every exit, so bail stubs/break checks/chain exits need ZERO
+flush code — the whole dirty-state correctness surface of classic
+dynarec regcaches doesn't exist here. Fills are body insns: every
+(re-)entry refills, no state crosses block entries. Knob M64K_DYN_RC_DISABLE
+(initializer flip inside the 8KB dyn_s block — layout law); [DYNRC]
+fire evidence under DYNSTAT.
+
+Gates: rig 101/0 (5 new RC sequences + canary: dropping the write-through
+store fails exactly the 6 post-inc sequences); vectors 126 PASS (CHK
+pre-existing); clean matched pair TRCRC IDENTICAL 9438f, non-vacuous
+(11 blocks with hits, 32 An-loads eliminated at translate time).
+
+**fps: FLAT bucket-matched** (45.8→45.6 / 48.0→48.0 / 36.1→35.8 / 34.9→34.5;
+m68k share unchanged). WHY, quantitatively: blocks average ~2.6 guest
+insns (278 insns/109 blocks in the 240s DYNSTAT window) and only 32
+static An-loads were eliminated — there is nothing for a per-block cache
+to pay on until blocks get LONGER. This is the residency-share law from
+a second angle: rung 1 is INFRASTRUCTURE; the payer is template coverage
+(longer blocks → more intra-block reuse → the same cache starts paying
+without further work). Default ON (free, correct, gated).
+
+NEXT RUNGS (the register-caching ladder, in order):
+1. **Template coverage** — the top refused heads ([DYNREF]/DYNSTAT) are
+   the direct lever: every newly-templated form both raises residency
+   AND lengthens blocks (compounding with the cache already landed).
+2. **Dn caching** — worth it only once blocks are long enough that the
+   slice-canonicalization cost amortizes; re-evaluate after coverage.
+3. **Cross-block persistence** (chain-web calling convention) — the big
+   structural step; only worth designing at majority residency.
+
 ## 🔥 THE ATTRACTOR SAGA, ACTUALLY RESOLVED (2026-08-08, copy_l session)
 
 Chasing the (An)+→(Am)+ memcpy fusion's gate exposed the REAL causes of
