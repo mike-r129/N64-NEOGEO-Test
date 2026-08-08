@@ -119,7 +119,9 @@ static void vblank_handler(void) {
     N64_FRAME++;
 }
 
+static int det_fps = 60;   // guest fps for MVS64_DET_AUDIO's fixed quantum
 void plat_init(int audiofreq, int fps) {
+    det_fps = fps > 0 ? fps : 60;
 #ifdef __LIBDRAGON_DEBUG_H
 #ifndef MVS64_NOISVIEWER
     // Diagnostic gate (-DMVS64_NOISVIEWER skips this): some emulators
@@ -247,7 +249,14 @@ static void wp_publish(void) {
     t0 = TICKS_READ();
     YM2610_wp_finish();        // usually instant: the RSP had the whole window
     profile_snd += TICKS_DISTANCE(t0, TICKS_READ());
+#ifdef MVS64_DET_AUDIO
+    // det-quantum generation can outrun the wall-rate reader: drop instead
+    // of overwriting unread frames (host-side loss only; see pump comment).
+    if (aring_wr - aring_rd + (uint32_t)wp_pending_n <= ARING_FRAMES)
+        aring_push(stage, wp_pending_n);
+#else
     aring_push(stage, wp_pending_n);
+#endif
     wp_pending_n = 0;
 #ifdef MVS64_PERFCOUNT
     perf_snd_pub += TICKS_DISTANCE(t0, TICKS_READ());
@@ -324,6 +333,25 @@ void plat_audio_pump(void) {
     } else {
         underrun_streak = 0;
     }
+#ifdef MVS64_DET_AUDIO
+    // GATE-BUILD DETERMINISM: the stock fill loop below tops the ring up
+    // toward TARGET_LEAD, but aring_rd advances in the AI interrupt at
+    // REAL VR4300 rate — so the NUMBER of sound_gen_samples() passes per
+    // guest frame depends on wall speed, and the Z80/YM phase the 68k
+    // observes through its 0x320000 reply polls forks at marginal
+    // handshake moments (the frame-377/3153 cross-profile TRCRC
+    // attractors; also July's "run-content divergence" note). Under this
+    // knob: generate EXACTLY one guest-frame's worth of samples per pump
+    // (accumulator carries the remainder), ignore the ring level and the
+    // wall-driven governor, and pin sound_silent. The ring may over/
+    // underrun — host-side only; gate builds are not for listening.
+    sound_silent = 0;
+    underrun_streak = 0;
+    static uint32_t det_carry;
+    uint32_t det_want = det_carry + (uint32_t)audio_get_frequency();
+    int det_samples = (int)(det_want / (uint32_t)det_fps);
+    det_carry = det_want % (uint32_t)det_fps;
+#endif
 
     // Overload governor: in sustained starvation, generation is slower than
     // real time and the output is zeros anyway (sound_silent), so grinding
@@ -336,6 +364,9 @@ void plat_audio_pump(void) {
     int pass_budget = (underrun_streak >= 1) ? 1 : AI_NUM_BUFFERS;
 
     int filled = 0, discarded = 0;
+#ifdef MVS64_DET_AUDIO
+    pass_budget = 1000000;              // the det quantum is the only limit
+#endif
 
     // Top the ring up toward TARGET_LEAD. The ISR consumes exactly n frames
     // per callback, so lead is always a multiple of n.
@@ -345,7 +376,12 @@ void plat_audio_pump(void) {
 #ifdef MVS64_RSPWP
         lead += (uint32_t)wp_pending_n;   // deferred buffer counts as staged
 #endif
+#ifdef MVS64_DET_AUDIO
+        if (filled * n >= det_samples) break;   // fixed guest quantum
+        (void)lead;
+#else
         if (lead + (uint32_t)n > TARGET_LEAD) break;   // topped up
+#endif
 #ifdef MVS64_RSPWP
         wp_publish();          // free the staging buffer before reusing it
 #endif
@@ -355,7 +391,12 @@ void plat_audio_pump(void) {
 #ifdef MVS64_RSPWP
         wp_pending_n = n;      // defer the publish to the next pump entry
 #else
+#ifdef MVS64_DET_AUDIO
+        if (aring_wr - aring_rd + (uint32_t)n <= ARING_FRAMES)
+            aring_push(stage, n);       // else drop: host-side loss only
+#else
         aring_push(stage, n);
+#endif
 #endif
         filled++;
     }
