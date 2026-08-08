@@ -25,9 +25,14 @@ CFLAGS += -DUSE_M64K
 # DBF block-op fast path (fused copy/fill loops; VRAM-port helper lives in
 # hw_n64.S, so only game builds enable it — the standalone testsuite link
 # has no hw_n64.S and must not reference its symbols).
+# Disable with make ... BLOCKOPS_OFF=1: the fused path must be bit- and
+# cycle-exact against the unfused interpreter, so ON-vs-OFF is its gate
+# (identical [TRCRC] streams).
+ifndef BLOCKOPS_OFF
 CFLAGS += -DM64K_BLOCKOPS
 ASFLAGS += -DM64K_BLOCKOPS
 N64_ASFLAGS += -DM64K_BLOCKOPS
+endif
 # m64k inline fast paths for the profile-dominant opcode forms (Bcc condition
 # dispatch, hot MOVE.b/.w forms, TST.b/.w (d16,An)) — testsuite-covered (the
 # standalone m64k testsuite build enables the same define). Disable with

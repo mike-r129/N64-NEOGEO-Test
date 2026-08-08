@@ -71,6 +71,38 @@ perf_idle_skips: .long 0
     .globl m64k_ophist_ptr
 m64k_ophist_ptr: .long m64k_ophist_tab
 #endif
+#ifdef M64K_BLOCKOPS
+# Runtime gate for the fused copy/fill path. Twin builds differ ONLY by this
+# initializer, so ON-vs-OFF is a layout-identical A/B (the ±10-15fps
+# cache-set lottery makes any other cross-binary fps comparison worthless).
+    .globl mvs64_blockop_enable
+#ifdef MVS64_BLOCKOP_DISABLE
+mvs64_blockop_enable: .long 0
+#else
+mvs64_blockop_enable: .long 1
+#endif
+#endif
+#if defined(M64K_BLOCKOPS) && defined(M64K_DYNSTAT)
+# Fused-blockop accounting ([BOSTAT]); diagnostic builds only.
+    .globl blockop_fire
+blockop_fire:     .long 0
+    .globl blockop_rej_dst
+blockop_rej_dst:  .long 0
+    .globl blockop_rej_bud
+blockop_rej_bud:  .long 0
+    .globl blockop_rej_span
+blockop_rej_span: .long 0
+    .globl blockop_rej_dstval
+blockop_rej_dstval: .long 0
+    .globl blockop_rej_shape
+blockop_rej_shape: .long 0
+    .globl blockop_seen
+blockop_seen:     .long 0
+    .globl blockop_t3val
+blockop_t3val:    .long 0
+    .globl blockop_t9val
+blockop_t9val:    .long 0
+#endif
 #ifdef MVS64_IDLEPROBE
 # Idle-spin probe: detects a branch/jump target hit many times CONSECUTIVELY
 # (a true wait-for-IRQ spin) vs a bounded backward loop (memcpy/DBRA). The PC
@@ -3599,6 +3631,7 @@ jmp_exec_cycles:
     use_cycles_opmask 0b111111, 0b111001, -2
     jal cyc_leapea_penalty
     #endif
+    .globl jmp_exec
 jmp_exec:
     map_m68k m_pc, eaptr32             # map 32-bit target to host pointer
     subu t0, eaptr32, m_pc             # save new pc_diff
@@ -3980,7 +4013,35 @@ dbcc_dec:
     lh t3, -2(m_pc)
     addiu t3, -2
 #ifdef M64K_BLOCKOPS
+# Blockop rejection accounting (DYNSTAT diagnostic builds only): the fused
+# VRAM-port copy has three guards, and a silent rejection is invisible in
+# every other metric — the loop just runs interpreted. Route each guard to
+# its own counting stub so [BOSTAT] says WHICH one declines.
+#ifdef M64K_DYNSTAT
+#define BO_REJ_DST   bo_rej_dst
+#define BO_REJ_BUD   bo_rej_bud
+#define BO_REJ_SPAN  bo_rej_span
+#define BO_REJ_SHAPE bo_rej_shape
+#else
+#define BO_REJ_DST   dbcc_no_blockop
+#define BO_REJ_BUD   dbcc_no_blockop
+#define BO_REJ_SPAN  dbcc_no_blockop
+#define BO_REJ_SHAPE dbcc_no_blockop
+#endif
     # Fused block-op fast path for single-instruction DBF copy/fill loops.
+    #
+    # LOOP-SHAPE LAW (fixed 2026-08-07; the guard was -4 and this path had
+    # therefore NEVER fired — [BOSTAT] fire=0 over 293k taken DBFs/window,
+    # 94% rejected right here). For the shape these charges are written
+    # for (1-word body + 2-word DBF), with dispatch_body's "addi m_pc,2"
+    # plus OP(dbcc)'s own, m_pc sits at body+6 when t3 is formed, so the
+    # self-loop delta is -6 and the body opcode is at -6(m_pc). -4 instead
+    # selects a DBF branching to its own opcode (a zero-body "dbra dn,*"
+    # delay loop) whose body fetch reads back the DBF word 0x51C8 — which
+    # is exactly what the diagnostic saw. The per-iteration charges below
+    # (22 = move.w mem-to-mem 12 + taken dbra 10; 18 = move.w Dn,(An)+ 8
+    # + 10) only balance for a REAL one-instruction body, so they are the
+    # independent confirmation that -6 is the intended constant.
     # samsho2 spends several % of every frame in "move.w (As)+,(Ad)" uploads
     # to the LSPC VRAM data port (one TLB exception per word on N64) and in
     # "move.w/l Dn,(Ad)+" RAM fills, all shaped as 2-word DBRA self-loops.
@@ -3989,16 +4050,51 @@ dbcc_dec:
     # the normal interpreter, so flags, PC and register state at every
     # observable boundary are bit-exact. Restricted to DBF (cc can never
     # become true mid-loop; other DBcc react to flags the body changes).
-    bne t3, -4, dbcc_no_blockop        # only a 2-word self-loop qualifies
+#ifdef M64K_DYNSTAT
+    lw t8, blockop_seen                # every taken, non-expiring DBF
+    addiu t8, 1
+    sw t8, blockop_seen
+    sw t3, blockop_t3val               # loop-shape delta actually seen
+#endif
+    bne t3, -6, BO_REJ_SHAPE           # 1-word body + 2-word DBF only
     andi t2, opcode, 0x0F00
     bne t2, 0x0100, dbcc_no_blockop    # DBF only
+    lw t8, mvs64_blockop_enable        # runtime A/B gate
+    beqz t8, dbcc_no_blockop
+#ifdef M64K_DYNSTAT
+    lhu t8, -6(m_pc)
+    sw t8, blockop_t9val               # what the "body opcode" fetch sees
+#endif
     addi t2, t0, -1                    # fast-loopable iterations (keep last)
     blez t2, dbcc_no_blockop
-    lhu t9, -4(m_pc)                   # body opcode
+    lhu t9, -6(m_pc)                   # body opcode
     andi t1, t9, 0xF1F8
     beq t1, 0x3098, blockop_movew_port # move.w (As)+,(Ad)
     beq t1, 0x30C0, blockop_fill_w     # move.w Dn,(Ad)+
     beq t1, 0x20C0, blockop_fill_l     # move.l Dn,(Ad)+
+#ifdef M64K_DYNSTAT
+bo_rej_dst:
+    lw t8, blockop_rej_dst
+    addiu t8, 1
+    sw t8, blockop_rej_dst
+    sw t1, blockop_rej_dstval          # the destination that did not match
+    j dbcc_no_blockop
+bo_rej_bud:
+    lw t8, blockop_rej_bud
+    addiu t8, 1
+    sw t8, blockop_rej_bud
+    j dbcc_no_blockop
+bo_rej_span:
+    lw t8, blockop_rej_span
+    addiu t8, 1
+    sw t8, blockop_rej_span
+    j dbcc_no_blockop
+bo_rej_shape:
+    lw t8, blockop_rej_shape
+    addiu t8, 1
+    sw t8, blockop_rej_shape
+    j dbcc_no_blockop
+#endif
 dbcc_no_blockop:
 #endif
     j branch_exec
@@ -4013,16 +4109,16 @@ blockop_movew_port:
     sll t1, 8
     srl t1, 8                          # 24-bit address
     li result, 0x003C0002
-    bne t1, result, dbcc_no_blockop
+    bne t1, result, BO_REJ_DST
     # Budget: K = min(count-1, (m_cycles-11)/22); keeps m_cycles > 0 so the
     # interpreter always resumes at the loop body. 22 = move.w (An)+,(An)
     # [12] + taken dbra [10], matching the interpreter's own charges.
     addi result, m_cycles, -11
-    blez result, dbcc_no_blockop
+    blez result, BO_REJ_BUD
     li t8, 22
     divu zero, result, t8
     mflo result
-    beqz result, dbcc_no_blockop
+    beqz result, BO_REJ_BUD
     ble t2, result, 1f
     move t2, result
 1:  # Source (As)+ span must stay inside the always-mapped P-ROM + work-RAM
@@ -4036,8 +4132,14 @@ blockop_movew_port:
     sll result, t2, 1                  # 2K bytes
     addu result, t1
     li eaptr32, 0x00110000
-    bgt result, eaptr32, dbcc_no_blockop
+    bgt result, eaptr32, BO_REJ_SPAN
     # ---- commit ----
+#ifdef M64K_DYNSTAT
+    lw t8, blockop_fire
+    addiu t8, 1
+    sw t8, blockop_fire
+    li t8, 22                          # (restore t8: the commit reuses it)
+#endif
     sll result, t2, 1                  # As += 2K
     addu t8, result
     sw t8, 0(t9)
@@ -4049,7 +4151,7 @@ blockop_movew_port:
     mflo t8
     sub m_cycles, t8
     addi m_cycles, -10
-    addi m_pc, -4                      # resume at the loop body
+    addi m_pc, -6                      # resume at the loop body
     map_m68k t1                        # t1 = mapped src, t2 = count
     jal mvs64_blockop_vram_copy_w
     j main_loop
@@ -4094,7 +4196,7 @@ blockop_fill_w:
     mflo t7
     sub m_cycles, t7
     addi m_cycles, -10
-    addi m_pc, -4                      # resume at the loop body
+    addi m_pc, -6                      # resume at the loop body
     map_m68k t1                        # native fill (work RAM: mapped RW)
 1:  sh result, 0(t1)
     addiu t1, 2
@@ -4142,7 +4244,7 @@ blockop_fill_l:
     mflo t7
     sub m_cycles, t7
     addi m_cycles, -10
-    addi m_pc, -4                      # resume at the loop body
+    addi m_pc, -6                      # resume at the loop body
     map_m68k t1
     srl t3, result, 16                 # high word first (68k byte order;
 1:  sh t3, 0(t1)                       #  2-byte stores keep any even address

@@ -664,11 +664,44 @@ int main(int argc, char *argv[]) {
 				// coverage levers phase-3 escalations are gated on.
 				extern uint32_t __m64k_dyn_stat_blocks, __m64k_dyn_stat_insns;
 				extern uint32_t __m64k_dyn_stat_chains, __m64k_dyn_stat_refused;
-				framef("[DYNSTAT2] blocks=%lu insns=%lu chains=%lu refused=%lu\n",
+				// exec = guest insns EXECUTED inside blocks this window
+				// (emitted counter). exec/DYNSTAT_WINDOW vs the ~8-11k
+				// insns/frame the interpreter dispatches is the residency
+				// fraction — the only coverage number that predicts fps.
+				extern uint32_t __m64k_dyn_stat_exec;
+				framef("[DYNSTAT2] blocks=%lu insns=%lu chains=%lu refused=%lu exec=%lu execpf=%lu\n",
 					(unsigned long)__m64k_dyn_stat_blocks,
 					(unsigned long)__m64k_dyn_stat_insns,
 					(unsigned long)__m64k_dyn_stat_chains,
-					(unsigned long)__m64k_dyn_stat_refused);
+					(unsigned long)__m64k_dyn_stat_refused,
+					(unsigned long)__m64k_dyn_stat_exec,
+					(unsigned long)(__m64k_dyn_stat_exec / DYNSTAT_WINDOW));
+				__m64k_dyn_stat_exec = 0;
+			}
+			#endif
+			#ifdef M64K_BLOCKOPS
+			{
+				// Why the fused VRAM-port copy declines: a rejected
+				// blockop is silent everywhere else (the loop just runs
+				// interpreted, one TLB exception per word).
+				extern uint32_t blockop_fire, blockop_rej_dst;
+				extern uint32_t blockop_rej_bud, blockop_rej_span;
+				extern uint32_t blockop_rej_dstval, blockop_rej_shape;
+				extern uint32_t blockop_seen, blockop_t3val, blockop_t9val;
+				framef("[BOSTAT] seen=%lu shape=%lu fire=%lu rej_dst=%lu rej_bud=%lu"
+				       " rej_span=%lu t3=%ld body=%04lx dstval=%06lx\n",
+					(unsigned long)blockop_seen,
+					(unsigned long)blockop_rej_shape,
+					(unsigned long)blockop_fire,
+					(unsigned long)blockop_rej_dst,
+					(unsigned long)blockop_rej_bud,
+					(unsigned long)blockop_rej_span,
+					(long)(int32_t)blockop_t3val,
+					(unsigned long)blockop_t9val,
+					(unsigned long)blockop_rej_dstval);
+				blockop_fire = blockop_rej_dst = 0;
+				blockop_rej_bud = blockop_rej_span = 0;
+				blockop_seen = blockop_rej_shape = 0;
 			}
 			#endif
 		}
