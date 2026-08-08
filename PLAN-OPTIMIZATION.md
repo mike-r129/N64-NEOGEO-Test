@@ -1,5 +1,40 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## ⚖️ TRCRC MATCHED-PAIR LAW + RUNG-2 GATED (2026-08-07 late night, 6a4e2be)
+
+**The frame-377/3153 'divergences' were largely a broken gate, not broken
+code.** Nine recordings: three same-tree builds fork from the stored trcref
+at EXACTLY f=3153 — one of them a PURE INTERPRETER build — while three
+others match it through 5576-7066; two IOLOG builds fork together and match
+each other; the subtractive bisect halves forked at 377/3153 non-
+monotonically. Conclusion: some wall-profile-sensitive channel (not yet
+identified: frameskip is compiled out, RTC/watchdog are guest-clocked, perf
+TICKS are diagnostic-only) flips a marginal guest decision at content-
+sensitive frames; 377 and 3153 are attractors. LAWS:
+- **TRCRC gate v2: matched pairs ONLY** — same tree, back-to-back solo
+  runs, one knob flipped. Never a stored reference from another tree/day/
+  load profile. (The historical DYN_CHAIN_FALLTHROUGH quarantine — also
+  f=377 — is now suspect as this artifact: re-test with a matched pair.)
+- **Subtractive template bisects are population-poisoned**: disabling any
+  template reshapes the seeding cascade + tried-filter shadowing, moving
+  divergence frames arbitrarily. Use the [IO] stream differ instead
+  (MVS64_IOLOG_N64=<frame>: guest-frame-gated (addr,value) log of 0x3C/
+  0x32 reads; iodiff.sh compares value sequences).
+- **Mid-insn charge placement is architectural** (root cause #1, fixed):
+  the mem-to-mem MOVE.w template lumped -12 before the read where the
+  interpreter splits 8/4; lspc_mode_r derives the raster from the mid-
+  slice clock (trap reads saved a1), so a 4-late MMIO read flips near
+  line boundaries. Invisible to the rig under BOTH configs (RAM never
+  traps) — every multi-access template must split charges at the
+  interpreter's exact access points.
+**RUNG-2 VERDICT (matched-pair): interpreter-vs-dynarec TRCRC IDENTICAL
+over 5404 frames + [IO] MMIO stream IDENTICAL over 21104 reads; rig 96/96
+both W3 configs; testsuite 125/126.** Rung 2 (RTS ender + 5 memory
+templates + residency counter, ~10-13%% in-fight residency) is CORRECT by
+the strongest available instrument. fps twins measured this session (see
+below); traps recorded: N64_FRAME is the host VI count (guest key is
+g_frame); unfiltered IO logging throttles ares below the target frame.
+
 ## 🔬 RUNG-2 SESSION 2026-08-07 night — two findings, one shipped-blocked
 
 ### 1. THE GATE WAS LYING: rig builds ≠ game builds (m64k/Makefile)
