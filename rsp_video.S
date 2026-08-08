@@ -13,7 +13,11 @@
         RSPQ_DefineCommand cmd_pal_convert, 8  # 0x3
         RSPQ_DefineCommand cmd_sprite_begin, 4 # 0x4
         RSPQ_DefineCommand cmd_sprite_walk, 12 # 0x5
+#ifdef MVS64_BATCHDBG
+        RSPQ_DefineCommand cmd_sprite_batch, 16 # 0x6 (+a3: journal ring)
+#else
         RSPQ_DefineCommand cmd_sprite_batch, 12 # 0x6
+#endif
 	RSPQ_EndOverlayHeader
 
 RSPQ_BeginSavedState
@@ -677,14 +681,48 @@ sprite_draw:
 #   a0: records RDRAM phys (SprWalkRec[], 8 bytes each)
 #   a1: resolved-pointer array RDRAM phys (u32[], parallel; 0 = skip)
 #   a2: record count in this chunk (1..64)
+#   a3 (MVS64_BATCHDBG builds only; command widens to 16 bytes): RDRAM
+#       phys of this chunk's journal slice. The ucode DMAOuts one 16-byte
+#       entry {a0, a1, a2, w0} per record (skips included) BEFORE the skip
+#       branch; the CPU pre-fills the slice with a sentinel and compares
+#       every entry against independently-derived expected triples. This
+#       is the Phase 2 bit-exactness gate (plan §6).
 
     .bss
     .align 3
 BATCH_PTRS:  .dcb.b 256
     .align 2
-BATCH_STATE: .dcb.b 12        # rec cursor / ptr cursor / remaining
+BATCH_STATE: .dcb.b 16        # rec cursor / ptr cursor / remaining / journal cursor
+#ifdef MVS64_BATCHDBG
+    .align 3
+BATCH_JSTAGE: .dcb.b 16       # one journal entry staging for DMAOut
+#endif
 
     .text
+
+# a1/a2 synthesis from the DMA'd record words (t7 = w0, t8 = w1, t0
+# scratch) — the exact packing rsp_sprite_draw does on the CPU. One
+# macro shared by the live path and the BATCHDBG journal path, so the
+# text the gate verifies is the text that ships.
+.macro batch_synth_args
+    # a1 = pal<<24 | x<<12 | y  (exactly what rsp_sprite_draw packs)
+    srl t0, t7, 20
+    andi t0, 0xFF
+    sll a1, t0, 24
+    andi t0, t8, 0xFFF
+    sll t0, 12
+    or a1, t0
+    srl t0, t8, 12
+    andi t0, 0xFFF
+    or a1, t0
+    # a2 = (sw-1)|((sh-1)<<4) | flips — (w1>>24)&0xFF passes both size
+    # fields through; flips relocate from w0[28..29] to bits [8..9].
+    srl a2, t8, 24
+    andi a2, 0xFF
+    srl t0, t7, 20
+    andi t0, 0x300
+    or a2, t0
+.endm
 
     .func cmd_sprite_batch
 cmd_sprite_batch:
@@ -705,6 +743,9 @@ cmd_sprite_batch:
     sw t1, %lo(BATCH_STATE)+0
     sw t2, %lo(BATCH_STATE)+4
     sw a2, %lo(BATCH_STATE)+8
+#ifdef MVS64_BATCHDBG
+    sw a3, %lo(BATCH_STATE)+12
+#endif
 
 batch_loop:
     lw t1, %lo(BATCH_STATE)+0
@@ -716,25 +757,32 @@ batch_loop:
     addi t2, 4
     sw t1, %lo(BATCH_STATE)+0
     sw t2, %lo(BATCH_STATE)+4
+#ifdef MVS64_BATCHDBG
+    # Journal EVERY record (skips included): synth args first, DMAOut
+    # {a0,a1,a2,w0} to the CPU ring, THEN apply the skip. DMAOut is
+    # synchronous (rsp_dma.inc waits for completion), so BATCH_JSTAGE
+    # is safe to rewrite on the next iteration; it clobbers only t2/at
+    # beyond its s0/s4/t0 args, so a0/a1/a2/t7 survive.
+    batch_synth_args
+    li t0, %lo(BATCH_JSTAGE)
+    sw a0, 0(t0)
+    sw a1, 4(t0)
+    sw a2, 8(t0)
+    sw t7, 12(t0)
+    lw s0, %lo(BATCH_STATE)+12
+    li s4, %lo(BATCH_JSTAGE)
+    jal DMAOut
+    li t0, DMA_SIZE(16, 1)
+    lw t0, %lo(BATCH_STATE)+12
+    addiu t0, 16
+    sw t0, %lo(BATCH_STATE)+12
     beqz a0, batch_next
     nop
-    # a1 = pal<<24 | x<<12 | y  (exactly what rsp_sprite_draw packs)
-    srl t0, t7, 20
-    andi t0, 0xFF
-    sll a1, t0, 24
-    andi t0, t8, 0xFFF
-    sll t0, 12
-    or a1, t0
-    srl t0, t8, 12
-    andi t0, 0xFFF
-    or a1, t0
-    # a2 = (sw-1)|((sh-1)<<4) | flips — (w1>>24)&0xFF passes both size
-    # fields through; flips relocate from w0[28..29] to bits [8..9].
-    srl a2, t8, 24
-    andi a2, 0xFF
-    srl t0, t7, 20
-    andi t0, 0x300
-    or a2, t0
+#else
+    beqz a0, batch_next
+    nop
+    batch_synth_args
+#endif
     jal cmd_sprite_draw       # body tail-jumps RDPQ_Send -> jr ra -> here
     nop
 batch_next:

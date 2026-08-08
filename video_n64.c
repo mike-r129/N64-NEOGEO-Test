@@ -98,8 +98,28 @@ int mvs64_batch_enable = 0;
 #else
 int mvs64_batch_enable = 1;
 #endif
+// Chunk size caps the audio-latency window: a chunk is one uninterruptible
+// RSP command, and whole-pump audio commands queue behind it (snd% pays
+// the wait). Overridable for A/B (-DSPRBATCH_CHUNK=16); must stay <= 64
+// (WALK_LIST staging is 512B) and a multiple of 2 (8-byte DMA records).
+#ifndef SPRBATCH_CHUNK
 #define SPRBATCH_CHUNK 64
+#endif
 static uint32_t sprbatch_ptrs[SPRWALK_MAX_RECS] __attribute__((aligned(16)));
+
+#ifdef MVS64_BATCHDBG
+// Phase 2 bit-exactness gate (plan §6): the ucode journals one 16-byte
+// entry {a0, a1, a2, w0} per record (skips included) into this ring via
+// per-record DMAOut; after draining the chunks we compare every entry
+// against expected triples derived INDEPENDENTLY here from the record
+// words, following the C consume/draw-path semantics. Sentinel prefill
+// catches dropped/short journals (a record the ucode never reached).
+// Rig build only — the extra rspq_wait per frame disqualifies it from
+// any fps reading.
+#define BATCHDBG_SENTINEL 0xDEADDEADu
+static uint32_t batchdbg_ring[SPRWALK_MAX_RECS * 4] __attribute__((aligned(16)));
+static uint32_t batchdbg_frames, batchdbg_bad;
+#endif
 
 static void sprite_walk_consume_batch(const SprWalkRec *recs, int nrec) {
 	// Pointer-lifetime invariant (PLAN-DRAW-RDP §9 law 5) — VERIFIED in
@@ -111,38 +131,89 @@ static void sprite_walk_consume_batch(const SprWalkRec *recs, int nrec) {
 	// Pointers are written through the uncached segment (§9 law 1: no
 	// cached streaming writes in the frame loop; the batch-arena killer).
 	volatile uint32_t *up = (volatile uint32_t *)UncachedAddr(sprbatch_ptrs);
-	for (int i = 0; i < nrec; i++) {
-		uint32_t tnum = recs[i].w0 & 0xFFFFF;
-		if (crom_tile_empty(tnum)) {
-#ifdef DRAW_PERF
-			perf_dr_empty++;
-#endif
-			up[i] = 0;
-			continue;
-		}
-#ifdef DRAW_PERF
-		uint32_t _c0 = TICKS_READ();
-#endif
-		uint8_t *src = crom_get_sprite(tnum);
-#ifdef DRAW_PERF
-		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
-		perf_dr_tiles++;
-#endif
-		up[i] = PhysicalAddr(src);
-	}
 	// Records may be cached (C-produced walk): write back before the RSP
 	// DMAs them. RSP-produced lists were already invalidated at collect;
 	// writeback of uncached-clean lines is a no-op.
 	data_cache_hit_writeback((void *)recs,
 	                         ((unsigned)nrec * sizeof(SprWalkRec) + 15) & ~15u);
+#ifdef MVS64_BATCHDBG
+	volatile uint32_t *jr = (volatile uint32_t *)UncachedAddr(batchdbg_ring);
+	for (int i = 0; i < nrec * 4; i++)
+		jr[i] = BATCHDBG_SENTINEL;
+#endif
+	// Pipelined chunk kick: each chunk is issued (and flushed) the moment
+	// its own pointers are resolved, so the RSP draws chunk k while the
+	// CPU resolves chunk k+1. The first cut resolved ALL pointers before
+	// issuing anything — measured -1.5..-2.2 fps content-matched despite
+	// a ~13% faster CPU pass: the RSP idled through the resolve, the draw
+	// stream finished later, and the audio whole-pump behind it in the
+	// FIFO paid the delay as snd% wait (2026-08-08 twins).
 	for (int off = 0; off < nrec; off += SPRBATCH_CHUNK) {
 		int n = nrec - off;
 		if (n > SPRBATCH_CHUNK) n = SPRBATCH_CHUNK;
+		for (int i = off; i < off + n; i++) {
+			uint32_t tnum = recs[i].w0 & 0xFFFFF;
+			if (crom_tile_empty(tnum)) {
+#ifdef DRAW_PERF
+				perf_dr_empty++;
+#endif
+				up[i] = 0;
+				continue;
+			}
+#ifdef DRAW_PERF
+			uint32_t _c0 = TICKS_READ();
+#endif
+			uint8_t *src = crom_get_sprite(tnum);
+#ifdef DRAW_PERF
+			perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
+			perf_dr_tiles++;
+#endif
+			up[i] = PhysicalAddr(src);
+		}
+#ifdef MVS64_BATCHDBG
+		rspq_write(RSP_OVL_ID, 0x6,
+		           PhysicalAddr((void *)(recs + off)),
+		           PhysicalAddr((uint8_t *)sprbatch_ptrs + off * 4), n,
+		           PhysicalAddr((uint8_t *)batchdbg_ring + off * 16));
+#else
 		rspq_write(RSP_OVL_ID, 0x6,
 		           PhysicalAddr((void *)(recs + off)),
 		           PhysicalAddr((uint8_t *)sprbatch_ptrs + off * 4), n);
+#endif
+		rspq_flush();
 	}
-	rspq_flush();
+#ifdef MVS64_BATCHDBG
+	rspq_wait();
+	int bad = 0;
+	for (int i = 0; i < nrec; i++) {
+		uint32_t w0 = recs[i].w0, w1 = recs[i].w1;
+		uint32_t e0 = up[i];
+		uint32_t pal = (w0 >> 20) & 0xFF;
+		uint32_t x0 = w1 & 0xFFF, y0 = (w1 >> 12) & 0xFFF;
+		uint32_t sw = ((w1 >> 24) & 0xF) + 1, sh = ((w1 >> 28) & 0xF) + 1;
+		uint32_t e1 = (pal << 24) | ((x0 & 0xFFF) << 12) | (y0 & 0xFFF);
+		uint32_t e2 = (sw - 1) | ((sh - 1) << 4)
+		            | ((w0 & (1u << 28)) ? 0x100 : 0)
+		            | ((w0 & (1u << 29)) ? 0x200 : 0);
+		if (jr[i*4+0] != e0 || jr[i*4+1] != e1
+		    || jr[i*4+2] != e2 || jr[i*4+3] != w0) {
+			if (bad++ < 4)
+				debugf("[BATCHDBG] MISMATCH f=%lu i=%d got %08lx/%08lx/%08lx/%08lx exp %08lx/%08lx/%08lx/%08lx\n",
+					(unsigned long)batchdbg_frames, i,
+					(unsigned long)jr[i*4+0], (unsigned long)jr[i*4+1],
+					(unsigned long)jr[i*4+2], (unsigned long)jr[i*4+3],
+					(unsigned long)e0, (unsigned long)e1,
+					(unsigned long)e2, (unsigned long)w0);
+		}
+	}
+	batchdbg_bad += bad;
+	if (bad)
+		debugf("[BATCHDBG] frame %lu: %d bad entries of %d recs\n",
+			(unsigned long)batchdbg_frames, bad, nrec);
+	if (++batchdbg_frames % 600 == 0)
+		debugf("[BATCHDBG] %lu frames checked, %lu bad total\n",
+			(unsigned long)batchdbg_frames, (unsigned long)batchdbg_bad);
+#endif
 }
 #endif // MVS64_SPRBATCH
 
