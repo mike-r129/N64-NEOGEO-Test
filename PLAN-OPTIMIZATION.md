@@ -1,5 +1,67 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🔥 THE ATTRACTOR SAGA, ACTUALLY RESOLVED (2026-08-08, copy_l session)
+
+Chasing the (An)+→(Am)+ memcpy fusion's gate exposed the REAL causes of
+every content fork this campaign. Two concrete bugs, one design finding:
+
+### 1. BOSTAT/DYNSTAT As-corruption (FIXED)
+blockop_movew_port's instrumented commit bumped blockop_fire in t8 and
+"restored" it with `li t8, 22` — the BUDGET constant — where t8 held the
+As register value. Every fired port copy in an instrumented build wrote
+As := 22+2K: guest corruption at the FIRST fire (f≈385, BIOS era).
+Bisect-proven (cplY no-BOSTAT matches; cplZ +BOSTAT forks at exactly
+385). Fix: reload As via `lw t8, 0(t9)`. This is why instrumented runs
+"parked in attract" (forked BIOS content ate the scripted coins), and it
+poisons every historical TRCRC comparison involving an instrumented
+recording. Shipping builds were never affected.
+
+### 2. Blockops-ON vs blockops-OFF guest content forks at f=3153
+Byte-identical-binary chain: my tree with BLOCKOPS_OFF ≡ old tree with
+BLOCKOPS_OFF (cmp: identical), and that binary forks from blockops-ON
+recordings at exactly 3153 while all clean ON-family recordings
+(trcseed5-b, detA/B/C, iodP) match each other 6270-7918f. So the fused
+port copy is NOT bit-exact against the unfused interpreter at 3153-class
+events. Mechanism (design-level): the port copy's fused span completes
+ALL K MMIO writes and only then re-enters the interpreter; a mid-slice
+IRQ (raised by those very VRAM-port writes through the trap path, or by
+a guest-clock event landing inside the span) is granted at the END of
+the fused block instead of at the interpreter's per-instruction
+boundary — a bounded IRQ-latency coarsening that flips content at
+marginal frames. RAM-only fusions (fill_w/fill_l, copy_l) have no
+mid-span IRQ source and are immune. KNOWN-ISSUE, not fixed tonight:
+the port fusion's +0.9..+3.2 fps stands, the coarsening is within the
+slice-quantization class the emulator already has, but TRCRC gates must
+be like-vs-like (both sides same blockop config).
+
+### FUSION VERDICTS (bucket-matched PERFCOUNT twins, 480s)
+- **fillw_port (move.w Dn,(An) VRAM-port fill): FLAT-to-marginal.**
+  40.7→40.7 dominant bucket, +0.6..+1.1 light/heavy, m68k −1..−2 pts —
+  despite ~3.7-4k fires/window (fire-delta-proven). The fill runs are
+  short; per-entry savings are small. Kept ON (free, correct, gated).
+- **copy_l ((As)+,(Ad)+ memcpy): IDLE in samsho2** — every such DBF loop
+  targets PALETTE RAM (0x401558/0x401eb8, trapped MMIO with conversion
+  side effects, ~2 entries/frame + fight-load bursts). A palette-dst
+  helper would mostly speed LOADS, not in-fight fps: not worth it now.
+- CONCLUSION: the cheap interpreter-fusion class is EXHAUSTED. The port
+  copy's +0.9..+3.2 (2026-08-07) was its one big win. Remaining levers
+  for significant fps: dynarec register caching + chain webs (the only
+  +6-10 projection), the PLAN-DRAW-RDP dense-scene redesign, overclock.
+
+### 3. Gate discipline hardened
+- VACUOUS-GATE LAW: a TRCRC-identical pair proves nothing unless the new
+  path FIRED — require a per-window fire-counter delta (ON >> OFF).
+  (The cpl3 "green" gate was vacuous: copy_l span-rejected 1584/window —
+  source spans live in the PB-ROM bank window 0x200000+, now admitted.)
+- Same-config-family comparisons only: instrumented↔instrumented,
+  blockops-ON↔ON. Cross-family forks at 385 (instrumented, bug #1) and
+  3153 (ON/OFF, finding #2) are now explained and expected.
+- The DET_AUDIO "causal confirmation" of the audio wall channel was
+  CONFOUNDED: all det-trio builds were clean-ON family, so they matched
+  regardless of DET. Clean non-DET ≡ clean DET over 6270f (trcseed5-b vs
+  detB): the audio channel has NO observed content effect. DET stays as
+  a theoretical pin; the plat_audio_pump analysis stands as code-reading.
+
 ## 🎯 DIVERGENCE SITE FOUND + RUNG-2 FPS VERDICT (2026-08-08 早)
 
 ### THE WALL→GUEST CHANNEL: plat_audio_pump's lead-driven fill loop
