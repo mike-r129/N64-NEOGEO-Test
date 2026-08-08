@@ -349,3 +349,25 @@ fps flatline kill Phase 3 items — but do let a DPC busy-% flatline.
   frames boot→fight, zero wedges. NEXT: BATCHDBG triple-journal rig +
   10k-frame soak + DET screenshot A/B, THEN bucket-matched fps A/B and
   the default-ON decision (§6 kill bar: heavy >= +1, modal >= flat).
+- 2026-08-08 c73e61f/6a45d8b **Phase 2 GATED, verdict: compile-gated
+  stays, default-absent** — all three gates ran green, the economics
+  did not: (1) BATCHDBG triple journal (cmd widens to 16B, a3 = ring;
+  ucode DMAOuts {a0,a1,a2,w0} per record pre-skip via the shared
+  batch_synth_args macro; CPU compares vs independent derivation):
+  18,000-frame ares soak, 0 bad entries. (2) FBCRC pixel A/B (new
+  MVS64_FBCRC headless instrument + compare-fbcrc.py): 9,878 frames
+  pixel-identical ON vs OFF. (3) fps twins (DET+AUTOINPUT real-fight
+  content): FIRST measured -1.5..-2.2 — root-caused to resolve-then-
+  burst serialization; pipelined per-chunk kick landed. STILL
+  -0.8..-1.6 net: constant +11-14 snd% tax, SNDRMS split shows z80ms
+  +27%/step with ymms FLAT = icache-aliasing signature (live batch text
+  vs Z80 hot lines), invariant to chunk size (16 vs 64 identical).
+  Gross CPU-pass win is real (sprus -12%, rspq -> 0.0%) but ~+0.5 fps
+  equivalent — under the §6 bar even untaxed. METHOD LAW: bucketing by
+  spr TIME is invalid for draw treatments (frames migrate buckets —
+  first A/B looked like -3 fps with wildly skewed bucket populations);
+  analyze-buckets-tiles.py keys on tiles+empty (content) instead.
+  NEXT: Phase 3 COPY-mode on top of the batch path (modal 50-95%) —
+  it replaces the per-record RDP template, changing both the RDP
+  economics (4px/clk) and possibly the icache picture; perf go/no-go
+  on real hardware (DPC), pixel gates in ares via FBCRC.
