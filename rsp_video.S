@@ -25,6 +25,13 @@ RSPQ_BeginSavedState
 PALETTE_CACHE: .half -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 LAST_PALETTE:  .long 0
 RDRAM_PALETTE: .long 0
+# Phase 3 rotation state (PLAN-DRAW-RDP §7): must live in the SAVED state
+# block — overlay .data/.bss reset on every overlay swap (the audio ucode
+# swaps in mid-frame constantly), and this state persists record-to-record
+# across the whole sprite pass. Reset by cmd_sprite_begin each frame.
+SPR_RSTATE:    .byte 0        # descriptor/TMEM pair in rotation (0..2)
+SPR_MODE:      .byte 0        # current RDP cycle mode: 0=1cyc, 1=copy
+    .align 3                  # keep saved-state DMA size a multiple of 8
 RSPQ_EndSavedState
 
 .macro vsll_acc vdstreg, vsrcreg, qty
@@ -375,24 +382,41 @@ fix_draw:
 
     .data
 
-    .align 4
-RDP_SPRITE_DRAW:
-    # No SyncPipe: it is only required before pipeline ATTRIBUTE changes
-    # (SetOtherModes/SetCombine/...), which this stream never does. The
-    # per-tile hazards are exactly what SyncTile (TILE0/TILE1 descriptor
-    # reuse by the previous rect) and SyncLoad (LoadBlock over TMEM the
-    # previous rect reads) cover — same policy as libdragon's rdpq
-    # autosync for texrect streams. The old per-tile SyncPipe forced a
-    # full pipeline drain per 16x16 tile, ~565 times a frame in fights.
-    .quad RdpSyncTile()
-    .quad RdpSyncLoad()
+    # Phase 3 (PLAN-DRAW-RDP §7.1): the per-record syncs left the template.
+    # Three baked variants rotate BOTH the tile-descriptor pair (draw tile
+    # 2p, load tile 2p+1) and the TMEM slot (p*128B; the TLUT half at
+    # 0x800+ is untouched, TILE7 stays the TLUT-load descriptor). A
+    # descriptor/slot is reused every 3rd record, so SyncTile+SyncLoad are
+    # emitted only on rotation wrap (see sprite_draw prologue): between
+    # wraps the RDP overlaps record i+1's LoadBlock with record i's
+    # TexRect instead of ping-ponging load→draw per tile. The old stream
+    # paid SyncTile+SyncLoad per record, ~565+/frame in fights.
+    # Variants sit 64B apart (7 quads + pad): base = TPL0 + (pair<<6).
+.macro SPRITE_DRAW_TPL ldtile, drtile, tmemw
     .quad RdpSetTexImage(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, 4)
-    .quad RdpSetTile(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, 0, TILE1)
-    .quad RdpSetTile(RDP_TILE_FORMAT_INDEX, RDP_TILE_SIZE_4BIT, 8/8, 0, TILE0)
-    .quad RdpSetTileSizeI(TILE0, 0, 0, 16-1, 16-1)
-    .quad RdpLoadBlock(TILE1, 0, 0, 16*16/4, 16/2)
-    .quad RdpTextureRectangle1I(TILE0, 0, 0, 0, 0)         # x0,y1,x1,y1
+    .quad RdpSetTile(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, \tmemw, \ldtile)
+    .quad RdpSetTile(RDP_TILE_FORMAT_INDEX, RDP_TILE_SIZE_4BIT, 8/8, \tmemw, \drtile)
+    .quad RdpSetTileSizeI(\drtile, 0, 0, 16-1, 16-1)
+    .quad RdpLoadBlock(\ldtile, 0, 0, 16*16/4, 16/2)
+    .quad RdpTextureRectangle1I(\drtile, 0, 0, 0, 0)       # x1,y1 / x0,y0
     .quad RdpTextureRectangle2I(0, 0, 0, 0)                # s,t,ds,dt
+    .quad 0                                                # pad to 64B stride
+.endm
+    .align 4
+RDP_SPRITE_TPL0: SPRITE_DRAW_TPL 1, 0, 0
+RDP_SPRITE_TPL1: SPRITE_DRAW_TPL 3, 2, 16
+RDP_SPRITE_TPL2: SPRITE_DRAW_TPL 5, 4, 32
+
+# Layout-identical fps-twin knob (matched-pair law): with -DMVS64_ROTA_OFF
+# this single DATA byte flips to 1 and the body pins pair=0 (TPL0 = tiles
+# 0/1, tmem 0, syncs every record — byte-identical to the pre-Phase-3
+# stream) and never picks copy mode. Both twin binaries carry identical
+# text and layout; only this initializer differs.
+#ifdef MVS64_ROTA_OFF
+ROTA_DISABLE: .byte 1
+#else
+ROTA_DISABLE: .byte 0
+#endif
 
     .align 4
 RDP_SPRITE_LOAD_PALETTE:
@@ -428,6 +452,11 @@ cmd_sprite_begin:
     li s0, %lo(PALETTE_CACHE)
     sqv $v01, 0,s0
     sqv $v01, 16,s0
+
+    # Reset Phase 3 rotation/mode state: the CPU emits the standard-mode
+    # SetOtherModes right after this command each frame, so pair=0 and
+    # mode=1cyc are consistent with the RDP state by construction.
+    sh zero, %lo(SPR_RSTATE)
 
     jr ra
     sw a0, %lo(RDRAM_PALETTE)
@@ -535,32 +564,8 @@ cmd_sprite_draw:
     addi s3, 48
 
 sprite_draw:
-    # The template is 9 quads (72 bytes) since the SyncPipe removal; the
-    # fifth 16-byte copy over-copies 8 stale bytes past the stream end,
-    # which is harmless: s3 advances by 72 and RDPQ_Send sends up to s3.
-    li s0, %lo(RDP_SPRITE_DRAW)
-    lqv vload0,  0,s0
-    lqv vload1, 16,s0
-    lqv vload2, 32,s0
-    lqv vload3, 48,s0
-    lqv vload4, 64,s0
-
-    sqv vload0,  0,s3
-    sqv vload1, 16,s3
-    sqv vload2, 32,s3
-    sqv vload3, 48,s3
-    sqv vload4, 64,s3
-
-    # Store sprite pixel address in SetTexImage
-    sw a0, 2*8+4(s3)
-
-    # Store palette number into SetTile
-    lbu t0, 4*8+5(s3)
-    sll t1, palslot, 4
-    or t0, t1
-    sb t0, 4*8+5(s3)
-
-    # Extract X/Y
+    # Extract X/Y and size fields first: the rotation prologue (and the
+    # Phase 3 copy-mode decision) need them before the template is staged.
     sll rect_x0, a1, 8
     sll rect_y0, a1, 20
     sra rect_x0, 20
@@ -575,10 +580,119 @@ sprite_draw:
     nop
     addi rect_y0, -512
 2:
-
     andi rect_sw, a2, 0xF
     srl rect_sh, a2, 4
     andi rect_sh, 0xF
+
+    # --- Phase 3.2 modal test: copy-eligible iff full 16x16, no flips,
+    # and no x-clipping — the proven predicate of the old CPU dual-mode
+    # path (video_n64.c draw_sprite). Top y-clip is handled inside the
+    # copy path, bottom by the 224 clamp; y is additionally bounded to
+    # (-16, 224) so the copy rect can never go degenerate (the 1cyc
+    # fallback scissors those away, same as today). t3 = record mode.
+    li t3, 0                  # 1cyc
+    andi t0, a2, 0x3FF
+    xori t0, 0xFF             # sw-1==15 && sh-1==15 && !flipx && !flipy
+    bnez t0, 9f
+    nop
+    bltz rect_x0, 9f          # x0 >= 0
+    sltiu t0, rect_x0, 305    # x0 <= 304 (x0+16 <= 320), delay slot
+    beqz t0, 9f
+    addi t0, rect_y0, 15      # y0 >= -15, delay slot
+    bltz t0, 9f
+    slti t0, rect_y0, 224     # y0 <= 223, delay slot
+    beqz t0, 9f
+    nop
+    li t3, 1                  # copy
+9:
+    lbu t0, %lo(ROTA_DISABLE)
+    beqz t0, 10f
+    nop
+    li t3, 0                  # legacy twin: never copy
+10:
+
+    # --- Rotation prologue (§7.1): t2 = descriptor/TMEM pair in use for
+    # this record. Syncs are emitted only on rotation wrap (pair 0 about
+    # to be reused): the previous user of pair 0's descriptors and TMEM
+    # slot is record i-3, and SyncTile+SyncLoad here drain every record
+    # <= i-1. Between wraps there are no syncs, so the RDP loads record
+    # i+1's texels into its own slot while record i's rect still draws.
+    # A mode switch (§7.2) instead emits SyncPipe + SetOtherModes: the
+    # pipe drain covers every rotation hazard too, so the wrap syncs are
+    # skipped on those records. SOM words are the VERBATIM payloads the
+    # rdpq engine composes for these two modes, captured off the
+    # validated stream (MVS64_RDPDBG rig, 2026-08-08):
+    #   1cyc: EF008CF000000201  "1cyc tlut alpha_compare cvg=[zap]"
+    #   copy: EF20800000000001  "copy tlut alpha_compare" (fix layer's
+    #         own copy mode — proven with the same CI4+TLUT+alpha setup)
+    lbu t2, %lo(SPR_RSTATE)
+    lbu t0, %lo(SPR_MODE)
+    beq t0, t3, 3f
+    addi t1, t2, 1            # next pair (delay slot, all paths)
+    # mode switch
+    sb t3, %lo(SPR_MODE)
+    li t0, 0x27000000         # SyncPipe
+    sw t0, 0(s3)
+    sw zero, 4(s3)
+    bnez t3, 1f
+    nop
+    li t0, 0x2F008CF0         # -> standard 1cyc
+    li t4, 0x00000201
+    b 2f
+    nop
+1:  li t0, 0x2F208000         # -> copy
+    li t4, 0x00000001
+2:  sw t0, 8(s3)
+    sw t4, 12(s3)
+    b 5f
+    addi s3, 16
+3:  bnez t2, 5f
+    nop
+    li t0, 0x28000000         # SyncTile
+    sw t0, 0(s3)
+    sw zero, 4(s3)
+    li t0, 0x26000000         # SyncLoad
+    sw t0, 8(s3)
+    sw zero, 12(s3)
+    addi s3, 16
+5:
+    slti t0, t1, 3
+    bnez t0, 4f
+    nop
+    li t1, 0
+4:
+    lbu t0, %lo(ROTA_DISABLE)
+    beqz t0, 6f
+    nop
+    li t1, 0                  # legacy twin: pair pinned to 0 (per-record syncs)
+6:  sb t1, %lo(SPR_RSTATE)
+
+    # Stage this pair's template (7 quads, 56B; the 4th quad copy
+    # over-copies the 8B pad, harmless: s3 advances 56 and RDPQ_Send
+    # sends up to s3).
+    sll t4, t2, 6
+    addi t4, %lo(RDP_SPRITE_TPL0)
+    lqv vload0,  0,t4
+    lqv vload1, 16,t4
+    lqv vload2, 32,t4
+    lqv vload3, 48,t4
+
+    sqv vload0,  0,s3
+    sqv vload1, 16,s3
+    sqv vload2, 32,s3
+    sqv vload3, 48,s3
+
+    # Store sprite pixel address in SetTexImage
+    sw a0, 0*8+4(s3)
+
+    # Store palette slot into the draw-tile SetTile
+    lbu t0, 2*8+5(s3)
+    sll t1, palslot, 4
+    or t0, t1
+    sb t0, 2*8+5(s3)
+
+    bnez t3, sprite_copy_rect
+    nop
 
     # Fetch scale factors from table
     sll rect_ds, rect_sw, 1
@@ -587,34 +701,34 @@ sprite_draw:
     lhu rect_dt, %lo(SCALE_FACTORS)(rect_dt)
 
     # Handle negative rectangle positions
-    bgez rect_x0, 1f
+    bgez rect_x0, 5f
     li rect_s0, 0
     neg rect_s0, rect_x0
     sub rect_sw, rect_s0
     li rect_x0, 0
-1:
-    bgez rect_y0, 2f
+5:
+    bgez rect_y0, 6f
     li rect_t0, 0
     neg rect_t0, rect_y0
     sub rect_sh, rect_t0
     li rect_y0, 0
-2:
+6:
 
     # Handle flipping
     andi t0, a2, 1<<8
-    beqz t0, 1f
+    beqz t0, 7f
     nop
     li t0, 16
     sub rect_s0, t0, rect_s0
     neg rect_ds, rect_ds
-1:
+7:
     andi t0, a2, 1<<9
-    beqz t0, 2f
+    beqz t0, 8f
     nop
     li t0, 16
     sub rect_t0, t0, rect_t0
     neg rect_dt, rect_dt
-2:
+8:
 
     # Calculate X1/Y1 coordinates
     add rect_sw, rect_x0
@@ -628,27 +742,78 @@ sprite_draw:
     sll rect_x0, 14
     sll rect_y0, 2
     or rect_x0, rect_y0
-    lw t0, 7*8+4(s3)
+    lw t0, 5*8+4(s3)
     or t0, rect_x0
-    sw t0, 7*8+4(s3)
+    sw t0, 5*8+4(s3)
 
     andi rect_sw, 0x3FF
     andi rect_sh, 0x3FF
     sll rect_sw, 14
     sll rect_sh, 2
     or rect_sw, rect_sh
-    lw t0, 7*8+0(s3)
+    lw t0, 5*8+0(s3)
     or t0, rect_sw
-    sw t0, 7*8+0(s3)
+    sw t0, 5*8+0(s3)
 
     sll rect_s0, 5
     sll rect_t0, 5
-    sh rect_s0, 8*8+0(s3)
-    sh rect_t0, 8*8+2(s3)
-    sh rect_ds, 8*8+4(s3)
-    sh rect_dt, 8*8+6(s3)
+    sh rect_s0, 6*8+0(s3)
+    sh rect_t0, 6*8+2(s3)
+    sh rect_ds, 6*8+4(s3)
+    sh rect_dt, 6*8+6(s3)
 
-    addi s3, 9*8
+    addi s3, 7*8
+
+    # Send to RDP and go back to main loop
+    j RDPQ_Send
+    li s4, %lo(RDPQ_CMD_STAGING)
+
+sprite_copy_rect:
+    # COPY-mode rect (§7.2): full 16x16, no flip, no x-clip guaranteed by
+    # the modal test. Top y-clip via the t texel offset (the old CPU copy
+    # path's workaround), bottom clamped to 224. COPY semantics follow
+    # the libdragon fixup + the fix layer's own template: XL/YL are
+    # INCLUSIVE (one full pixel less than the exclusive x1/y1, hence
+    # -0x4004 on the packed 10.2 pair), dsdx = 4 texels/pixel (the RDP
+    # copies 4 16-bit texels per clock), dtdy = 1.
+    li rect_t0, 0
+    bgez rect_y0, 1f
+    addi rect_sw, rect_x0, 16      # x1 exclusive (delay slot, both paths)
+    neg rect_t0, rect_y0           # t offset = -y0
+    li rect_y0, 0
+1:
+    li t0, 16
+    sub t0, rect_t0
+    add rect_sh, rect_y0, t0       # y1 exclusive = y0 + 16 - t
+    li t0, 224
+    ble rect_sh, t0, 2f
+    nop
+    move rect_sh, t0               # bottom clamp
+2:
+    sll rect_sw, 14
+    sll rect_sh, 2
+    or rect_sw, rect_sh
+    addi rect_sw, -0x4004          # exclusive -> inclusive XL/YL
+    lw t0, 5*8+0(s3)
+    or t0, rect_sw
+    sw t0, 5*8+0(s3)
+
+    sll rect_x0, 14
+    sll rect_y0, 2
+    or rect_x0, rect_y0
+    lw t0, 5*8+4(s3)
+    or t0, rect_x0
+    sw t0, 5*8+4(s3)
+
+    sh zero, 6*8+0(s3)             # s = 0
+    sll rect_t0, 5
+    sh rect_t0, 6*8+2(s3)          # t
+    li t0, 4<<10
+    sh t0, 6*8+4(s3)               # dsdx = 4.0
+    li t0, 1<<10
+    sh t0, 6*8+6(s3)               # dtdy = 1.0
+
+    addi s3, 7*8
 
     # Send to RDP and go back to main loop
     j RDPQ_Send
@@ -672,10 +837,17 @@ sprite_draw:
 #
 # DMEM: records stage in WALK_LIST (512B) — DEAD SHARING invariant: batch
 # commands are only issued after the walk's collect (sentinel wait) in
-# the same frame, and pal_convert touches only PAL_BUFFER. BATCH_PTRS is
-# dedicated (256B). Loop state lives in DMEM because the draw body +
+# the same frame, and pal_convert touches only PAL_BUFFER. BATCH_PTRS
+# dead-shares the TAIL of PAL_BUFFER (last 256B): both are pure
+# per-command scratch (each batch command DMAs its pointers in at start;
+# pal_convert DMAs its result out before returning), pal_convert runs
+# once per frame BEFORE the sprite pass, and RSP commands execute
+# serially — the regions are never live at the same time. This freed the
+# DMEM that the Phase 3 rotation templates consumed (the overlay sat 16B
+# from the 4KB ceiling). Loop state lives in DMEM because the draw body +
 # RDPQ_Send clobber nearly every scalar register; three loads per record
 # is noise against the ~100-instruction body.
+#define BATCH_PTRS (PAL_BUFFER + 0x800 - 256)
 #
 # Command: 0x6, 12 bytes
 #   a0: records RDRAM phys (SprWalkRec[], 8 bytes each)
@@ -689,8 +861,6 @@ sprite_draw:
 #       is the Phase 2 bit-exactness gate (plan §6).
 
     .bss
-    .align 3
-BATCH_PTRS:  .dcb.b 256
     .align 2
 BATCH_STATE: .dcb.b 16        # rec cursor / ptr cursor / remaining / journal cursor
 #ifdef MVS64_BATCHDBG
