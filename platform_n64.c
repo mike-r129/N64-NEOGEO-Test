@@ -6,7 +6,10 @@
 
 // Audio-health telemetry (see sound_neogeo.c). MVS64_SNDHEALTH enables the
 // [AIPUMP] USB log in a normal human-driven build (no scripted MVS64_AUTOINPUT).
-#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH)
+// MVS64_SNDOSD additionally draws the audio-health numbers on screen (see
+// plat_endframe) so a real console diagnoses sound loss with no cable or SD
+// card pull — it implies the SD/USB telemetry too.
+#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH) || defined(MVS64_SNDOSD)
 #define SND_HEALTH 1
 #endif
 
@@ -71,6 +74,15 @@ extern char end __attribute__((section (".data")));
 // Audio (libdragon AI) state — see plat_audio_pump below.
 static int audio_enabled = 0;
 #define AI_NUM_BUFFERS 4          // AI back buffers handed to audio_init
+
+#ifdef MVS64_RSPWP
+// rspq lost-wakeup watchdog kicks (see plat_audio_pump); file-scope so the
+// SNDOSD overlay / [AIPUMP] telemetry can report it.
+static uint32_t rspwp_wedge_kicks;
+#endif
+// Consecutive pump passes that observed ISR silence-padding (the overload
+// governor input, see plat_audio_pump); file-scope for SNDOSD.
+static int underrun_streak;
 
 // --- Interrupt-fed staging ring ---------------------------------------------
 // The N64 AI hardware replays its last DMA buffer forever when its queue runs
@@ -267,6 +279,19 @@ static void wp_publish(void) {
 void plat_audio_pump(void) {
     if (!audio_enabled) return;
 
+#if defined(MVS64_RSPWP) && defined(MVS64_WP_DEATHTEST)
+    // Revive-cycle gate rig: force a dead-latch during the attract music
+    // (~pass 3600 ≈ 60s at speed) and again later, so an ares run shows
+    // death -> C fallback -> [RSPWP] revive -> offload healthy (off=0).
+    {
+        extern void YM2610_offload_testkill(void);
+        static int dt_passes;
+        dt_passes++;
+        if (dt_passes == 3600 || dt_passes == 5400)
+            YM2610_offload_testkill();
+    }
+#endif
+
 #ifdef MVS64_RSPWP
     // rspq lost-wakeup watchdog. The whole-pump audio offload issues bursts
     // of commands separated by idle gaps (~500 halt/wake edges per second),
@@ -284,15 +309,14 @@ void plat_audio_pump(void) {
         volatile uint32_t * const SP_STATUS_REG =
             (volatile uint32_t *) 0xA4040010;
         static int wedged_seen;
-        static uint32_t wedge_kicks;
         uint32_t st = *SP_STATUS_REG;
         if ((st & 1u /*HALTED*/) && (st & (1u << 14) /*SIG_MORE*/)) {
             if (wedged_seen++) {
                 *SP_STATUS_REG = 1u /*SP_WSTATUS_CLEAR_HALT*/;
                 wedged_seen = 0;
-                wedge_kicks++;
+                rspwp_wedge_kicks++;
                 debugf("[RSPWP] rspq lost-wakeup kicked (%lu)\n",
-                       (unsigned long) wedge_kicks);
+                       (unsigned long) rspwp_wedge_kicks);
             }
         } else {
             wedged_seen = 0;
@@ -323,7 +347,6 @@ void plat_audio_pump(void) {
     // happen in the middle of one long sound_gen_samples() call. sound_silent
     // is set from the PREVIOUS pass's streak so one slow frame isn't muted.
     static uint32_t last_pad;
-    static int underrun_streak;
     uint32_t pad_now = aring_pad;
     uint32_t starved = pad_now - last_pad;
     last_pad = pad_now;
@@ -475,10 +498,18 @@ void plat_audio_pump(void) {
         starvedsum += starved;
         if (underrun_streak) deep++;
         if ((pumps++ % 60) == 0) {
-            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d starved=%u lead=%u sndms=%.2f silent=%d\n",
+#ifdef MVS64_RSPWP
+            uint32_t kicks = rspwp_wedge_kicks;
+#else
+            uint32_t kicks = 0;
+#endif
+            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d starved=%u lead=%u sndms=%.2f silent=%d off=%lx deaths=%lu revives=%lu kicks=%lu\n",
                      pumps, total, maxf, deep, disc, starvedsum,
                      (uint32_t)(aring_wr - aring_rd),
-                     (float)tacc * 1000.f / (float)TICKS_PER_SECOND / 60.f, sound_silent);
+                     (float)tacc * 1000.f / (float)TICKS_PER_SECOND / 60.f, sound_silent,
+                     (unsigned long)YM2610_offload_flags(),
+                     (unsigned long)ym_off_deaths, (unsigned long)ym_off_revives,
+                     (unsigned long)kicks);
             total = 0; maxf = 0; tacc = 0; disc = 0; deep = 0; starvedsum = 0;
             // Commit the SD log to the card so it survives a power-off. FatFs only
             // writes the directory entry (file size) on close, so we close+reopen
@@ -558,11 +589,11 @@ void plat_save_screenshot(const char *fn) {
 uint8_t *g_screen_ptr;
 int g_screen_pitch;
 
-#if defined(MVS64_FBCRC) || defined(MVS64_DPCOSD)
+#if defined(MVS64_FBCRC) || defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD)
 static surface_t *fbcrc_disp;
 #endif
 
-#ifdef MVS64_DPCOSD
+#if defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD)
 // PLAN-DRAW-RDP Phase 3 hardware instrument: ares/paraLLEl-RDP does not
 // model the DPC counters (they read 0 there), so the Phase 3 perf verdict
 // comes from a real console. This build draws the RDP numbers on screen:
@@ -572,7 +603,7 @@ static surface_t *fbcrc_disp;
 //   B bb     PIPE_BUSY as % of DP_CLOCK (RDP duty cycle)
 // Glyphs: 4x6 bitmap font drawn 2x through the uncached segment onto the
 // finished frame (detach_wait first), top-left corner.
-static const uint8_t dpcosd_font[16][6] = {
+static const uint8_t dpcosd_font[22][6] = {
 	{0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, // 0 1
 	{0x6,0x9,0x1,0x2,0x4,0xF}, {0xE,0x1,0x6,0x1,0x1,0xE}, // 2 3
 	{0x2,0x6,0xA,0xF,0x2,0x2}, {0xF,0x8,0xE,0x1,0x1,0xE}, // 4 5
@@ -582,6 +613,9 @@ static const uint8_t dpcosd_font[16][6] = {
 	{0xE,0x9,0xE,0x8,0x8,0x8}, {0xF,0x2,0x2,0x2,0x2,0x2}, // P T
 	{0xE,0x9,0xE,0x9,0x9,0xE}, {0xF,0x8,0xE,0x8,0x8,0x8}, // B F
 	{0x0,0x0,0x0,0x0,0x0,0x0},                            // space
+	{0xE,0x9,0x9,0x9,0x9,0xE}, {0x9,0xA,0xC,0xC,0xA,0x9}, // D K
+	{0xE,0x9,0x9,0xE,0xA,0x9}, {0x7,0x8,0x6,0x1,0x1,0xE}, // R S
+	{0x8,0x8,0x8,0x8,0x8,0xF}, {0x6,0x9,0x8,0x8,0x9,0x6}, // L C
 };
 static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s) {
 	for (; *s; s++, x += 10) {
@@ -592,6 +626,12 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 		else if (*s == 'T') g = 12;
 		else if (*s == 'B') g = 13;
 		else if (*s == 'F') g = 14;
+		else if (*s == 'D') g = 16;
+		else if (*s == 'K') g = 17;
+		else if (*s == 'R') g = 18;
+		else if (*s == 'S') g = 19;
+		else if (*s == 'L') g = 20;
+		else if (*s == 'C') g = 21;
 		else continue;
 		for (int r = 0; r < 6; r++) {
 			uint8_t bits = dpcosd_font[g][r];
@@ -610,7 +650,7 @@ void plat_beginframe(void) {
 
 	g_screen_ptr = rdp_disp->buffer;
 	g_screen_pitch = 320*2;
-#if defined(MVS64_FBCRC) || defined(MVS64_DPCOSD)
+#if defined(MVS64_FBCRC) || defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD)
 	fbcrc_disp = rdp_disp;
 #endif
 
@@ -702,6 +742,60 @@ void plat_endframe(void) {
 		dpcosd_text(fb, stride_px, 8, 22, l2);
 		dpcosd_text(fb, stride_px, 8, 36, l3);
 		dpcosd_text(fb, stride_px, 8, 50, l4);
+	}
+	display_show(fbcrc_disp);
+#elif defined(MVS64_SNDOSD)
+	rdpq_detach_wait();
+	{
+		// Audio-health OSD: which layer of the sound pipeline died, readable
+		// on a real console with no cable (mirrors the [AIPUMP] telemetry).
+		//   F ff.f    emulated fps (wall clock, 60-frame window)
+		//   D wamh n  offload dead-latches (whole-pump, adpcm, fm, hatch)
+		//             + death count
+		//   K k R r   rspq lost-wakeup watchdog kicks + offload revives
+		//   S s n     silent-governor engaged + ISR silence-pad frames/sec
+		//   L n C n   staging-ring lead (frames) + AI consumption frames/sec
+		// Healthy @11kHz: D 0000 0, K 0 R 0, S 0 0, L ~2n, C ~11025.
+		// Sound dead but C ~11025  -> delivery alive, generation muted/dead
+		// (look at D/S). C 0 -> the AI interrupt chain itself died.
+		static uint32_t tick0, rd0, pad0;
+		static int accn;
+		static char l1[24], l2[24], l3[24], l4[24], l5[24];
+		if (accn == 0 && tick0 == 0) {   // bootstrap
+			tick0 = TICKS_READ(); rd0 = aring_rd; pad0 = aring_pad;
+		}
+		if (++accn >= 60) {
+			uint32_t now = TICKS_READ();
+			uint32_t dt = TICKS_DISTANCE(tick0, now);
+			uint32_t rd = aring_rd, pad = aring_pad;
+			if (dt) {
+				uint32_t f10  = (uint32_t)((uint64_t)TICKS_PER_SECOND * accn * 10 / dt);
+				uint32_t cons = (uint32_t)((uint64_t)(rd - rd0) * TICKS_PER_SECOND / dt);
+				uint32_t strv = (uint32_t)((uint64_t)(pad - pad0) * TICKS_PER_SECOND / dt);
+				uint32_t off  = YM2610_offload_flags();
+#ifdef MVS64_RSPWP
+				uint32_t kicks = rspwp_wedge_kicks;
+#else
+				uint32_t kicks = 0;
+#endif
+				sprintf(l1, "F %lu.%lu", (unsigned long)(f10/10), (unsigned long)(f10%10));
+				sprintf(l2, "D %u%u%u%u %lu", (unsigned)!!(off & 2), (unsigned)!!(off & 1),
+				        (unsigned)!!(off & 4), (unsigned)!!(off & 16),
+				        (unsigned long)ym_off_deaths);
+				sprintf(l3, "K %lu R %lu", (unsigned long)kicks, (unsigned long)ym_off_revives);
+				sprintf(l4, "S %d %lu", sound_silent ? 1 : 0, (unsigned long)strv);
+				sprintf(l5, "L %lu C %lu", (unsigned long)(aring_wr - aring_rd),
+				        (unsigned long)cons);
+			}
+			tick0 = now; rd0 = rd; pad0 = pad; accn = 0;
+		}
+		uint16_t *fb = (uint16_t *)UncachedAddr(fbcrc_disp->buffer);
+		int stride_px = fbcrc_disp->stride / 2;
+		dpcosd_text(fb, stride_px, 8,  8, l1);
+		dpcosd_text(fb, stride_px, 8, 22, l2);
+		dpcosd_text(fb, stride_px, 8, 36, l3);
+		dpcosd_text(fb, stride_px, 8, 50, l4);
+		dpcosd_text(fb, stride_px, 8, 64, l5);
 	}
 	display_show(fbcrc_disp);
 #else
