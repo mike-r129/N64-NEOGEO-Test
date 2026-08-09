@@ -371,3 +371,34 @@ fps flatline kill Phase 3 items — but do let a DPC busy-% flatline.
   it replaces the per-record RDP template, changing both the RDP
   economics (4px/clk) and possibly the icache picture; perf go/no-go
   on real hardware (DPC), pixel gates in ares via FBCRC.
+- 2026-08-08 **Phase 3 §7.1+§7.2 LANDED DEFAULT-ON** — descriptor/TMEM
+  rotation + COPY-mode modal template, in the shared cmd_sprite_draw
+  body (per-tile AND batch paths). §7.1: 3 baked template variants
+  rotate the draw/load tile pair (2p/2p+1) and the 128B TMEM slot;
+  SyncTile+SyncLoad only on rotation wrap (every 3rd record; was per
+  record) — between wraps the RDP overlaps record i+1's LoadBlock with
+  record i's TexRect. DMEM funded by dead-sharing BATCH_PTRS into
+  PAL_BUFFER's tail (overlay was 16B from the 4KB ceiling; now 160B
+  slack). §7.2: modal records (16x16, no flip, no x-clip — the old CPU
+  dual-mode predicate) draw in COPY mode at 4px/clk; SyncPipe+SOM only
+  on run edges; SOM words are VERBATIM captures off the validated
+  stream (MVS64_RDPDBG rig): 1cyc=EF008CF000000201,
+  copy=EF20800000000001 (the fix layer's proven copy config); copy
+  TexRect = inclusive XL/YL (-1px both axes, the libdragon fixup
+  convention) + dsdx 4<<10. GATES (all green): FBCRC pixel A/B vs HEAD
+  — attract 8,601 (rotation-only) / 9,112 (full) frames identical,
+  AUTOINPUT fight 7,422 frames identical both stages; rdpq validator
+  live frame 60→end incl. fights, 0 errors (warns pre-existing
+  class); BATCHDBG soak on the new body 9,600 frames 0 bad; fps
+  LAYOUT-IDENTICAL twins (ROTA_DISABLE one-data-byte knob,
+  -DMVS64_ROTA_OFF; knob path itself pixel-gated 10,186 frames) FLAT
+  in every content bucket. METHOD FINDING: the naive cross-binary twin
+  (copyfps vs basefps) read -1.9..-3.0 fps / +13-16 snd%; the knob
+  cross-check (p3off vs basefps, SAME stream, different binary) read
+  -3.4..-5.0 / +23-26 snd% — pure link-layout luck (ucode blob size
+  shift -> dcache alias reshuffle of the sound path). Cross-binary fps
+  deltas remain uninterpretable; only knob twins count. HARDWARE
+  HAND-OFF: MVS64_DPCOSD build draws F/P/T/B (fps, PIPE_BUSY ms,
+  TMEM_BUSY ms, busy%) on-screen from the DPC counters (zeros in
+  ares by design); §7 go/no-go = flashcart A/B of dpcosd vs
+  dpcosd+ROTA_OFF. Phase 3.3 (TLUT preload) not started.
