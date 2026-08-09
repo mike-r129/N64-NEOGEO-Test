@@ -39,4 +39,11 @@ int sound_gen_samples(int16_t *out, int nsamples);
 // replaying a stale buffer as a stuck/looping note. 0 during normal playback.
 extern int sound_silent;
 
+// Audio-offload health (N64 RSP offloads; always linkable, stays 0 when the
+// offloads are compiled out or on other platforms). Read by the platform's
+// SNDOSD overlay / SND_HEALTH telemetry. Flags: bit0 ADPCM dead-latch, bit1
+// whole-pump dead-latch, bit2 FM dead-latch, bit3 structural (unrevivable).
+extern uint32_t ym_off_deaths, ym_off_revives;
+uint32_t YM2610_offload_flags(void);
+
 #endif

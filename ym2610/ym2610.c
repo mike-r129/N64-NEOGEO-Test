@@ -881,6 +881,40 @@ INLINE void FM_BUSY_SET(FM_ST *ST, int busyclock) {
 #define FM_BUSY_CLEAR(ST) {}
 #endif
 
+/* Offload-health accounting (read by the platform's SNDOSD/telemetry; the
+ * counters exist on every build so sound.h externs always link, they just
+ * stay 0 without the RSP offloads). A "death" is any runtime dead-latch
+ * (poll timeout / ring-stall) that dropped the session to the C synth
+ * path; "structural" marks the boot-time sin-fold check failure, which is
+ * never revivable. The wp_hatch latch below counts separately (see
+ * YM2610_offload_flags bit4). */
+u32 ym_off_deaths, ym_off_revives;
+int ym_off_structural;
+#if defined(N64) && (defined(MVS64_RSPADPCM) || defined(MVS64_RSPFM))
+#include <libdragon.h>            /* TICKS_* (idempotent re-include below) */
+static u32 ym_off_dead_tick;      /* TICKS_READ() at the latest death/hatch */
+#ifdef MVS64_WP_REVIVE
+static u32 ym_off_revive_tick;    /* TICKS_READ() at the latest revive */
+static u32 ym_off_backoff_ms = 1000;
+#endif
+static void ym_off_died(void) {
+	u32 now = TICKS_READ();
+#ifdef MVS64_WP_REVIVE
+	/* A death long after the last revive is a fresh incident, not revival
+	 * thrash: restore the revival budget. (TICKS wraps ~91s, so a very old
+	 * revive tick can misread — worst case the budget stays reduced or
+	 * resets early; both are benign.) */
+	if (ym_off_revives &&
+	    TICKS_DISTANCE(ym_off_revive_tick, now) > (s32) TICKS_FROM_MS(30000)) {
+		ym_off_revives = 0;
+		ym_off_backoff_ms = 1000;
+	}
+#endif
+	ym_off_dead_tick = now;
+	ym_off_deaths++;
+}
+#endif
+
 #if defined(N64) && defined(MVS64_RSPWP)
 /* MVS64 whole-pump FM offload (WHOLEPUMP-DESIGN.md): the FM dynamic state
  * lives on the RSP, so key transitions must reach it as events. Writes only
@@ -1945,6 +1979,9 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 			if (!wp_hatch)
 				wp_hatch_count++;
 			wp_hatch = 1;
+#ifdef MVS64_WP_REVIVE
+			ym_off_dead_tick = TICKS_READ();   /* backoff anchor */
+#endif
 		}
 #endif
 		SLOT->ssg = v & 0x0f;
@@ -3263,6 +3300,7 @@ static int rspa_wait_slot(int slot, u32 seq) {
 			debugf("[RSPADPCM] TIMEOUT seq=%lu got=%lu - disabling RSP ADPCM\n",
 					(unsigned long) seq, (unsigned long) *seqp);
 			rspa_dead = 1;
+			ym_off_died();
 			return 0;
 		}
 	}
@@ -3648,6 +3686,7 @@ static void rspfm_init(void) {
 					" - FM offload disabled\n", i, sin_tab[i],
 					(unsigned long) rec);
 			rspfm_dead = 1;
+			ym_off_structural = 1;   /* never revivable */
 			return;
 		}
 	}
@@ -3886,6 +3925,7 @@ static int rspfm_wait(void) {
 			debugf("[RSPFM] TIMEOUT seq=%lu got=%lu - disabling FM offload\n",
 					(unsigned long) rspfm_seqno, (unsigned long) *seqp);
 			rspfm_dead = 1;
+			ym_off_died();
 			return 0;
 		}
 	}
@@ -4393,6 +4433,7 @@ void YM2610_wp_finish(void) {
 			debugf("[RSPWP] TIMEOUT seq=%lu coll=%lu — offload dead\n",
 					(unsigned long) rspwp_seq, (unsigned long) rspwp_coll);
 			rspwp_dead2 = 1;
+			ym_off_died();
 			/* drop the stuck chunks; their dests keep the emit copy */
 			while (rspwp_coll < rspwp_seq) {
 				rspwp_pend[rspwp_coll % RSPWP_RING].n = 0;
@@ -4433,6 +4474,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	if (rspwp_seq - rspwp_coll >= RSPWP_RING) {
 		if (rspwp_coll >= rspwp_emitted || !rspwp_collect(1)) {
 			rspwp_dead2 = 1;
+			ym_off_died();
 			return 0;
 		}
 	}
@@ -4446,6 +4488,9 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 				ccs_oc1[algo], eg_base, OPN->eg_cnt, 1)) {
 			wp_hatch = 1;
 			rspwp_pack_hatches++;
+#ifdef MVS64_WP_REVIVE
+			ym_off_dead_tick = TICKS_READ();   /* backoff anchor */
+#endif
 			return 0;
 		}
 		/* no CPU-side skip knowledge: all slots due, no quiet locks */
@@ -4497,6 +4542,41 @@ static void rspwp_ship(void) {
 static int rspwp_ok(FM_CH **cch) {
 	if (!rspfm_checked)
 		rspfm_init();
+#ifdef MVS64_WP_REVIVE
+	/* Transient-stall hardening: a runtime dead-latch (RSP >50ms behind at
+	 * a blocking collect — e.g. RDP/RDRAM contention bursts on real
+	 * hardware) is retried after a backoff instead of writing the offload
+	 * off for the whole session. Gates: the disable transition must have
+	 * run (state adopted back to the CPU: !rspwp_seeded), the death must
+	 * not be structural, and the attempt budget must remain — a genuinely
+	 * wedged RSP re-pays one 50ms timeout per attempt, bounded to 6
+	 * attempts at 1s..16s doubling backoff (ym_off_died() restores the
+	 * budget when a death comes >30s after the last revive, i.e. a fresh
+	 * incident rather than revival thrash). Reviving is the hatch-resync
+	 * cycle: clear the latches and the next chunk reseeds via rspwp_seed
+	 * from the CPU state the C fallback kept authoritative. wp_hatch (a
+	 * permanent latch upstream: SSG-EG enable / pack overflow, both
+	 * usually transient states of the music driver) revives on the same
+	 * backoff — safe because the pack check re-trips it within the same
+	 * chunk if the exclusion is still live (cost: one pack attempt). */
+	if ((rspfm_dead || rspwp_dead2 || rspa_dead || wp_hatch)
+			&& !ym_off_structural
+			&& !rspwp_seeded && ym_off_revives < 6
+			&& TICKS_DISTANCE(ym_off_dead_tick, TICKS_READ())
+				> (s32) TICKS_FROM_MS(ym_off_backoff_ms)) {
+		rspfm_dead = 0;
+		rspwp_dead2 = 0;
+		rspa_dead = 0;
+		wp_hatch = 0;
+		ym_off_revives++;
+		ym_off_revive_tick = TICKS_READ();
+		if (ym_off_backoff_ms < 16000)
+			ym_off_backoff_ms <<= 1;
+		debugf("[RSPWP] revive %lu (next backoff %lums)\n",
+				(unsigned long) ym_off_revives,
+				(unsigned long) ym_off_backoff_ms);
+	}
+#endif
 	if (rspfm_dead || rspwp_dead2 || wp_hatch) {
 		if (rspwp_seeded) {
 			YM2610_wp_finish();
@@ -4513,6 +4593,44 @@ static int rspwp_ok(FM_CH **cch) {
 }
 #endif /* MVS64_RSPWP */
 #endif /* N64 && MVS64_RSPFM */
+
+#if defined(N64) && defined(MVS64_RSPWP) && defined(MVS64_WP_DEATHTEST)
+/* Test hook (emulator gate for MVS64_WP_REVIVE): fake a runtime dead-latch
+ * as if a blocking collect had timed out, so the revive cycle can be
+ * exercised deterministically in ares without a real RSP stall. */
+void YM2610_offload_testkill(void) {
+	rspwp_dead2 = 1;
+	ym_off_died();
+	debugf("[RSPWP] DEATHTEST: forced dead-latch\n");
+}
+#endif
+
+/* Offload-health snapshot for the platform OSD/telemetry (SNDOSD builds):
+ * bit0 = ADPCM dead-latch, bit1 = whole-pump dead-latch, bit2 = FM
+ * dead-latch, bit3 = structural (never revivable). Zero when healthy or
+ * when the offloads are compiled out. */
+u32 YM2610_offload_flags(void) {
+	u32 f = 0;
+#if defined(N64) && defined(MVS64_RSPADPCM)
+	if (rspa_dead)
+		f |= 1;
+#ifdef MVS64_RSPWP
+	if (rspwp_dead2)
+		f |= 2;
+#endif
+#endif
+#if defined(N64) && defined(MVS64_RSPFM)
+	if (rspfm_dead)
+		f |= 4;
+#endif
+	if (ym_off_structural)
+		f |= 8;
+#if defined(N64) && defined(MVS64_RSPWP)
+	if (wp_hatch)
+		f |= 16;
+#endif
+	return f;
+}
 
 /*********************************************************************************************/
 
