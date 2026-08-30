@@ -1,5 +1,56 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 SESSION 2026-08-30 — TRACK C COMPLETE; walk-dyn-gate + B4 killed by data
+
+Context: user reports the sndfix build has had NO sound loss on real
+hardware (extended play) — revive validated; lows ~30fps are the pain.
+Re-baseline (PERFCOUNT+DET+AUTOINPUT, 480s): modal 35.0, heavy 33.6/32.3;
+snd 62-66% is the largest share in every bucket, m68k 58-65, draw 33->91
+scaling with density. New [YMPROF] split (in-fight): kick/pack ~60,
+SSG ~59, mix+collect ~61, eg ~12, adpcm ~3 ms/s.
+
+Landed (one gated commit each):
+- **C3 banking-copy elision** (9981b76): WP chunks accumulate SSG/ADPCM/
+  deltaT partials straight into the pend slot (ax_l/ax_r target pointers);
+  pass-4 copy gone. Gates: WAV IDENTICAL; RSPWP_VERIFY 61,440 chunks 0 bad.
+- **C4 emit-copy elision** (4c8607d): non-WP chunks pack directly into the
+  staging span; emit()'s play_buffer->stage copy deleted under RSPWP.
+  Gates: WAV IDENTICAL; RSPWP_VERIFY 59,392 chunks 0 bad; WP_DEATHTEST run
+  (no revive compiled) played the whole post-death half through the new
+  fallback pack path — rms healthy, 0 underruns.
+- **MVS64_WP_REVIVE default-ON** (5dde585): hardware-validated by the user;
+  WP_REVIVE_OFF=1 to disable.
+- **C5 SSG chunk batching** (03bd2d7): SSG_CALC_N, state hoisted to locals,
+  bit-exact (s8 count_env wrap + unsigned mix promotion preserved).
+  Gates: WAV IDENTICAL. Guest-tick verdict vs pre-C3 (same instr.):
+  ssgms 58.6->43.5 (-26%), mixms 59.3->49.1 (-17%), z80ms 317->300,
+  genms -23ms/s ≈ -0.8ms/frame for C3+C4+C5. Cross-binary fps inside
+  layout noise at this size — guest-tick counters are the verdict channel.
+
+Killed / repriced by data (do not retread):
+- **B4 single-site computed-goto**: exec_opcode ALREADY compiles to 2
+  indirect-jr sites (no per-case duplication) — no fat to trim.
+- **Walk dynamic heavy-scene gating** (the track-D close-out idea): the
+  archived SAME-BINARY twin A/B (ares-walkON/OFF-480) reads heavy buckets
+  at only +0.1..+0.2 (the +0.7..1.0 was the older protocol), modal -1.3.
+  A density gate would buy ~nothing. Idea dead unless walk economics
+  change again (e.g. batch-consume world).
+- **B2/B3 (Z80 loop fusion / hot-cold)**: B1's measured lesson stands —
+  call overhead isn't the cost; per-step loop overhead is ~10% best case
+  and the snap logic is semantic. Low EV; not worth gated increments.
+- **B5 uop cache honest reprice**: phase-1 (2B records, prefix-collapse
+  only, operands still via callback) saves ~10-20 of ~300 host cyc/step
+  → +0.3..+0.5 fps, NOT +1..+1.5; the bigger cut needs operand-direct
+  handler variants (icache-risk surgery). Still the only structural Z80
+  lever left. Next session's candidate — design against the inline-bus
+  postmortem (sound_neogeo.c:256).
+
+State after this session: snd's YM half is trimmed ~9%; Z80 (~300ms/s
+guest) is now clearly the dominant snd cost; m68k 58-65% remains the
+biggest overall bucket with only the dynarec ladder open against it;
+dense-scene draw remains hardware-gated (Phase 3 DPC verdict STILL
+PENDING the user's flashcart A/B: dpcosd vs dpcosd+ROTA_OFF builds).
+
 ## 🔥 THE WALL-CHANNEL LAW — frame-377 fully mechanized (2026-08-08, 3ff9dc7)
 
 The last unexplained divergence class is closed. A clean dynarec-vs-
