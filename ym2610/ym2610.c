@@ -892,25 +892,56 @@ u32 ym_off_deaths, ym_off_revives;
 int ym_off_structural;
 #if defined(N64) && (defined(MVS64_RSPADPCM) || defined(MVS64_RSPFM))
 #include <libdragon.h>            /* TICKS_* (idempotent re-include below) */
-static u32 ym_off_dead_tick;      /* TICKS_READ() at the latest death/hatch */
 #ifdef MVS64_WP_REVIVE
-static u32 ym_off_revive_tick;    /* TICKS_READ() at the latest revive */
 static u32 ym_off_backoff_ms = 1000;
-#endif
-static void ym_off_died(void) {
+static u32 ym_off_now_ms;         /* wrap-free monotonic ms, see ym_off_ms() */
+static u32 ym_off_ms_last_tick;
+static u32 ym_off_ms_frac;
+static u32 ym_off_dead_ms;        /* ym_off_ms() at the latest death/hatch */
+static u32 ym_off_revive_ms;      /* ym_off_ms() at the latest revive */
+static u32 ym_off_burst;          /* revives in the CURRENT incident window
+                                   * (the 6-attempt budget); ym_off_revives
+                                   * stays a lifetime total for telemetry */
+/* Monotonic millisecond clock for the revive bookkeeping. TICKS_DISTANCE's
+ * signed range is only ~±45.8s, so the 30s/60s horizons below measured on
+ * raw tick anchors oscillate after wrap (part of the 2026-08-30 permanent
+ * sound-loss postmortem). This clock accumulates small per-call deltas
+ * instead; a gap longer than 1s between calls (silent spans don't reach
+ * the callers) is clamped, so the clock only ever runs SLOW, which merely
+ * lengthens backoffs — the safe direction. */
+static u32 ym_off_ms(void) {
 	u32 now = TICKS_READ();
-#ifdef MVS64_WP_REVIVE
-	/* A death long after the last revive is a fresh incident, not revival
-	 * thrash: restore the revival budget. (TICKS wraps ~91s, so a very old
-	 * revive tick can misread — worst case the budget stays reduced or
-	 * resets early; both are benign.) */
-	if (ym_off_revives &&
-	    TICKS_DISTANCE(ym_off_revive_tick, now) > (s32) TICKS_FROM_MS(30000)) {
-		ym_off_revives = 0;
+	s32 d = TICKS_DISTANCE(ym_off_ms_last_tick, now);
+	ym_off_ms_last_tick = now;
+	if (d < 0)
+		d = 0;
+	if (d > (s32) TICKS_FROM_MS(1000))
+		d = (s32) TICKS_FROM_MS(1000);
+	ym_off_ms_frac += (u32) d;
+	ym_off_now_ms += ym_off_ms_frac / (TICKS_PER_SECOND / 1000);
+	ym_off_ms_frac %= (TICKS_PER_SECOND / 1000);
+	return ym_off_now_ms;
+}
+/* Shared incident bookkeeping for deaths AND hatches. A fresh incident
+ * >30s after the last revive restores the attempt budget (thrash inside
+ * 30s does not). Hatches going through here is load-bearing: the 08-30
+ * permanent-loss trap was hatch sites only re-anchoring the backoff, so
+ * a recurring attract-music hatch burned the 6-attempt budget with no
+ * restore path, and the exhausted state was permanent (dead paths never
+ * die again, so ym_off_died's restore could never fire). */
+static void ym_off_incident(void) {
+	u32 ms = ym_off_ms();
+	if (ym_off_burst && (u32) (ms - ym_off_revive_ms) > 30000u) {
+		ym_off_burst = 0;
 		ym_off_backoff_ms = 1000;
 	}
+	ym_off_dead_ms = ms;
+}
 #endif
-	ym_off_dead_tick = now;
+static void ym_off_died(void) {
+#ifdef MVS64_WP_REVIVE
+	ym_off_incident();
+#endif
 	ym_off_deaths++;
 }
 #endif
@@ -1980,7 +2011,7 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 				wp_hatch_count++;
 			wp_hatch = 1;
 #ifdef MVS64_WP_REVIVE
-			ym_off_dead_tick = TICKS_READ();   /* backoff anchor */
+			ym_off_incident();   /* backoff anchor + budget-restore check */
 #endif
 		}
 #endif
@@ -4632,7 +4663,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 			wp_hatch = 1;
 			rspwp_pack_hatches++;
 #ifdef MVS64_WP_REVIVE
-			ym_off_dead_tick = TICKS_READ();   /* backoff anchor */
+			ym_off_incident();   /* backoff anchor + budget-restore check */
 #endif
 			return 0;
 		}
@@ -4690,34 +4721,47 @@ static int rspwp_ok(FM_CH **cch) {
 	 * a blocking collect — e.g. RDP/RDRAM contention bursts on real
 	 * hardware) is retried after a backoff instead of writing the offload
 	 * off for the whole session. Gates: the disable transition must have
-	 * run (state adopted back to the CPU: !rspwp_seeded), the death must
-	 * not be structural, and the attempt budget must remain — a genuinely
-	 * wedged RSP re-pays one 50ms timeout per attempt, bounded to 6
-	 * attempts at 1s..16s doubling backoff (ym_off_died() restores the
-	 * budget when a death comes >30s after the last revive, i.e. a fresh
-	 * incident rather than revival thrash). Reviving is the hatch-resync
-	 * cycle: clear the latches and the next chunk reseeds via rspwp_seed
-	 * from the CPU state the C fallback kept authoritative. wp_hatch (a
-	 * permanent latch upstream: SSG-EG enable / pack overflow, both
-	 * usually transient states of the music driver) revives on the same
-	 * backoff — safe because the pack check re-trips it within the same
-	 * chunk if the exclusion is still live (cost: one pack attempt). */
-	if ((rspfm_dead || rspwp_dead2 || rspa_dead || wp_hatch)
-			&& !ym_off_structural
-			&& !rspwp_seeded && ym_off_revives < 6
-			&& TICKS_DISTANCE(ym_off_dead_tick, TICKS_READ())
-				> (s32) TICKS_FROM_MS(ym_off_backoff_ms)) {
-		rspfm_dead = 0;
-		rspwp_dead2 = 0;
-		rspa_dead = 0;
-		wp_hatch = 0;
-		ym_off_revives++;
-		ym_off_revive_tick = TICKS_READ();
-		if (ym_off_backoff_ms < 16000)
-			ym_off_backoff_ms <<= 1;
-		debugf("[RSPWP] revive %lu (next backoff %lums)\n",
-				(unsigned long) ym_off_revives,
-				(unsigned long) ym_off_backoff_ms);
+	 * run (state adopted back to the CPU: !rspwp_seeded) and the death
+	 * must not be structural. Budget: 6 attempts per incident at 1s..16s
+	 * doubling backoff; the budget restores after 30s of SUSTAINED HEALTH
+	 * following a revive (below) or at a fresh incident >30s after the
+	 * last revive (ym_off_incident). An exhausted budget degrades to a
+	 * 60s PAROLE retry instead of permanent death — a genuinely wedged
+	 * RSP then costs one 50ms timeout per minute, a live hatch exclusion
+	 * one pack attempt per minute; nothing short of ym_off_structural is
+	 * permanent (the 2026-08-30 attract-idle permanent-sound-loss fix).
+	 * Reviving is the hatch-resync cycle: clear the latches and the next
+	 * chunk reseeds via rspwp_seed from the CPU state the C fallback kept
+	 * authoritative. wp_hatch (SSG-EG enable / pack overflow) revives on
+	 * the same backoff — safe because the pack check re-trips it within
+	 * the same chunk if the exclusion is still live. */
+	{
+		const int off_dead =
+				rspfm_dead || rspwp_dead2 || rspa_dead || wp_hatch;
+		const u32 ms = ym_off_ms();
+		if (!off_dead && ym_off_burst
+				&& (u32) (ms - ym_off_revive_ms) > 30000u) {
+			/* 30s of health after a revive: the incident is over */
+			ym_off_burst = 0;
+			ym_off_backoff_ms = 1000;
+		}
+		if (off_dead && !ym_off_structural && !rspwp_seeded
+				&& (ym_off_burst < 6
+					|| (u32) (ms - ym_off_dead_ms) > 60000u)
+				&& (u32) (ms - ym_off_dead_ms) > ym_off_backoff_ms) {
+			rspfm_dead = 0;
+			rspwp_dead2 = 0;
+			rspa_dead = 0;
+			wp_hatch = 0;
+			ym_off_burst++;
+			ym_off_revives++;
+			ym_off_revive_ms = ms;
+			if (ym_off_backoff_ms < 16000)
+				ym_off_backoff_ms <<= 1;
+			debugf("[RSPWP] revive %lu (next backoff %lums)\n",
+					(unsigned long) ym_off_revives,
+					(unsigned long) ym_off_backoff_ms);
+		}
 	}
 #endif
 	if (rspfm_dead || rspwp_dead2 || wp_hatch) {

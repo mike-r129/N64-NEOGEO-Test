@@ -280,14 +280,19 @@ void plat_audio_pump(void) {
     if (!audio_enabled) return;
 
 #if defined(MVS64_RSPWP) && defined(MVS64_WP_DEATHTEST)
-    // Revive-cycle gate rig: force a dead-latch during the attract music
-    // (~pass 3600 ≈ 60s at speed) and again later, so an ares run shows
-    // death -> C fallback -> [RSPWP] revive -> offload healthy (off=0).
+    // Revive-cycle gate rig, thrash edition (2026-08-30 permanent-loss
+    // postmortem): 8 forced dead-latches ~10s apart starting at pass 3600
+    // (~60s at speed), i.e. every kill lands <30s after the previous
+    // revive. The old bookkeeping exhausted its 6-attempt budget with no
+    // restore path and stayed dead for the session; the fixed bookkeeping
+    // must ride the thrash (parole retries) and, once the kills stop,
+    // return to sustained health (off=0, budget restored) by run end.
     {
         extern void YM2610_offload_testkill(void);
         static int dt_passes;
         dt_passes++;
-        if (dt_passes == 3600 || dt_passes == 5400)
+        if (dt_passes >= 3600 && dt_passes <= 7800
+            && (dt_passes - 3600) % 600 == 0)
             YM2610_offload_testkill();
     }
 #endif
