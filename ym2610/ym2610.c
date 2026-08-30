@@ -5029,6 +5029,10 @@ void YM2610Update_stream(int length) {
 			const int n = length < YM_CHUNK ? length : YM_CHUNK;
 			u8 lfo_am[YM_CHUNK], lfo_pm[YM_CHUNK], egt[YM_CHUNK];
 			s32 acc_l[YM_CHUNK], acc_r[YM_CHUNK], dtb[YM_CHUNK];
+			/* accumulation target for passes 1-3: the stack arrays, or (WP
+			 * chunks, track C step 3) the pending slot's banked arrays
+			 * directly, eliding the pass-4 banking copy */
+			s32 *ax_l = acc_l, *ax_r = acc_r;
 			const u32 eg_base = OPN->eg_cnt;
 #if defined(N64) && defined(MVS64_RSPADPCM) && !defined(MVS64_RSPADPCM_VERIFY)
 			/* MVS64: kick the RSP ADPCM decode for this chunk NOW so it runs
@@ -5080,8 +5084,6 @@ void YM2610Update_stream(int length) {
 				}
 				egt[i] = (u8) t;   /* <= 3 even at 8kHz output */
 				OPN->eg_cnt += t;
-				acc_l[i] = 0;
-				acc_r[i] = 0;
 			}
 			YMPROF_A(0, a);
 
@@ -5195,6 +5197,24 @@ void YM2610Update_stream(int length) {
 #endif /* MVS64_RSPWP */
 #endif
 
+#if defined(N64) && defined(MVS64_RSPFM) && defined(MVS64_RSPWP)
+			/* Track C step 3 (banking-copy elision): WP chunks accumulate
+			 * the SSG/ADPCM/deltaT partial straight into the pending slot's
+			 * banked arrays. Safe: the kick owns the slot exclusively until
+			 * ship (ring-full is resolved inside the kick), and the
+			 * opportunistic collects only ever touch SHIPPED chunks. */
+			if (wp_this) {
+				rspwp_pend_t * const pdax =
+						&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
+				ax_l = pdax->acc_l;
+				ax_r = pdax->acc_r;
+			}
+#endif
+			for (i = 0; i < n; i++) {
+				ax_l[i] = 0;
+				ax_r[i] = 0;
+			}
+
 			/* pass 1: FM — each channel replays the same EG tick schedule
 			 * with a private counter, then synthesizes its sample */
 			YMPROF_T(b);
@@ -5203,7 +5223,7 @@ void YM2610Update_stream(int length) {
 				const u32 panl = OPN->pan[fmn[j] * 2 + 0];
 				const u32 panr = OPN->pan[fmn[j] * 2 + 1];
 				u32 cnt = eg_base;
-				s32 *fm_al = acc_l, *fm_ar = acc_r;
+				s32 *fm_al = ax_l, *fm_ar = ax_r;
 
 #if defined(N64) && defined(MVS64_RSPFM)
 #ifdef MVS64_RSPWP
@@ -5299,8 +5319,8 @@ void YM2610Update_stream(int length) {
 			YMPROF_T(c);
 			for (i = 0; i < n; i++) {
 				outn = SSG_CALC(outn);
-				acc_l[i] += out_ssg;
-				acc_r[i] += out_ssg;
+				ax_l[i] += out_ssg;
+				ax_r[i] += out_ssg;
 			}
 			YMPROF_A(2, c);
 
@@ -5330,7 +5350,7 @@ void YM2610Update_stream(int length) {
 						refr[i] = 0;
 					}
 					/* channels NOT on the RSP decode straight into the chunk */
-					rspa_c_decode(n, (u8) ~ramask, !rb, acc_l, acc_r, dtb);
+					rspa_c_decode(n, (u8) ~ramask, !rb, ax_l, ax_r, dtb);
 					arr0 = YM2610.adpcm_arrivedEndAddress;
 					/* RSP-covered channels decode into the reference arrays,
 					 * deltaT folded exactly like the ucode folds it */
@@ -5348,8 +5368,8 @@ void YM2610Update_stream(int length) {
 					rspa_c_decode(n, ramask, 0, refl, refr, NULL);
 					arr1 = YM2610.adpcm_arrivedEndAddress;
 					for (i = 0; i < n; i++) {
-						acc_l[i] += refl[i];
-						acc_r[i] += refr[i];
+						ax_l[i] += refl[i];
+						ax_r[i] += refr[i];
 					}
 					if (rsp_any) {
 						rspa_chunks++;
@@ -5380,15 +5400,15 @@ void YM2610Update_stream(int length) {
 						dtb[i] = (dt->portstate & 0x80)
 								? OPNB_ADPCMB_CALC(dt) : 0;
 				}
-				rspa_c_decode(n, (u8) ~ramask, 0, acc_l, acc_r, NULL);
+				rspa_c_decode(n, (u8) ~ramask, 0, ax_l, ax_r, NULL);
 #ifndef MVS64_RSPWP
 				if (rsp_any) {
 					if (rspa_wait()) {
-						rspa_adopt(n, acc_l, acc_r);
+						rspa_adopt(n, ax_l, ax_r);
 					} else {
 						/* timeout: no state was adopted, so the C decoders
 						 * can still run this chunk from the pre-RSP state */
-						rspa_c_decode(n, ramask, rb, acc_l, acc_r, dtb);
+						rspa_c_decode(n, ramask, rb, ax_l, ax_r, dtb);
 					}
 				}
 #endif
@@ -5419,8 +5439,8 @@ void YM2610Update_stream(int length) {
 					rspa_c_decode(n, ramask, 0, pda->aref_l, pda->aref_r,
 							NULL);
 					for (i = 0; i < n; i++) {
-						acc_l[i] += pda->aref_l[i];
-						acc_r[i] += pda->aref_r[i];
+						ax_l[i] += pda->aref_l[i];
+						ax_r[i] += pda->aref_r[i];
 					}
 					pda->aref_amask = ramask;
 					pda->aref_b = rb;
@@ -5454,9 +5474,9 @@ void YM2610Update_stream(int length) {
 					for (i = 0; i < n && ch->flag; i++) {
 						const s32 o = OPNB_ADPCMA_calc_chan(ch);
 						if (al)
-							acc_l[i] += o;
+							ax_l[i] += o;
 						if (ar)
-							acc_r[i] += o;
+							ax_r[i] += o;
 					}
 				}
 			}
@@ -5473,8 +5493,8 @@ void YM2610Update_stream(int length) {
 				else
 					rspfm_badchunks++;
 				for (i = 0; i < n; i++) {
-					acc_l[i] += rspfm_refl[i];
-					acc_r[i] += rspfm_refr[i];
+					ax_l[i] += rspfm_refl[i];
+					ax_r[i] += rspfm_refr[i];
 				}
 				if ((rspfm_chunks & 1023) == 0)
 					debugf("[RSPFM] chunks=%lu badchunks=%lu badsamp=%lu "
@@ -5486,8 +5506,8 @@ void YM2610Update_stream(int length) {
 #else
 				if (rspfm_wait()) {
 					for (i = 0; i < n; i++) {
-						acc_l[i] += rspfm_ob.l[i];
-						acc_r[i] += rspfm_ob.r[i];
+						ax_l[i] += rspfm_ob.l[i];
+						ax_r[i] += rspfm_ob.r[i];
 					}
 					for (j = 0; j < 4; j++)
 						if (rspfm_pb.chmask & (1 << j))
@@ -5519,8 +5539,8 @@ void YM2610Update_stream(int length) {
 								o = chan_calc_stream(OPN, CH, lfo_am[i],
 										lfo_pm[i], algo, i_memc, i_om1,
 										i_om2, i_oc1) >> 1;
-								acc_l[i] += o & (s32) panl;
-								acc_r[i] += o & (s32) panr;
+								ax_l[i] += o & (s32) panl;
+								ax_r[i] += o & (s32) panr;
 							}
 						}
 					}
@@ -5540,9 +5560,11 @@ void YM2610Update_stream(int length) {
 				 * at collect, always before the pump returns). */
 				rspwp_pend_t * const pd =
 						&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
+				/* passes 1-3 accumulated into pd->acc_* directly (ax_l/ax_r
+				 * above); only the deltaT fold remains here */
 				for (i = 0; i < n; i++) {
-					pd->acc_l[i] = acc_l[i] + (dtl ? (dtb[i] >> 9) : 0);
-					pd->acc_r[i] = acc_r[i] + (dtr ? (dtb[i] >> 9) : 0);
+					pd->acc_l[i] += (dtl ? (dtb[i] >> 9) : 0);
+					pd->acc_r[i] += (dtr ? (dtb[i] >> 9) : 0);
 				}
 				pl += 2 * n;
 #ifdef MVS64_RSPWP_VERIFY
@@ -5568,8 +5590,8 @@ void YM2610Update_stream(int length) {
 			} else
 #endif
 			for (i = 0; i < n; i++) {
-				lt = acc_l[i];
-				rt = acc_r[i];
+				lt = ax_l[i];
+				rt = ax_r[i];
 				if (dtl)
 					lt += dtb[i] >> 9;
 				if (dtr)
