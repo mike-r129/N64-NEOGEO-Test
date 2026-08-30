@@ -5589,6 +5589,31 @@ void YM2610Update_stream(int length) {
 #endif
 			} else
 #endif
+#if defined(N64) && defined(MVS64_RSPWP)
+			if (ym2610_wp_dest_base) {
+				/* Track C step 4 (emit-copy elision): non-WP chunks pack
+				 * straight into the staging span with the same big-endian
+				 * u32 pack the WP collect uses; emit()'s play_buffer copy
+				 * is gone on this path. */
+				u32 * const dstw = (u32 *) ym2610_wp_dest_base + wp_off;
+				for (i = 0; i < n; i++) {
+					lt = ax_l[i];
+					rt = ax_r[i];
+					if (dtl)
+						lt += dtb[i] >> 9;
+					if (dtr)
+						rt += dtb[i] >> 9;
+
+					lt <<= 1;
+					rt <<= 1;
+
+					Limit(lt, MAXOUT, MINOUT);
+					Limit(rt, MAXOUT, MINOUT);
+					dstw[i] = ((u32) (u16) lt << 16) | (u16) (s16) rt;
+				}
+				pl += 2 * n;
+			} else
+#endif
 			for (i = 0; i < n; i++) {
 				lt = ax_l[i];
 				rt = ax_r[i];

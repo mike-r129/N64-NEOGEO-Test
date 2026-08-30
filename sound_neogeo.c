@@ -480,9 +480,9 @@ static void emit(int16_t *out, int from, int count) {
 #endif
 #if defined(N64) && defined(MVS64_RSPWP)
 	/* Whole-pump deferred FM: deferred chunks write their final samples
-	 * straight into this span at collect time (the play_buffer copy below
-	 * carries garbage for those ranges until then; everything is complete
-	 * before sound_gen_samples returns the buffer — see YM2610_wp_finish). */
+	 * straight into this span at collect time, and non-WP chunks pack
+	 * theirs directly in pass 4 (track C step 4); everything is complete
+	 * before sound_gen_samples returns the buffer — see YM2610_wp_finish. */
 	ym2610_wp_dest_base = out + from * 2;
 	YM2610Update_stream(count);
 	ym2610_wp_dest_base = NULL;
@@ -490,6 +490,13 @@ static void emit(int16_t *out, int from, int count) {
 	YM2610Update_stream(count);
 #endif
 #ifdef N64
+#ifdef MVS64_RSPWP
+	/* Track C step 4 (emit-copy elision): Update_stream packed the non-WP
+	 * chunks straight into this span (same u32 big-endian pack the collect
+	 * uses); WP chunks land at collect. play_buffer is no longer read here
+	 * (the snd_dbg [SND] s0 probe below goes stale on this path). */
+	YM2610_wp_mark_emitted();
+#else
 	// `out` is an UNCACHED AI buffer: every store is a separate RDRAM
 	// transaction, so pack each stereo frame into ONE 32-bit store (big-endian:
 	// high half = left = out[0]) — halves the uncached traffic vs two 16-bit
@@ -499,10 +506,6 @@ static void emit(int16_t *out, int from, int count) {
 		for (int i = 0; i < count; i++)
 			dst[i] = ((uint32_t)play_buffer[i * 2 + 0] << 16) | play_buffer[i * 2 + 1];
 	}
-#ifdef MVS64_RSPWP
-	/* Only now may this span's deferred chunks land their final samples
-	 * (collecting earlier would be clobbered by the copy above). */
-	YM2610_wp_mark_emitted();
 #endif
 #else
 	for (int i = 0; i < count; i++) {
