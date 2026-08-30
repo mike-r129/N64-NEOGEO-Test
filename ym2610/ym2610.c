@@ -2376,6 +2376,149 @@ static int SSG_CALC(int outn) {
 	return outn;
 }
 
+/* MVS64 (track C step 5): SSG chunk batching — bit-exact transliteration of
+ * SSG_CALC (above, kept as the reference) over nsmp samples with the SSG
+ * dynamic state hoisted into locals, accumulating straight into the chunk.
+ * Constants within a chunk (register writes only happen between update
+ * calls): period[3], PeriodN, PeriodE, envelope[3], hold, alternate,
+ * vol_table, regs[SSG_ENABLE]. Exactness notes: count_env stays s8 (its
+ * wraparound in the envelope catch-up loop is guest-visible), and the
+ * volume mix keeps the reference's int*u32 unsigned promotion. */
+static int SSG_CALC_N(int outn, int nsmp, s32 *al, s32 *ar) {
+	int cnt0 = SSG.count[0], cnt1 = SSG.count[1], cnt2 = SSG.count[2];
+	const int per0 = SSG.period[0], per1 = SSG.period[1],
+			per2 = SSG.period[2];
+	int out0 = SSG.output[0], out1 = SSG.output[1], out2 = SSG.output[2];
+	u32 v0 = SSG.vol[0], v1 = SSG.vol[1], v2 = SSG.vol[2];
+	int cntn = SSG.CountN, rng = SSG.RNG;
+	const int pern = SSG.PeriodN;
+	int cnte = SSG.CountE;
+	s8 cenv = SSG.count_env;
+	int holding = SSG.holding, attack = SSG.attack;
+	u32 vole = SSG.VolE;
+	const int pere = SSG.PeriodE;
+	const int hold = SSG.hold, alternate = SSG.alternate;
+	const int env0 = SSG.envelope[0], env1 = SSG.envelope[1],
+			env2 = SSG.envelope[2];
+	const int enable = YM2610.regs[SSG_ENABLE];
+	int smp;
+
+	for (smp = 0; smp < nsmp; smp++) {
+		int vol0 = 0, vol1 = 0, vol2 = 0;
+		int left = SSG_STEP;
+
+		do {
+			const int nextevent = (cntn < left) ? cntn : left;
+
+			/* per-channel body identical to the reference's ch loop */
+#define SSG_TONE(CH, cnt, per, out, vol)                                   \
+			if (outn & (0x08 << CH)) {                                     \
+				if (out)                                                   \
+					vol += cnt;                                            \
+				cnt -= nextevent;                                          \
+				while (cnt <= 0) {                                         \
+					cnt += per;                                            \
+					if (cnt > 0) {                                         \
+						out ^= 1;                                          \
+						if (out)                                           \
+							vol += per;                                    \
+						break;                                             \
+					}                                                      \
+					cnt += per;                                            \
+					vol += per;                                            \
+				}                                                          \
+				if (out)                                                   \
+					vol -= cnt;                                            \
+			} else {                                                       \
+				cnt -= nextevent;                                          \
+				while (cnt <= 0) {                                         \
+					cnt += per;                                            \
+					if (cnt > 0) {                                         \
+						out ^= 1;                                          \
+						break;                                             \
+					}                                                      \
+					cnt += per;                                            \
+				}                                                          \
+			}
+			SSG_TONE(0, cnt0, per0, out0, vol0)
+			SSG_TONE(1, cnt1, per1, out1, vol1)
+			SSG_TONE(2, cnt2, per2, out2, vol2)
+#undef SSG_TONE
+
+			cntn -= nextevent;
+			if (cntn <= 0) {
+				if ((rng + 1) & 2) {
+					SSG.OutputN = ~SSG.OutputN;
+					outn = (SSG.OutputN | enable);
+				}
+				if (rng & 1)
+					rng ^= 0x24000;
+				rng >>= 1;
+				cntn += pern;
+			}
+
+			left -= nextevent;
+		} while (left > 0);
+
+		/* envelope */
+		if (holding == 0) {
+			cnte -= SSG_STEP;
+			if (cnte <= 0) {
+				do {
+					cenv--;
+					cnte += pere;
+				} while (cnte <= 0);
+
+				if (cenv < 0) {
+					if (hold) {
+						if (alternate)
+							attack ^= 0x1f;
+						holding = 1;
+						cenv = 0;
+					} else {
+						if (alternate && (cenv & 0x20))
+							attack ^= 0x1f;
+						cenv &= 0x1f;
+					}
+				}
+
+				vole = SSG.vol_table[cenv ^ attack];
+				if (env0)
+					v0 = vole;
+				if (env1)
+					v1 = vole;
+				if (env2)
+					v2 = vole;
+			}
+		}
+
+		{
+			const s32 o = (((vol0 * v0) + (vol1 * v1) + (vol2 * v2))
+					/ SSG_STEP) / 3;
+			al[smp] += o;
+			ar[smp] += o;
+		}
+	}
+
+	SSG.count[0] = cnt0;
+	SSG.count[1] = cnt1;
+	SSG.count[2] = cnt2;
+	SSG.output[0] = (u8) out0;
+	SSG.output[1] = (u8) out1;
+	SSG.output[2] = (u8) out2;
+	SSG.vol[0] = v0;
+	SSG.vol[1] = v1;
+	SSG.vol[2] = v2;
+	SSG.CountN = cntn;
+	SSG.RNG = rng;
+	SSG.CountE = cnte;
+	SSG.count_env = cenv;
+	SSG.holding = (u8) holding;
+	SSG.attack = (u8) attack;
+	SSG.VolE = vole;
+	return outn;
+}
+
 static void SSG_init_table(void) {
 	int i;
 	double out;
@@ -5315,13 +5458,9 @@ void YM2610Update_stream(int length) {
 			}
 			YMPROF_A(1, b);
 
-			/* pass 2: SSG */
+			/* pass 2: SSG (track C step 5: chunk-batched, state hoisted) */
 			YMPROF_T(c);
-			for (i = 0; i < n; i++) {
-				outn = SSG_CALC(outn);
-				ax_l[i] += out_ssg;
-				ax_r[i] += out_ssg;
-			}
+			outn = SSG_CALC_N(outn, n, ax_l, ax_r);
 			YMPROF_A(2, c);
 
 			/* pass 3: deltaT ADPCM + ADPCM-A (flag/portstate can only go
