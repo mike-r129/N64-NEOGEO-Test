@@ -6208,7 +6208,7 @@ STATE_LOAD( ym2610 )
 
 #endif /* SAVE_STATE */
 
-#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH)
+#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH) || defined(MVS64_SNDOSD)
 #include <stdio.h>
 // MVS64 diagnostic: one-line snapshot of every state element that can hold a
 // sustained tone, printed by sound_neogeo.c's [SNDRMS] telemetry (~1/s). Used

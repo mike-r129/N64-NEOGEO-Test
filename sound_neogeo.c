@@ -17,8 +17,11 @@
 // Audio-health telemetry. MVS64_AUTOINPUT (headless validation) implies it, but
 // MVS64_SNDHEALTH enables the [SNDRMS]/[AIPUMP] USB logs in a normal, human-
 // driven build too (no scripted input), so real-hardware behaviour can be read
-// off a flashcart USB capture while actually playing.
-#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH)
+// off a flashcart USB capture while actually playing. MVS64_SNDOSD must imply
+// it here too (2026-08-30: an OSD-only build wrote an SD log with no [SNDRMS]
+// lines — platform_n64.c's gate included SNDOSD but this one didn't, so the
+// one hardware post-mortem that needed z80pc/t=/steps didn't have them).
+#if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH) || defined(MVS64_SNDOSD)
 #define SND_HEALTH 1
 #endif
 
@@ -334,6 +337,12 @@ void sound_init(void) {
 	cpu.write_byte = z80_write;
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
+#ifdef MVS64_CYCWRAP_TEST
+	// Wrap-gate rig — see the twin block in sound_reset().
+	cpu.cyc = 0xFFFFFFFFul - 4000000ul * 120ul;
+	plat_log("[CYCWRAP] cyc parked at %08lx (wrap in ~120s of audio)\n",
+	         (unsigned long)cpu.cyc);
+#endif
 
 	// ADPCM sample source (v.rom, up to 7MB). samsho2 has no separate ADPCM-B
 	// ROM, so A and B share the same data (as on real NeoGeo). Resident when RAM
@@ -389,6 +398,15 @@ void sound_reset(void) {
 	cpu.write_byte = z80_write;
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
+#ifdef MVS64_CYCWRAP_TEST
+	// Gate rig for the 2^32 cycle-counter wrap (the 17.9-minute permanent
+	// silence): park cyc ~2 minutes of audio time before the wrap so a short
+	// ares run crosses it during attract music. Unfixed builds freeze the
+	// Z80 forever at the crossing; fixed builds play straight through.
+	cpu.cyc = 0xFFFFFFFFul - 4000000ul * 120ul;
+	plat_log("[CYCWRAP] cyc parked at %08lx (wrap in ~120s of audio)\n",
+	         (unsigned long)cpu.cyc);
+#endif
 	YM2610Reset();
 }
 
@@ -449,9 +467,16 @@ void sound_write_command(uint8_t cmd) {
 	// handler. Both runs are cycle-capped so a driver phase that parks with DI
 	// (the boot jingle's RAM wait loop) cannot stall the 68k exception handler;
 	// on cap we inject/return anyway, which is exactly the old behavior.
+	// NOTE on every cyc loop bound in this file: cpu.cyc is 32-bit on N64 and
+	// WRAPS after 2^32 Z80 cycles = 17.9 minutes of audio time. A magnitude
+	// compare (cyc < bound) fails closed at the wrap — bound overflows small,
+	// the loop never runs, and since stepping is the only thing that advances
+	// cyc the Z80 freezes FOREVER (2026-08-30 permanent-silence postmortem:
+	// both the hardware and ares deaths integrate to exactly 2^32 cycles).
+	// All bounds therefore use the wrap-safe signed-distance form.
 	if (!cpu.iff1 && !cpu.halted) {   // a DI+HALT park only an NMI can wake:
 		unsigned long cap = cpu.cyc + 1500;   // don't burn the cap stepping it
-		while (cpu.cyc < cap && !cpu.iff1 && !cpu.halted)
+		while ((long)(cap - cpu.cyc) > 0 && !cpu.iff1 && !cpu.halted)
 			z80_step(&cpu);
 #ifdef SND_HEALTH
 		if (!cpu.iff1) g_nmi_precap++;
@@ -460,7 +485,7 @@ void sound_write_command(uint8_t cmd) {
 	z80_gen_nmi(&cpu);
 	{
 		unsigned long cap = cpu.cyc + 8000;
-		while (cpu.cyc < cap && (cpu.nmi_pending || !cpu.iff1)) {
+		while ((long)(cap - cpu.cyc) > 0 && (cpu.nmi_pending || !cpu.iff1)) {
 			z80_service_level_irq();
 			z80_step(&cpu);
 		}
@@ -554,7 +579,7 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 	                                    // every compare is guarded by spin_armed)
 	int spin_armed = 0;                 // snapshot valid + no writes since it taken
 
-	while (cpu.cyc < frame_end) {
+	while ((long)(frame_end - cpu.cyc) > 0) {   // wrap-safe (see NMI note)
 		// Service any due FM timers first (re-arms them forward + raises IRQ).
 		// Wrap-safe signed compare: cpu.cyc is 32-bit on N64 and wraps at ~17min
 		// once it advances at the true ~4MHz rate (deltas here are tiny, <budget).
@@ -581,9 +606,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		uint32_t _zt0 = TICKS_READ();
 #endif
 #ifdef MVS64_Z80HIST
-		if (cpu.cyc < next) g_z80_segs++;
+		if ((long)(next - cpu.cyc) > 0) g_z80_segs++;
 #endif
-		while (cpu.cyc < next) {
+		while ((long)(next - cpu.cyc) > 0) {   // wrap-safe (see NMI note)
 			z80_service_level_irq();   // must precede the HALT check: a
 			                           // re-delivered tick wakes a halted CPU
 #ifndef MVS64_NOIDLESKIP
@@ -690,8 +715,12 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			// re-delivered (each one was a lost music tick before this fix);
 			// nmiw  = command NMIs delivered mid-handler (pre-run cap hit) /
 			//         handlers that outran the completion cap.
-			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu genms=%lu lost=%d t=%d%d irqre=%d nmiw=%d,%d\n",
-				rms, pk, cpu.pc, sound_code,
+			// sp/ha/if: Z80 stack pointer + halted + iff1 — the 2026-08-30
+			// silent-death forensics (a slow stack leak descending through
+			// the driver's RAM would show as sp marching down over minutes).
+			plat_log("[SNDRMS] rms=%d peak=%d z80pc=%04x sp=%04x hi=%d%d code=%02x steps=%lu skips=%d skipcyc=%lu z80ms=%lu ymms=%lu genms=%lu lost=%d t=%d%d irqre=%d nmiw=%d,%d\n",
+				rms, pk, cpu.pc, cpu.sp, cpu.halted ? 1 : 0,
+				cpu.iff1 ? 1 : 0, sound_code,
 				g_z80_steps, g_z80_skips, g_z80_skipcyc,
 				(unsigned long)(g_prof_z80t / (TICKS_PER_SECOND / 1000)),
 				(unsigned long)(g_prof_ymt / (TICKS_PER_SECOND / 1000)),
