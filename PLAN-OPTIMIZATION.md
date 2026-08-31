@@ -1,5 +1,24 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🔴 2026-08-30 evening — THE 17.9-MINUTE SOUND DEATH, SOLVED (cd0b72f)
+
+User's "sound eventually fails forever" (long HW sessions, all-green
+SNDOSD) was **cpu.cyc wrapping 2^32** (32-bit on N64 = 17.9 min of audio
+time): sound_gen_samples' loop bounds were magnitude compares, so at the
+wrap the step loop never runs again — and stepping is the only thing that
+advances cyc. Z80 frozen forever, NMIs unserviced (silent coin test),
+every downstream layer healthy. Proven: HW SD log AND the 90-min ares
+soak deaths both integrate to exactly 2^32 generated cycles; PC (64-bit
+long) sails past — WAV gates are STRUCTURALLY BLIND to N64-width wrap
+bugs. Fix: signed-distance loop bounds (5 sites). Gate: MVS64_CYCWRAP_TEST
+parks cyc 120s pre-wrap; control freezes on cue (steps=0 forever), fixed
+build plays through. Also: SNDOSD now implies SND_HEALTH everywhere
+(sndfix3's SD log was missing [SNDRMS]) and [SNDRMS] gained sp=/hi=
+forensics. Earlier same day: the revive-budget permanence fix (3570612)
+— real but a different, rarer class. Deliverables: sndfix4/release4.
+LAW: audio-time u32 counters never gate loops by magnitude; wrap-class
+bugs need the CYCWRAP rig, not PC gates.
+
 ## 📊 SESSION 2026-08-30 — TRACK C COMPLETE; walk-dyn-gate + B4 killed by data
 
 Context: user reports the sndfix build has had NO sound loss on real
