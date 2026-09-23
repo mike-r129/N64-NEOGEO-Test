@@ -58,6 +58,8 @@ uint32_t perf_dr_cache, perf_dr_rspq;
 uint32_t perf_dr_tiles, perf_dr_cells;
 uint32_t perf_dr_empty;   /* sprite tiles skipped as known-empty */
 uint32_t perf_dr_wwait;   /* RSP sprite walk: CPU time blocked in rspq_wait */
+uint32_t perf_walk_spr;   /* sprites that reach the tile loop (past all culls) */
+uint32_t perf_walk_iter;  /* tile-loop iterations, visible or not */
 // PLAN-DRAW-RDP Phase 0 decision counters ([PERF3] in emu.c):
 uint32_t perf_dr_recs;    /* records seen by consume (incl. empty-skipped) */
 uint32_t perf_dr_adjrep;  /* drawn records whose tnum == previous drawn */
@@ -188,6 +190,9 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 		// speedup, pixel-identical by construction); chain bookkeeping
 		// (sx += sw) already happened above.
 		if (sy >= 224 && sy + sh <= 512) continue;
+#ifdef DRAW_PERF
+		perf_walk_spr++;
+#endif
 
 		// debugf("[VIDEO] sprite snum:%d xc:%04x yc:%04x zc:%04x pos:%d,%d sh:%d chain:%d repeat:%d tmap:%04x:%04x\n", snum, xc, yc, zc, sx, sy, sh, (yc & 0x40), repeat_tiles, tmap[0], tmap[1]);
 
@@ -231,6 +236,9 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 			// Loop through the vertical sprite, tile by tile
 			while (y < maxy) {
+#ifdef DRAW_PERF
+				perf_walk_iter++;
+#endif
 				// Calculate the vertical size of this tile. This is
 				// a pixel-perfect formula using the magic table derived
 				// from the original NeoGeo L0 ROM.

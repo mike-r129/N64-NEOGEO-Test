@@ -779,7 +779,8 @@ int main(int argc, char *argv[]) {
 			extern uint32_t perf_dr_cache, perf_dr_rspq;
 			extern uint32_t perf_dr_tiles, perf_dr_cells, perf_dr_empty;
 			extern uint32_t perf_dr_wwait;
-			framef("[PERF2] begin=%lu spr=%lu (cache=%lu rspq=%lu) fix=%lu tiles=%lu cells=%lu empty=%lu wwait=%lu\n",
+			extern uint32_t perf_walk_spr, perf_walk_iter;
+			framef("[PERF2] begin=%lu spr=%lu (cache=%lu rspq=%lu) fix=%lu tiles=%lu cells=%lu empty=%lu wwait=%lu wspr=%lu witer=%lu\n",
 				(unsigned long)(perf_dr_begin / fb),
 				(unsigned long)(perf_dr_sprites / fb),
 				(unsigned long)(perf_dr_cache / fb),
@@ -788,11 +789,14 @@ int main(int argc, char *argv[]) {
 				(unsigned long)perf_dr_tiles,
 				(unsigned long)perf_dr_cells,
 				(unsigned long)perf_dr_empty,
-				(unsigned long)(perf_dr_wwait / fb));
+				(unsigned long)(perf_dr_wwait / fb),
+				(unsigned long)perf_walk_spr,
+				(unsigned long)perf_walk_iter);
 			perf_dr_begin = perf_dr_sprites = perf_dr_fix = 0;
 			perf_dr_cache = perf_dr_rspq = 0;
 			perf_dr_tiles = perf_dr_cells = perf_dr_empty = 0;
 			perf_dr_wwait = 0;
+			perf_walk_spr = perf_walk_iter = 0;
 
 			// PLAN-DRAW-RDP Phase 0 decision data ([PERF3]): drawn-stream
 			// run/repeat/palette/modal stats (video.c consume), cache-miss
