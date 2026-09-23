@@ -94,9 +94,9 @@ static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
 // Compile-gated (feature absent without MVS64_SPRBATCH) and UNGATED until
 // the BATCHDBG rig passes; runtime twin knob for layout-identical A/Bs.
 #ifdef MVS64_BATCH_DISABLE
-int mvs64_batch_enable = 0;
+int mvs64_batch_enable __attribute__((section(".data"))) = 0;
 #else
-int mvs64_batch_enable = 1;
+int mvs64_batch_enable __attribute__((section(".data"))) = 1;
 #endif
 // Chunk size caps the audio-latency window: a chunk is one uninterruptible
 // RSP command, and whole-pump audio commands queue behind it (snd% pays

@@ -427,9 +427,9 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 // walk verdict was a cross-binary measurement and is layout-confounded).
 // The kick site latches the decision per frame so collect always matches.
 #ifdef MVS64_WALK_DISABLE
-int mvs64_walk_enable = 0;
+int mvs64_walk_enable __attribute__((section(".data"))) = 0;
 #else
-int mvs64_walk_enable = 1;
+int mvs64_walk_enable __attribute__((section(".data"))) = 1;
 #endif
 static int walk_kicked_this_frame;
 #endif
