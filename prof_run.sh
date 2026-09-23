@@ -3,8 +3,8 @@ set -uo pipefail
 export N64_INST="$HOME/n64inst"
 export PATH="$N64_INST/bin:$PATH"
 export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
-cd /mnt/c/Users/Mike/Desktop/N64-NEOGEO/mvs64 || exit 1
-ROM=/mnt/c/Users/Mike/Desktop/N64-NEOGEO/samsho2.n64/
+cd /root/N64-NEOGEO/mvs64 || exit 1
+ROM=/root/N64-NEOGEO/samsho2.n64/
 FRAMES="${1:-3000}"
 SHOT="${2:-0}"
 INPUT="${3:-}"

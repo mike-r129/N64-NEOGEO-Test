@@ -2,7 +2,7 @@
 # Generate a compact input script (<256 events) that boots UniBIOS, inserts a
 # coin, starts, confirms a character, and then mashes attacks + movement during
 # the match. Kept economical so all events fit the emu's HL_MAX_EVENTS=256 cap.
-OUT=/mnt/c/Users/Mike/Desktop/N64-NEOGEO/input_prof.txt
+OUT=/root/N64-NEOGEO/input_prof.txt
 {
   echo "# boot -> coin -> start -> char select -> match (compact)"
   # two coins during title

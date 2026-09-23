@@ -133,7 +133,7 @@ def report(path,label,total_insns):
 
 if __name__=='__main__':
     import os
-    os.chdir('/mnt/c/Users/Mike/Desktop/N64-NEOGEO/mvs64')
+    os.chdir('/root/N64-NEOGEO/mvs64')
     # totals from summary
     S={}
     for line in open('prof_summary.txt'):

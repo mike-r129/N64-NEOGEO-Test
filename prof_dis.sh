@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /mnt/c/Users/Mike/Desktop/N64-NEOGEO || exit 1
+cd /root/N64-NEOGEO || exit 1
 D=mvs64/disgame
 echo "=== spin loop 0x1424-0x1440 ==="; $D 1424 1440
 echo "=== fill loop 0x3358-0x3360 ==="; $D 3358 3360
