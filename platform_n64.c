@@ -80,6 +80,13 @@ static int audio_enabled = 0;
 // SNDOSD overlay / [AIPUMP] telemetry can report it.
 static uint32_t rspwp_wedge_kicks;
 #endif
+// Highpri-wedge recoveries performed inside libdragon's RSP wait loops by the
+// vendored patch (patches/libdragon-rspq-highpri-wedge.patch). Weak so the
+// ROM still links against an unpatched toolchain (then it always reads 0).
+extern uint32_t __rspq_wedge_recoveries __attribute__((weak));
+static inline uint32_t rspq_wedge_recoveries(void) {
+    return &__rspq_wedge_recoveries ? __rspq_wedge_recoveries : 0;
+}
 // Consecutive pump passes that observed ISR silence-padding (the overload
 // governor input, see plat_audio_pump); file-scope for SNDOSD.
 static int underrun_streak;
@@ -508,13 +515,13 @@ void plat_audio_pump(void) {
 #else
             uint32_t kicks = 0;
 #endif
-            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d starved=%u lead=%u sndms=%.2f silent=%d off=%lx deaths=%lu revives=%lu kicks=%lu\n",
+            plat_log("[AIPUMP] pass=%d buffers/60=%d maxfill=%d underruns=%d discard=%d starved=%u lead=%u sndms=%.2f silent=%d off=%lx deaths=%lu revives=%lu kicks=%lu hpwedge=%lu\n",
                      pumps, total, maxf, deep, disc, starvedsum,
                      (uint32_t)(aring_wr - aring_rd),
                      (float)tacc * 1000.f / (float)TICKS_PER_SECOND / 60.f, sound_silent,
                      (unsigned long)YM2610_offload_flags(),
                      (unsigned long)ym_off_deaths, (unsigned long)ym_off_revives,
-                     (unsigned long)kicks);
+                     (unsigned long)kicks, (unsigned long)rspq_wedge_recoveries());
             total = 0; maxf = 0; tacc = 0; disc = 0; deep = 0; starvedsum = 0;
             // Commit the SD log to the card so it survives a power-off. FatFs only
             // writes the directory entry (file size) on close, so we close+reopen
@@ -757,10 +764,11 @@ void plat_endframe(void) {
 		//   F ff.f    emulated fps (wall clock, 60-frame window)
 		//   D wamh n  offload dead-latches (whole-pump, adpcm, fm, hatch)
 		//             + death count
-		//   K k R r   rspq lost-wakeup watchdog kicks + offload revives
+		//   K k R r W w  rspq lost-wakeup watchdog kicks + offload revives
+		//             + rspq highpri-wedge recoveries (libdragon patch)
 		//   S s n     silent-governor engaged + ISR silence-pad frames/sec
 		//   L n C n   staging-ring lead (frames) + AI consumption frames/sec
-		// Healthy @11kHz: D 0000 0, K 0 R 0, S 0 0, L ~2n, C ~11025.
+		// Healthy @11kHz: D 0000 0, K 0 R 0 W 0, S 0 0, L ~2n, C ~11025.
 		// Sound dead but C ~11025  -> delivery alive, generation muted/dead
 		// (look at D/S). C 0 -> the AI interrupt chain itself died.
 		static uint32_t tick0, rd0, pad0;
@@ -787,7 +795,9 @@ void plat_endframe(void) {
 				sprintf(l2, "D %u%u%u%u %lu", (unsigned)!!(off & 2), (unsigned)!!(off & 1),
 				        (unsigned)!!(off & 4), (unsigned)!!(off & 16),
 				        (unsigned long)ym_off_deaths);
-				sprintf(l3, "K %lu R %lu", (unsigned long)kicks, (unsigned long)ym_off_revives);
+				snprintf(l3, sizeof l3, "K %lu R %lu W %lu", (unsigned long)kicks,
+				        (unsigned long)ym_off_revives,
+				        (unsigned long)rspq_wedge_recoveries());
 				sprintf(l4, "S %d %lu", sound_silent ? 1 : 0, (unsigned long)strv);
 				sprintf(l5, "L %lu C %lu", (unsigned long)(aring_wr - aring_rd),
 				        (unsigned long)cons);
