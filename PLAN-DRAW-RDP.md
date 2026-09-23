@@ -276,9 +276,12 @@ fps flatline kill Phase 3 items — but do let a DPC busy-% flatline.
 5. **Pointer-lifetime hazard**: any deferred consumption of cache pointers
    must prove the current-tick eviction protection or add the forced-evict
    syncpoint guard. A recycled pixel slot draws the wrong tile with no crash.
-6. **rspq discipline**: the vendored libdragon closed-loop-flush patch
-   (patches/libdragon-rspq-closed-loop-flush.patch) must be present in any
-   toolchain reinstall; keep the lost-wakeup watchdog; audit DMEM maps before
+6. **rspq discipline**: the vendored libdragon patches — closed-loop-flush
+   (patches/libdragon-rspq-closed-loop-flush.patch) and, on top of it,
+   highpri-wedge (patches/libdragon-rspq-highpri-wedge.patch, 2026-09-23) —
+   must be present in any toolchain reinstall (a ROM built without the second
+   shows `W` stuck at 0 even under MVS64_RSPQ_WEDGETEST, and crashes there);
+   keep the lost-wakeup watchdog; audit DMEM maps before
    growing overlay state; sentinel-trailer polling over full `rspq_wait`
    where the walk already established the pattern.
 7. **Commit discipline**: one gated increment per commit, pushed

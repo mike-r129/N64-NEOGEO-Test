@@ -18,8 +18,18 @@ sudo apt-get install -y build-essential texinfo wget curl flex bison \
 # Build + install the toolchain from a libdragon checkout (e.g. libdragon-trunk):
 export N64_INST="$HOME/n64inst"
 cd <libdragon>/tools && JOBS=$(nproc) ./build-toolchain.sh   # builds binutils+gcc+newlib
-cd ..               && ./build.sh                            # builds + installs libdragon
+cd ..
+# REQUIRED: the vendored rspq stability patches, in this order. Without them
+# the RSP queue can wedge on real hardware (lost wakeup; highpri wedge after
+# 30+ min of play). The first patch has scratch-path headers, hence the
+# explicit target file.
+patch src/rspq/rspq.c < <repo>/patches/libdragon-rspq-closed-loop-flush.patch
+patch -p1 < <repo>/patches/libdragon-rspq-highpri-wedge.patch
+./build.sh                                                   # builds + installs libdragon
 ```
+
+A ROM built against the patched library reports highpri-wedge recoveries as
+`hpwedge=` in `[AIPUMP]` and `W` on the SNDOSD overlay (healthy: 0).
 
 This installs `mips64-elf-gcc` (gcc 14.2 validated), `mkdfs`, `n64tool`,
 `n64elfcompress`, and `include/n64.mk` under `$N64_INST`.
