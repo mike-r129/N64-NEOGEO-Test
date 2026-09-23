@@ -52,8 +52,53 @@ never be committed; see BUILDING.md §3.
 | Debug | none | Per-frame debug logging; slower on hardware |
 
 Make switches such as `WP_OFF=1`, `ADPCM_CPU=1`, `FP_OFF=1` and
-`BLOCKOPS_OFF=1` turn single optimizations back off for A/B tests.
-`DYNREC_ON=1` enables the experimental 68000 dynarec.
+`BLOCKOPS_OFF=1` turn single optimizations back off for A/B tests. The
+experimental features below have their own switches.
+
+## Experimental features (off by default)
+
+These are in the tree but switched off, because each one measured no faster
+than the default path, or slower. They stay because they work, they're
+tested, and some may pay off with more work or on other games. All figures are
+from ares; [PLAN-OPTIMIZATION.md](PLAN-OPTIMIZATION.md) has the full
+measurements.
+
+### 68000 dynarec
+
+    make mvs64 ROM=... BIOS=... DYNREC_ON=1
+
+The dynarec translates hot 68000 code into native MIPS code instead of
+interpreting it one instruction at a time.
+
+- When the interpreter jumps to an address with no translated block, the
+  address is queued. At the end of the time slice, the translator builds a
+  block from per-instruction templates, up to the next branch, in a 256 KB code
+  buffer.
+- Blocks jump straight to each other once both ends are translated, and keep
+  the guest's address registers in host registers while they run.
+- Each block checks the remaining cycle budget before it starts, so interrupts
+  land on the same instruction as in the interpreter. Memory-mapped I/O goes
+  through the same trap handler the interpreter uses.
+- Only ROM code is translated. samsho2 never runs code from RAM or the banked
+  P-ROM window.
+
+It matches the interpreter bit for bit: per-frame state hashes agree over
+thousands of frames, and a differential test rig checks every template. But
+only about 10% of guest instructions run translated, because many instructions
+have no template yet, so fps is flat. Wider template coverage is the next step.
+`DYNSTAT_ON=1` prints translation coverage, and `TRCRC_ON=1` prints the
+per-frame state hash used to check bit-exactness. Template notes are in
+[m64k/DYNREC-PHASE2-TEMPLATES.md](m64k/DYNREC-PHASE2-TEMPLATES.md).
+
+### Other experiments
+
+| Feature | Enable with | What it does | Result |
+| --- | --- | --- | --- |
+| Predecoded dispatch | `PD_ON=1` | Scaffold that dispatches through pre-decoded records per guest address instead of the opcode table | 5.5-5.9 fps slower: the record stream thrashes the 8 KB data cache. Closed |
+| Full fast-path wave 3 | `EXTRA_DEFINES=-DM64K_W3_FULL` | 14 more inline 68000 instruction forms | 2.9-3.9 fps slower: the extra code overflows the 16 KB instruction cache |
+| RSP sprite walk | `EXTRA_DEFINES=-DMVS64_WALK_RSP` | The RSP walks the sprite tables and builds the visible-tile list the CPU draws from | Bit-exact over 11,400 frames, but about 1.3 fps slower in typical scenes |
+| Batched sprite draw | `EXTRA_DEFINES=-DMVS64_SPRBATCH` | One RSP command per 64 sprite tiles instead of one per tile | Pixel-identical, but 0.8-1.6 fps slower |
+| Synchronous RSP FM | `WP_OFF=1 RSPFM=1` | FM synthesis on the RSP one chunk at a time, with the CPU waiting on each chunk | Bit-exact, but slower: 26.3 → 21.8 fps with two channels on the RSP, 12.6 with all four. The default whole-pump offload replaced it |
 
 ## Reading the audio-health overlay
 
