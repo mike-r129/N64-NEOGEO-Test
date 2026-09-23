@@ -2,6 +2,15 @@
 
 ## 🔴 2026-09-23 — HARDWARE RSP CRASH AFTER 30+ MIN = rspq HIGHPRI WEDGE (libdragon race), FIXED; CDT +1.2ms/frame
 
+**HEADLINE (ares, shipped config QUIET+SNDOSD, same AUTOINPUT script, 35
+content windows): sndfix4 36.5 fps → sndfix6 45.9 fps median, +9.8 median per
+window (+9.3 in fights; boot 12 → 43).** sndms/pump 8.67 → 4.82. The Z80
+self-jump fast-forward (4f87318) is NOT boot-only: the driver waits in-game
+in DI+`JP $` spins, and the new build executes 10-30% fewer Z80 steps for the
+same content (bit-exact skip). Stack: that + read page map + CDT + fused walk
++ the SND_HEALTH rms-probe fix (OSD/SNDHEALTH builds only, ~2-3 fps of it) —
+release builds gain somewhat less.
+
 **Hardware report:** first long session on the sndfix4 line — sound healthy past
 the 17.9-min wrap (cd0b72f validated on real HW) — ended after 30+ min in
 `RSP CRASH | rsp_queue | rspq_next_buffer (rspq.c:951)`, "wait loop timed out
@@ -41,16 +50,24 @@ and the CPU dies in rspq_next_buffer. Every field of the HW dump matches.
   17 injections, 7 stuck → 7 recoveries (hpwedge=7), 0 crashes, 11,758 frames.
   Drain-first rig (every injection sticks): 43 injections → 43 recoveries
   (hpwedge=43), 0 crashes, 0 audio deaths, 13,660 frames.
-- Race-window widening (throwaway libdragon variants, 50us busy-wait inside
-  highpri_begin): upstream order vs fixed order — RESULTS PENDING (queued).
+- Race-window widening (throwaway libdragon variants, a ~1500-iteration plain
+  loop inside highpri_begin): UPSTREAM order 367 wedges in 23,101 pump
+  passes, every one recovered by the watchdog (0 crashes, 0 audio deaths);
+  FIXED order with the same window: 0 in 19,981. (A first attempt polled
+  COUNT for the delay; ares crawled to ~1000 frames: 1 vs 0.) The race is
+  real, the reorder closes it, and the net holds under a wedge storm.
 - Deliverable soak (sndfix5 code + AUTOINPUT, 600s): 15,121 pump passes, 0 crashes,
   0 audio deaths, hpwedge=0, sound in 131/142 [SNDRMS] windows; the only underrun
   is pass 1 (boot, before the first fill).
 
-**Deliverables** (built at 1daf5c6, patched toolchain; handed to the user for the next HW soak): `mvs64-samsho2-sndfix5.z64`
-(QUIET+SNDOSD, as sndfix4) and `mvs64-samsho2-release5.z64` (QUIET). Contents
-over sndfix4: the highpri-wedge fix + telemetry, CDT, fused walk, Z80 self-jump
-fast-forward, SND_HEALTH rms-probe fix.
+**Deliverables** (patched toolchain; handed to the user for the next HW soak):
+sndfix5/release5 at 1daf5c6, then **sndfix6/release6 at 33dc60c** (+ Z80 read
+page map; soak 26,281 passes clean — one 40ms pad at a KO sound burst, the
+known load-hitch class; shipped-config fps vs sndfix5 +0.6 median over 26
+content windows).
+sndfixN = QUIET+SNDOSD (as sndfix4), releaseN = QUIET. Build 5 over sndfix4:
+the highpri-wedge fix + telemetry, CDT, fused walk, Z80 self-jump
+fast-forward, SND_HEALTH rms-probe fix; build 6 adds the Z80 read page map.
 
 ### Perf work this session (tracks resumed after the 2026-09-22 crash)
 The previous session ran four forked tracks in parallel that together launched
@@ -67,18 +84,31 @@ sequence; WSL scripts source `emu-guard.sh`.
 - **Fused sprite walk (9952b78):** −0.5 cpu points; pixel-identical (N64 2354
   frames, PC 101 shots).
 - **Z80 self-jump fast-forward (4f87318):** JP $/JR $ spins (the boot DI park
-  = 48% of all Z80 steps) fast-forwarded bit-exactly; WAV IDENTICAL; boot only.
+  = 48% of all Z80 steps) fast-forwarded bit-exactly; WAV IDENTICAL. Also
+  cuts 10-30% of in-game Z80 steps (the driver's DI+JP $ waits).
 - **SND_HEALTH rms probe (2571377):** the per-call linear-search isqrt cost
   ~2.8% of frame time in every SND_HEALTH build (SNDOSD HW builds + all
   measurement twins). Now computed only on the reporting call, exact isqrt.
   NOTE: genms in [SNDRMS] is not comparable across this commit.
-- **FIXBLK (fix-layer rspq block replay): NOT landed.** Frame-paired 2693
-  frames: fix 639→358µs median but mean cpu only −0.5 (re-records on 5-75% of
-  frames; a re-record costs more than the old path; dense bucket +1.2).
-  Refined version (compare the 28 drawn rows only, evict_gen fast path,
-  slot_tick refresh) under measurement (queued).
-- **B5 Z80 read page map (rmap): WAV IDENTICAL, measurement pending** (queued
-  b5-base2 vs b5-rmap2 twins).
+- **FIXBLK (fix-layer rspq block replay): NOT landed, parked on the draw
+  branch (0e7768b).** The fix layer genuinely changes on 5-75% of frames
+  (re-record counts identical with the hidden rows excluded), and a re-record
+  costs more than the plain path: refined version cpu −1.5 median / −0.2 mean
+  over 5,445 paired frames, pixel-identical 8,710 frames. Only per-column
+  blocks could pay; the whole fix layer is ~4% of the frame.
+- **Z80 read page map (33dc60c): LANDED.** Inline per-256-byte-page host
+  pointer table instead of the read_byte callback. Bit-exact (PC WAV
+  identical both inputs; every [SNDRMS] window has identical Z80 step counts
+  on N64). Z80 stepping time −30.2% in the B5-worktree twins but only −6.9% in
+  the integrated twins; shipped-config soak fps +0.6.
+- **LAYOUT-LUCK LAW, re-measured:** the integrated rmap twins moved CDT's
+  hit-path cost 932 → 293µs/frame with no CDT change — rmap's 1KB .bss table
+  shifts the heap start, re-aliasing the heap-allocated CDT tables in the 8KB
+  dcache. Cross-binary comparisons must read guest-tick channels (z80ms,
+  bit-exact step counts) or use layout-identical twins, and every shipped
+  binary carries its own luck. Next lever candidate: make the CDT hot path
+  layout-robust (hoist table pointers out of the per-record call, or keep the
+  LRU tick on the crom_dt line).
 - **Profile (MVS64_PCPROF host-PC sampler, in-fight, pre-CDT):** draw
   video_render 7.8% (walk loop ~4.5%, fix scan ~2%), CROM lookup 8.1% (CDT
   target), Z80 ~15% (z80_read 3.4% = rmap target), YM2610Update_stream 6.6%,
