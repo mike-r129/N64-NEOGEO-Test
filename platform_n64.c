@@ -535,6 +535,32 @@ void plat_audio_pump(void) {
         }
     }
 #endif
+#if defined(MVS64_RSPWP) && defined(MVS64_RSPQ_WEDGETEST)
+    // Fault-injection rig for the rspq highpri wedge (the 2026-09-23 hardware
+    // crash; see patches/libdragon-rspq-highpri-wedge.patch). Every 300th pump
+    // from pass 900 on, let this pump's audio burst drain, then raise a stale
+    // SIG_HIGHPRI_REQUESTED: exactly the state the upstream highpri_begin race
+    // leaves behind. (Injected while segments are still queued, their own
+    // WRITE_STATUS would consume it: the first rig, 2026-09-23, stuck only 1
+    // of 5 times.) The kernel then re-enters highpri at the empty end of the
+    // stream and sleeps there with SIG_HIGHPRI_RUNNING set, starving lowpri.
+    // Unpatched toolchain: the next lowpri wait times out into the crash
+    // screen (reproduced in ares: the exact hardware signature, rspq.c:951,
+    // STATUS 0x1403). Patched: the wait-loop watchdog recovers it ([AIPUMP]
+    // hpwedge= / SNDOSD W count up, play continues).
+    {
+        static uint32_t wt_passes, wt_injected;
+        if (++wt_passes >= 900 && (wt_passes % 300) == 0) {
+            rspq_highpri_sync();
+            MEMORY_BARRIER();
+            *SP_STATUS = SP_WSTATUS_SET_SIG4;   // = SET_SIG_HIGHPRI_REQUESTED
+            MEMORY_BARRIER();
+            wt_injected++;
+            debugf("[WEDGETEST] stale HIGHPRI_REQUESTED injected (%lu)\n",
+                   (unsigned long) wt_injected);
+        }
+    }
+#endif
 }
 
 int plat_poll(void) {
