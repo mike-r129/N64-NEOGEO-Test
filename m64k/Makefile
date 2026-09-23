@@ -1,7 +1,7 @@
 BUILD_DIR=build
 include $(N64_INST)/include/n64.mk
 
-src = m64k.c tlb.c testsuite.c
+src = m64k.c tlb.c testsuite.c dynrec.c
 asm = m64k_asm.S
 assets_xm = $(wildcard assets/*.xm)
 assets_wav = $(wildcard assets/*.wav)
@@ -15,6 +15,37 @@ M64K_CONFIG += -DM64K_CONFIG_ADDRERR=1
 M64K_CONFIG += -DM64K_CONFIG_PRIVERR=1
 M64K_CONFIG += -DM64K_CONFIG_DIVBYZERO=1
 M64K_CONFIG += -DM64K_CONFIG_ADDR_WRAP=1
+# Enable the inline fast paths so the testsuite exercises them (with ADDRERR=1
+# they additionally cover the bail-to-generic odd-address route).
+M64K_CONFIG += -DM64K_FASTPATHS
+# Also test the parked wave-3 full set (default-OFF in the game build: the
+# extra ~1.7KB of handlers pushed m64k text to 15.3KB and the whole-frame
+# icache regression outweighed the saved instructions — see
+# PLAN-OPTIMIZATION.md 2026-08-06). Kept testsuite-covered as the seed
+# handler corpus for the predecode project.
+#
+# GATE HAZARD (2026-08-07): the GAME build does NOT define this — only
+# M64K_FASTPATHS. So with W3_FULL on, the emitter-differential rig compares
+# emitted blocks against a DIFFERENT interpreter than samsho2 runs, and any
+# template whose charge/behaviour is config-dependent can be rig-green and
+# still diverge in-game (suspected cause of the frame-377 TRCRC failures).
+# Build with W3_OFF=1 to reproduce the game's fast-path set.
+ifndef W3_OFF
+M64K_CONFIG += -DM64K_W3_FULL
+endif
+# M64K_PREDECODE (killed 2026-08-07, kept opt-in): the phase-1a record
+# dispatch was testsuite-green (125/126) but regressed -5.5..-5.9 fps in
+# every bucket — the per-PC record stream adds ~20+ cyc/insn of dcache
+# misses, more than phase-2 specialization could recover. Enable here to
+# re-test the machinery if the design is ever revisited.
+# M64K_CONFIG += -DM64K_PREDECODE
+# m64k dynarec phase-1 machinery (arena + empty block-table probes): opt-in
+# via make ... DYNREC_ON=1 so the testsuite covers the probe-instrumented
+# dispatch. (The EPC-range extension lives in the game's hw_n64.S and is
+# proven by the game-side boot [DYNTEST].)
+ifdef DYNREC_ON
+M64K_CONFIG += -DM64K_DYNREC
+endif
 
 N64_CFLAGS += $(M64K_CONFIG)
 N64_ASFLAGS += $(M64K_CONFIG)

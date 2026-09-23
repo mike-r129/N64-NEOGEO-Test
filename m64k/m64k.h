@@ -21,6 +21,14 @@ typedef struct {
     uint8_t ipl;
     uint8_t nmi_pending;
     uint8_t check_interrupts;
+    // Set (from C, within an MMIO handler) to request that the current
+    // timeslice ends at the next MMIO boundary. Consumed by the TLB handler.
+    uint8_t slice_break;
+    // Cycles clamped out of the live cycle counter by a forced slice exit
+    // (slice_break or an SR reload that unmasked a pending IRQ). m64k_run
+    // adds this back to the value returned by the asm core so the guest
+    // clock stays exact.
+    int32_t forced_remaining;
 
     uint8_t virq;
     int (*hook_irqack)(void *ctx, int level);
@@ -33,6 +41,13 @@ typedef uint32_t m64k_mapping_t;
 void m64k_init(m64k_t *m64k);
 void m64k_pulse_reset(m64k_t *m64k);
 int64_t m64k_run(m64k_t *m64k, int64_t until);
+
+#ifdef M64K_DYNREC
+/** @brief Translate a straight-line block at pc into the dynarec table
+ * (dynrec.c). force skips the C_max entry gate — testsuite forced mode
+ * only. Returns the number of guest instructions translated (0 = none). */
+int m64k_dyn_translate(m64k_t *m64k, uint32_t pc, int max_insns, bool force);
+#endif
 
 /**
  * @brief Map a linear buffer of memory into the m68k memory map.

@@ -5,7 +5,11 @@
 #include <stdbool.h>
 #include "roms.h"
 
-#ifdef N64
+// Direct m64k-window memory accessors (used only by the m64k core, which maps
+// 68k memory into the 0xFF000000 TLB window and dispatches HWIO via hw_n64.S).
+// The Musashi core (incl. the N64 MUSASHI=1 fallback) instead uses the banks[]
+// callbacks in hw.c, so gate these on USE_M64K rather than N64.
+#ifdef USE_M64K
 
 // M68K memory handlers on N64 host.
 //

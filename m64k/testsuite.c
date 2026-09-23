@@ -145,6 +145,15 @@ void run_testsuite(const char *fn)
             (void)m68k_ram_r8(final.ram[i][0]);
 
         // Run the opcode
+        #ifdef M64K_DYNREC
+        // Forced-superblock mode: translate the vector's single insn with
+        // the C_max gate skipped (vectors run with m_cycles=1, which the
+        // gate would always refuse), so every supported-form vector
+        // exercises the emitted block end-to-end via the slice-entry
+        // probe. m64k_init above reset the table+arena, so blocks never
+        // leak across vectors (they rewrite RAM at reused addresses).
+        m64k_dyn_translate(&m64k, m64k.pc, 1, true);
+        #endif
         int elapsed_cycles = m64k_run(&m64k, 1);
 
         // Check the results
@@ -245,6 +254,318 @@ bool strendswith(const char *s, const char *suffix)
     if (sl < sufl) return false;
     return strcmp(s+sl-sufl, suffix) == 0;
 }
+
+#ifdef M64K_DYNREC
+// ---- Emitter-differential rig ------------------------------------------
+// Proves dynarec template hand-encodings that the TomHarte vector set
+// cannot cover (there are no immediate-form suites): each synthetic
+// sequence runs twice from an identical seed state — once pure
+// interpreter, once with a forced translated block — and the final
+// architectural state (regs, SR, PC, USP/SSP) plus elapsed cycles must
+// match bit-for-bit. Memory effects are verified by loading stored
+// values back into registers within the sequence. Canary rule: a
+// template counts as covered here only if corrupting its idiom makes a
+// sequence FAIL (verified for ADDI/CMPI at rig introduction).
+static int diff_fails, diff_runs;
+
+static void diff_run(const uint16_t *code, int ncode, int nexpect,
+                     int budget, const char *name)
+{
+    m64k_t st[2];
+    for (int side = 0; side < 2; side++) {
+        m64k_init(&m64k);               // also resets the dynrec table/arena
+        m68k_ram_init();
+        for (int i = 0; i < 8; i++)
+            m64k.dregs[i] = (0x11111111u * i) ^ 0x8000;
+        m64k.dregs[3] = 0;              // Z-flag material
+        m64k.dregs[4] = 0x0000FFFF;     // carry/borrow material
+        for (int i = 0; i < 7; i++)
+            m64k.aregs[i] = 0x4000 + 0x100 * i;
+        m64k.aregs[5] = 0x4501;         // odd: exercises the emitted
+                                        // ADDRERR bail -> generic replay
+        m64k.usp = 0x5000;
+        m64k.ssp = 0x5800;
+        m64k.pc = 0x2000;
+        m64k.sr = 0x2700;
+        for (int i = 0; i < ncode; i++) {
+            m68k_ram_w8(0x2000 + i * 2,     code[i] >> 8);
+            m68k_ram_w8(0x2000 + i * 2 + 1, code[i] & 0xFF);
+        }
+        (void)m68k_ram_r8(0x0000);      // map the vector page (ADDRERR)
+        (void)m68k_ram_r8(0x4000);      // map the data/stack page
+        if (side == 1) {
+            int got = m64k_dyn_translate(&m64k, m64k.pc, nexpect, true);
+            if (got != nexpect) {
+                debugf(">>> DIFF FAIL %s: translated %d insns, expected %d\n",
+                       name, got, nexpect);
+                diff_fails++;
+                diff_runs++;
+                return;
+            }
+        }
+        m64k_run(&m64k, budget);
+        st[side] = m64k;
+    }
+    diff_runs++;
+    bool ok = memcmp(st[0].dregs, st[1].dregs, sizeof(st[0].dregs)) == 0
+           && memcmp(st[0].aregs, st[1].aregs, sizeof(st[0].aregs)) == 0
+           && st[0].usp == st[1].usp && st[0].ssp == st[1].ssp
+           && st[0].pc == st[1].pc && st[0].sr == st[1].sr
+           && st[0].cycles == st[1].cycles;
+    if (!ok) {
+        diff_fails++;
+        debugf(">>> DIFF FAIL %s\n", name);
+        for (int i = 0; i < 8; i++)
+            if (st[0].dregs[i] != st[1].dregs[i])
+                debugf("  D%d: %08lx != %08lx\n", i, st[0].dregs[i], st[1].dregs[i]);
+        for (int i = 0; i < 7; i++)
+            if (st[0].aregs[i] != st[1].aregs[i])
+                debugf("  A%d: %08lx != %08lx\n", i, st[0].aregs[i], st[1].aregs[i]);
+        if (st[0].sr != st[1].sr)
+            debugf("  SR: %04lx != %04lx\n", st[0].sr, st[1].sr);
+        if (st[0].pc != st[1].pc)
+            debugf("  PC: %08lx != %08lx\n", st[0].pc, st[1].pc);
+        if (st[0].cycles != st[1].cycles)
+            debugf("  cycles: %lld != %lld\n",
+                   (long long)st[0].cycles, (long long)st[1].cycles);
+    }
+}
+
+static void run_emitter_differential(void)
+{
+    // MOVEQ edges: zero (Z), -1 (N), positive; and a 3-insn run.
+    diff_run((const uint16_t[]){0x7000}, 1, 1, 100, "moveq #0,d0");
+    diff_run((const uint16_t[]){0x72FF}, 1, 1, 100, "moveq #-1,d1");
+    diff_run((const uint16_t[]){0x747F, 0x7000, 0x76FF}, 3, 3, 100, "moveq x3");
+    // MOVE.w forms (templated set), incl. store->load-back memory checks.
+    diff_run((const uint16_t[]){0x3A03}, 1, 1, 100, "move.w d3,d5");
+    diff_run((const uint16_t[]){0x3481, 0x3E12}, 2, 1, 100, "move.w d1,(a2); (a2),d7");
+    diff_run((const uint16_t[]){0x36C0, 0x3419}, 2, 2, 100, "move.w d0,(a3)+; (a1)+,d2");
+    diff_run((const uint16_t[]){0x3C28, 0x0008}, 2, 1, 100, "move.w (8,a0),d6");
+    diff_run((const uint16_t[]){0x3942, 0x0004, 0x3C2C, 0x0004}, 4, 2, 100, "move.w d2,(4,a4); (4,a4),d6");
+    diff_run((const uint16_t[]){0x3CBC, 0x8000, 0x3E16}, 3, 1, 100, "move.w #0x8000,(a6); (a6),d7");
+    // ADDRERR bail from an emitted block (a5 is odd): the bail replays
+    // the insn generically and raises the address error bit-exactly.
+    diff_run((const uint16_t[]){0x3A84}, 1, 1, 200, "move.w d4,(a5) ADDRERR");
+    // CMPI edges: equal (Z), borrow (C), byte form.
+    diff_run((const uint16_t[]){0x0C42, 0x1111}, 2, 1, 100, "cmpi.w #0x1111,d2");
+    diff_run((const uint16_t[]){0x0C43, 0x0000}, 2, 1, 100, "cmpi.w #0,d3 (Z)");
+    diff_run((const uint16_t[]){0x0C42, 0xFFFF}, 2, 1, 100, "cmpi.w #0xFFFF,d2 (C)");
+    diff_run((const uint16_t[]){0x0C04, 0x00FF}, 2, 1, 100, "cmpi.b #0xFF,d4");
+    // ADDI.w edges: carry+X wrap, Z, sign/overflow.
+    diff_run((const uint16_t[]){0x0644, 0xFFFF}, 2, 1, 100, "addi.w #0xFFFF,d4 (C/X)");
+    diff_run((const uint16_t[]){0x0643, 0x0000}, 2, 1, 100, "addi.w #0,d3 (Z)");
+    diff_run((const uint16_t[]){0x0640, 0x8000}, 2, 1, 100, "addi.w #0x8000,d0 (V)");
+    // Mixed 6-insn block: sequencing + guest-length accounting.
+    diff_run((const uint16_t[]){0x7001, 0x3A03, 0x0C42, 0x1111,
+                                0x0644, 0xFFFF, 0x3419, 0x36C0},
+             8, 6, 200, "mixed x6");
+    // Bcc enders: taken/not-taken, forward/backward, both charge forms.
+    diff_run((const uint16_t[]){0x7000, 0x6702, 0x7201, 0x7402}, 4, 2, 100,
+             "moveq #0; beq.s +2 (taken)");
+    diff_run((const uint16_t[]){0x7001, 0x6702, 0x74AA}, 3, 2, 100,
+             "moveq #1; beq.s +2 (not taken)");
+    diff_run((const uint16_t[]){0x6002, 0x7201, 0x7402}, 3, 1, 100,
+             "bra.s +2");
+    diff_run((const uint16_t[]){0x6700, 0x0004, 0x7201}, 3, 1, 100,
+             "beq.w +4 (not taken, 12-cycle form)");
+    diff_run((const uint16_t[]){0x6A02, 0x7201, 0x7402}, 3, 1, 100,
+             "bpl.s +2 (N from seed flags)");
+    // Backward loop: addi.w #-1,d0 decrements to Z; bne.s -6 loops once.
+    diff_run((const uint16_t[]){0x7002, 0x0640, 0xFFFF, 0x66FA}, 4, 3, 200,
+             "moveq #2; addi.w #-1,d0; bne.s -6 (loop)");
+    // NOP, MOVE.b family (byte ops: odd addresses legal, no bail).
+    diff_run((const uint16_t[]){0x4E71}, 1, 1, 100, "nop");
+    diff_run((const uint16_t[]){0x1A03}, 1, 1, 100, "move.b d3,d5");
+    diff_run((const uint16_t[]){0x1219}, 1, 1, 100, "move.b (a1)+,d1");
+    diff_run((const uint16_t[]){0x162D, 0x0004}, 2, 1, 100, "move.b (4,a5),d3 odd");
+    diff_run((const uint16_t[]){0x1B42, 0x0006}, 2, 1, 100, "move.b d2,(6,a5) odd");
+    diff_run((const uint16_t[]){0x1482, 0x1612}, 2, 1, 100, "move.b d2,(a2); (a2),d3");
+    diff_run((const uint16_t[]){0x13C1, 0x0000, 0x4402, 0x1039, 0x0000, 0x4402},
+             6, 1, 150, "move.b d1,(abs).l; readback");
+    diff_run((const uint16_t[]){0x13FC, 0x00A5, 0x0000, 0x4403}, 4, 1, 150,
+             "move.b #0xA5,(abs).l");
+    diff_run((const uint16_t[]){0x13FC, 0x0000, 0x0000, 0x4403}, 4, 1, 150,
+             "move.b #0,(abs).l (Z)");
+    // TST.b/.w forms.
+    diff_run((const uint16_t[]){0x4A02}, 1, 1, 100, "tst.b d2");
+    diff_run((const uint16_t[]){0x4A45}, 1, 1, 100, "tst.w d5");
+    diff_run((const uint16_t[]){0x4A03}, 1, 1, 100, "tst.b d3 (Z)");
+    diff_run((const uint16_t[]){0x4A2D, 0x0002}, 2, 1, 100, "tst.b (2,a5) odd");
+    diff_run((const uint16_t[]){0x4A6C, 0x0004}, 2, 1, 100, "tst.w (4,a4)");
+    diff_run((const uint16_t[]){0x4A39, 0x0000, 0x4402}, 3, 1, 150, "tst.b (abs).l");
+    diff_run((const uint16_t[]){0x4A79, 0x0000, 0x4404}, 3, 1, 150, "tst.w (abs).l");
+    // Mixed with the new forms.
+    diff_run((const uint16_t[]){0x4E71, 0x1A03, 0x4A45}, 3, 3, 150,
+             "nop; move.b d3,d5; tst.w d5");
+    // MOVE source-form batch.
+    diff_run((const uint16_t[]){0x3A3C, 0x8001}, 2, 1, 100, "move.w #0x8001,d5");
+    diff_run((const uint16_t[]){0x3A3C, 0x0000}, 2, 1, 100, "move.w #0,d5 (Z)");
+    diff_run((const uint16_t[]){0x3212}, 1, 1, 100, "move.w (a2),d1");
+    diff_run((const uint16_t[]){0x300C}, 1, 1, 100, "move.w a4,d0");
+    diff_run((const uint16_t[]){0x3239, 0x0000, 0x4404}, 3, 1, 150, "move.w (abs).l,d1");
+    diff_run((const uint16_t[]){0x1039, 0x0000, 0x4403}, 3, 1, 150, "move.b (abs).l,d0");
+    // DBF ender: d0=2 -> loops twice then expires (non-self-loop shape).
+    diff_run((const uint16_t[]){0x7002, 0x4E71, 0x4E71, 0x51C8, 0xFFFA},
+             5, 4, 300, "moveq #2; nop; nop; dbf d0,-6");
+    // DBF expire-immediately: d3=0 seed.
+    diff_run((const uint16_t[]){0x51CB, 0x0004, 0x4E71, 0x4E71, 0x4E71},
+             5, 1, 200, "dbf d3,+4 (expires: d3.w==0)");
+    // ALU batch: ADD/SUB/CMP/ADDQ/SUBQ/ADDA/MOVEA/MOVE.l.
+    diff_run((const uint16_t[]){0xD002}, 1, 1, 100, "add.b d2,d0");
+    diff_run((const uint16_t[]){0xD245}, 1, 1, 100, "add.w d5,d1");
+    diff_run((const uint16_t[]){0xD480}, 1, 1, 100, "add.l d0,d2");
+    diff_run((const uint16_t[]){0xD8C3}, 1, 1, 100, "adda.w d3,a4");
+    diff_run((const uint16_t[]){0x9002}, 1, 1, 100, "sub.b d2,d0");
+    diff_run((const uint16_t[]){0x9245}, 1, 1, 100, "sub.w d5,d1");
+    diff_run((const uint16_t[]){0x9480}, 1, 1, 100, "sub.l d0,d2");
+    diff_run((const uint16_t[]){0xB002}, 1, 1, 100, "cmp.b d2,d0");
+    diff_run((const uint16_t[]){0xB245}, 1, 1, 100, "cmp.w d5,d1");
+    diff_run((const uint16_t[]){0xB244}, 1, 1, 100, "cmp.w d4,d1");
+    diff_run((const uint16_t[]){0x5202}, 1, 1, 100, "addq.b #1,d2");
+    diff_run((const uint16_t[]){0x5245}, 1, 1, 100, "addq.w #1,d5");
+    diff_run((const uint16_t[]){0x5244}, 1, 1, 100, "addq.w #1,d4 (C/X wrap)");
+    diff_run((const uint16_t[]){0x5044}, 1, 1, 100, "addq.w #8,d4");
+    diff_run((const uint16_t[]){0x5480}, 1, 1, 100, "addq.l #2,d0");
+    diff_run((const uint16_t[]){0x5302}, 1, 1, 100, "subq.b #1,d2");
+    diff_run((const uint16_t[]){0x5343}, 1, 1, 100, "subq.w #1,d3 (borrow/X)");
+    diff_run((const uint16_t[]){0x5580}, 1, 1, 100, "subq.l #2,d0");
+    diff_run((const uint16_t[]){0x2841}, 1, 1, 100, "movea.l d1,a4");
+    diff_run((const uint16_t[]){0x2C4D}, 1, 1, 100, "movea.l a5,a6");
+    diff_run((const uint16_t[]){0x3841}, 1, 1, 100, "movea.w d1,a4");
+    diff_run((const uint16_t[]){0x2400}, 1, 1, 100, "move.l d0,d2");
+    diff_run((const uint16_t[]){0x2403}, 1, 1, 100, "move.l d3,d2 (Z)");
+    // ALU + ender loop: addq.w #1,d5; cmp.w d5,d1; bne -6 (budget-bounded).
+    diff_run((const uint16_t[]){0x5245, 0xB245, 0x66FA}, 3, 3, 300,
+             "addq/cmp/bne loop");
+    // Call/jump enders (JMP/JSR/BSR): the callee runs interpreted; final
+    // PC/SSP/pushed-return/cycles must match. Targets land on moveq
+    // markers so a wrong target changes D0 visibly.
+    diff_run((const uint16_t[]){0x4EFA, 0x000E, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7042}, 9, 1, 100,
+             "jmp (14,pc)");
+    diff_run((const uint16_t[]){0x4EF9, 0x0000, 0x2010, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7043}, 9, 1, 100,
+             "jmp (abs).l");
+    diff_run((const uint16_t[]){0x4EBA, 0x000E, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7044}, 9, 1, 100,
+             "jsr (14,pc)");
+    diff_run((const uint16_t[]){0x4EB9, 0x0000, 0x2010, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7045}, 9, 1, 100,
+             "jsr (abs).l");
+    diff_run((const uint16_t[]){0x610E, 0x4E71, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7046}, 9, 1, 100,
+             "bsr.b +14");
+    diff_run((const uint16_t[]){0x6100, 0x000E, 0x4E71, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x4E71, 0x7047}, 9, 1, 100,
+             "bsr.w +14");
+    // Call after straight-line body (mid-block goff accounting) and a
+    // call+rts round trip (RTS interpreted; return lands after the call).
+    diff_run((const uint16_t[]){0x7005, 0x4EBA, 0x000A, 0x4E71, 0x4E71,
+                                0x4E71, 0x4E71, 0x7048}, 8, 2, 150,
+             "moveq; jsr (10,pc)");
+    diff_run((const uint16_t[]){0x4EBA, 0x0006, 0x7049, 0x4E71, 0x74AA,
+                                0x4E75}, 6, 1, 50,
+             "jsr (6,pc); rts round trip");
+    // LEA (xxx).l,An (no flags; raw 32-bit into An).
+    diff_run((const uint16_t[]){0x43F9, 0x0001, 0x4321}, 3, 1, 100,
+             "lea (abs).l,a1");
+    diff_run((const uint16_t[]){0x4DF9, 0x0000, 0x4400, 0x3C16}, 4, 2, 100,
+             "lea (abs).l,a6; move.w (a6),d6");
+    // RTS ender: push a return address with jsr, then rts back. The whole
+    // round trip is one block, so both call and return enders execute.
+    diff_run((const uint16_t[]){0x4E75}, 1, 1, 100, "rts (bare, from seed sp)");
+    diff_run((const uint16_t[]){0x4EBA, 0x0004, 0x7051, 0x4E71, 0x4E75},
+             5, 1, 200, "jsr (4,pc) -> rts");
+    // Hot in-game refusals now templated (see DYNSTAT cross-reference):
+    // mem-to-mem move.w (the 0x0031FE copy loop), abs.l word store, and
+    // the MOVE.l memory forms. Store-then-read-back proves the memory
+    // effect and the post-increment.
+    diff_run((const uint16_t[]){0x3898, 0x3814}, 2, 1, 100,
+             "move.w (a0)+,(a4); (a4),d4");
+    diff_run((const uint16_t[]){0x3899, 0x3814}, 2, 1, 100,
+             "move.w (a1)+,(a4); (a4),d4");
+    diff_run((const uint16_t[]){0x33C0, 0x0000, 0x4406, 0x3239, 0x0000, 0x4406},
+             6, 1, 150, "move.w d0,(abs).l; readback");
+    diff_run((const uint16_t[]){0x33C3, 0x0000, 0x4406}, 3, 1, 150,
+             "move.w d3,(abs).l (Z)");
+    diff_run((const uint16_t[]){0x2210}, 1, 1, 100, "move.l (a0),d1");
+    diff_run((const uint16_t[]){0x2250}, 1, 1, 100, "movea.l (a0),a1");
+    diff_run((const uint16_t[]){0x2B4E, 0x0008, 0x2A6D, 0x0008}, 4, 2, 150,
+             "move.l a6,(8,a5); movea.l (8,a5),a5");
+    diff_run((const uint16_t[]){0x2B43, 0x0004, 0x222D, 0x0004}, 4, 2, 150,
+             "move.l d3,(4,a5); (4,a5),d1 (Z)");
+    // Coverage-rung forms (DYNTERM-driven 2026-08-08): ADD.b (An)+,Dn /
+    // CMP.w (d16,An),Dn / LSR.w #imm,Dn / SUBI.w #imm,Dn — each with
+    // C/X/Z/N/V edges; memory effects proven by store-then-read shapes.
+    diff_run((const uint16_t[]){0x1081, 0xD018}, 2, 2, 100,
+             "move.b d1,(a0); add.b (a0)+,d0");
+    diff_run((const uint16_t[]){0x1084, 0xD818}, 2, 2, 100,
+             "move.b d4,(a0); add.b (a0)+,d4 (C/X wrap)");
+    diff_run((const uint16_t[]){0x1083, 0xD618}, 2, 2, 100,
+             "move.b d3,(a0); add.b (a0)+,d3 (Z)");
+    diff_run((const uint16_t[]){0x3942, 0x0004, 0xB06C, 0x0004}, 4, 2, 100,
+             "move.w d2,(4,a4); cmp.w (4,a4),d0");
+    diff_run((const uint16_t[]){0x3940, 0x0004, 0xB06C, 0x0004}, 4, 2, 100,
+             "move.w d0,(4,a4); cmp.w (4,a4),d0 (Z)");
+    diff_run((const uint16_t[]){0x3941, 0x0004, 0xB86C, 0x0004}, 4, 2, 100,
+             "move.w d1,(4,a4); cmp.w (4,a4),d4");
+    diff_run((const uint16_t[]){0xEE49}, 1, 1, 100, "lsr.w #7,d1");
+    diff_run((const uint16_t[]){0xE24C}, 1, 1, 100, "lsr.w #1,d4 (C/X)");
+    diff_run((const uint16_t[]){0xE04B}, 1, 1, 100, "lsr.w #8,d3 (Z)");
+    // Canary-sensitive carry edges: 0x9111 has bit(c-1) != bit(c) at c=1
+    // (b0=1,b1=0) and c=4 (b3=0,b4=1) — an off-by-one carry bit FAILS here
+    // (the first canary round passed because every value above had equal
+    // adjacent bits at the tested positions).
+    diff_run((const uint16_t[]){0xE249}, 1, 1, 100, "lsr.w #1,d1 (C=b0=1,b1=0)");
+    diff_run((const uint16_t[]){0xE849}, 1, 1, 100, "lsr.w #4,d1 (C=b3=0,b4=1)");
+    diff_run((const uint16_t[]){0x0444, 0xFFFF}, 2, 1, 100,
+             "subi.w #0xFFFF,d4 (Z)");
+    diff_run((const uint16_t[]){0x0443, 0x0001}, 2, 1, 100,
+             "subi.w #1,d3 (borrow C/X/N)");
+    diff_run((const uint16_t[]){0x0441, 0x7FFF}, 2, 1, 100,
+             "subi.w #0x7FFF,d1 (V)");
+    // BTST #imm,Dn (population rung): Z from the tested bit, C preserved
+    // (bits_impl upper-half idiom), mod-32 index, sign-bit parity (the
+    // interpreter's sllv mask sign-extends at bit 31 — the template
+    // reproduces it exactly).
+    diff_run((const uint16_t[]){0x0801, 0x0000}, 2, 1, 100, "btst #0,d1 (set)");
+    diff_run((const uint16_t[]){0x0801, 0x0001}, 2, 1, 100, "btst #1,d1 (Z)");
+    diff_run((const uint16_t[]){0x0801, 0x001C}, 2, 1, 100, "btst #28,d1 (hi)");
+    diff_run((const uint16_t[]){0x0801, 0x0021}, 2, 1, 100, "btst #33,d1 (mod32)");
+    diff_run((const uint16_t[]){0xB244, 0x0801, 0x0010}, 3, 2, 100,
+             "cmp.w d4,d1; btst #16,d1 (C preserved)");
+    diff_run((const uint16_t[]){0x70FF, 0xB244, 0x0800, 0x001F}, 4, 3, 100,
+             "moveq #-1,d0; cmp; btst #31,d0 (sign-bit parity)");
+    diff_run((const uint16_t[]){0x0800, 0x000F, 0x6602, 0x7001, 0x4E71}, 5, 2, 100,
+             "btst #15,d0; bne (upload-fn entry shape)");
+    // The BIOS raster-poll shape end-to-end (lsr feeds subi feeds bne).
+    diff_run((const uint16_t[]){0xEE49, 0x0441, 0x0122, 0x6602, 0x7001, 0x4E71},
+             6, 3, 150, "lsr/subi/bne (raster-poll shape)");
+    // Register-cache (rung 1) shapes: cached post-inc bump visibility via
+    // store-store-readback (a stale slot would land both stores at the same
+    // address and the negative-d16 readbacks see it), in-slot ADDA, and
+    // LEA/MOVEA binding invalidation. Eviction rotation exercises the LRU.
+    diff_run((const uint16_t[]){0x30C0, 0x30C1, 0x3428, 0xFFFC, 0x3628, 0xFFFE},
+             6, 4, 200, "d0,(a0)+; d1,(a0)+; (-4,a0),d2; (-2,a0),d3 (rc bump)");
+    diff_run((const uint16_t[]){0x3014, 0x7004, 0xD8C0, 0x3214}, 4, 4, 150,
+             "(a4),d0; moveq #4,d0; adda.w d0,a4; (a4),d1 (rc adda)");
+    diff_run((const uint16_t[]){0x3212, 0x45F9, 0x0000, 0x4404, 0x3412}, 5, 3, 150,
+             "(a2),d1; lea (abs).l,a2; (a2),d2 (rc invalidate)");
+    diff_run((const uint16_t[]){0x3216, 0x2C4D, 0x3416}, 3, 3, 250,
+             "(a6),d1; movea.l a5,a6; (a6),d2 (rc set-invalidate, ADDRERR)");
+    diff_run((const uint16_t[]){0x3010, 0x3211, 0x3412, 0x3613, 0x3810},
+             5, 5, 200, "(a0)..(a3),(a0) rotation (rc LRU eviction)");
+    // Odd-address bails through the new memory templates (a5 = 0x4501).
+    diff_run((const uint16_t[]){0x2A15}, 1, 1, 200, "move.l (a5),d5 ADDRERR");
+    diff_run((const uint16_t[]){0x2B46, 0x0000}, 2, 1, 200,
+             "move.l d6,(0,a5) ADDRERR");
+    diff_run((const uint16_t[]){0x3A9C}, 1, 1, 200,
+             "move.w (a4)+,(a5) ADDRERR dst");
+    debugf("%s emitter differential: %d sequences, %d fails\n",
+           diff_fails ? ">>> DIFFRIG FAIL" : ">>> PASS", diff_runs, diff_fails);
+}
+#endif
 
 int main()
 {
@@ -430,6 +751,10 @@ int main()
     };
     int num_tests = sizeof(testfns)/sizeof(testfns[0]);
 #endif
+
+    #ifdef M64K_DYNREC
+    run_emitter_differential();
+    #endif
 
     for (int i=0; i<num_tests; i++) {
         run_testsuite(testfns[i]);

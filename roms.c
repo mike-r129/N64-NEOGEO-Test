@@ -61,6 +61,41 @@ static void rom_cache_init(void) {
 	sprite_cache_init(&crom_cache, 8*16, 1280);
 }
 
+// fread whose short-read is tolerated (EOF-bounded lookahead, cache fills
+// from known-good files). Exists to satisfy -Werror=unused-result on the
+// PC build without changing behavior.
+static inline void fread_ok(void *dst, size_t sz, FILE *f) {
+	size_t got = fread(dst, 1, sz, f);
+	(void)got;
+}
+
+// Empty-tile knowledge for the fix layer. Most of the 40x28 fix map is
+// "blank" cells whose tile decodes to all index-0 pixels (color 0 has alpha
+// forced to 0 in every palette, so such a draw can never touch the screen).
+// The map is full of nonzero tile codes though, so the `if (v)` check in
+// render_fix passes for every cell and we used to issue ~1120 draws/frame,
+// ~15% of the frame budget, almost all fully transparent. Tile pixel data is
+// ROM (immutable per SROM bank), so emptiness is a stable per-tile fact:
+// learn it on first sight, then skip empty tiles forever. Pixel-identical by
+// construction. Reset on srom_set_bank (tile numbers change meaning).
+#define SROM_MAX_TILES 8192
+static uint8_t srom_known[SROM_MAX_TILES/8];
+static uint8_t srom_empty[SROM_MAX_TILES/8];
+
+bool srom_tile_empty(int spritenum) {
+	if ((unsigned)spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
+	int byte = spritenum >> 3, bit = 1 << (spritenum & 7);
+	if (!(srom_known[byte] & bit)) {
+		const uint8_t *pix = srom_get_sprite(spritenum);
+		uint32_t acc = 0;
+		for (int i=0; i<4*8; i+=4)
+			acc |= *(const uint32_t*)(pix + i);
+		srom_known[byte] |= bit;
+		if (acc == 0) srom_empty[byte] |= bit;
+	}
+	return (srom_empty[byte] & bit) != 0;
+}
+
 uint8_t* srom_get_sprite(int spritenum) {
 	if (spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;
 	uint8_t *pix = sprite_cache_lookup(&srom_cache, spritenum);
@@ -77,10 +112,37 @@ uint8_t* srom_get_sprite(int spritenum) {
 	profile_dma_load += TICKS_READ();
 	#else
 	fseek(srom_file, spritenum*4*8, SEEK_SET);
-	fread(pix, 1, 4*8, srom_file);
+	fread_ok(pix, 4*8, srom_file);
 	#endif
 
 	return pix;
+}
+
+// Empty-tile knowledge for the sprite (C) ROM — the render_sprites analogue
+// of srom_tile_empty above. An all-index-0 tile is fully transparent in
+// every palette (pal_convert forces color 0 alpha to 0 and the sprite path
+// draws with alpha-compare on), and tile pixel data is immutable ROM, so
+// emptiness is a stable per-tile fact: learn it on the first fetch, then
+// skip the cache lookup AND the RSP/RDP draw forever. samsho2's dense
+// sprite-background stages issue 8-10k tiles/frame at up to ~100% of the
+// frame budget; [PERF2] empty= reports how many draws this removes.
+#define CROM_MAX_TILES (1u << 18)   // 32MB of C-ROM; samsho2 uses 2^17
+static uint8_t crom_known[CROM_MAX_TILES/8];
+static uint8_t crom_emptyb[CROM_MAX_TILES/8];
+
+bool crom_tile_empty(int spritenum) {
+	unsigned sn = (unsigned)spritenum & crom_mask;
+	if (sn >= crom_num_tiles) sn = crom_num_tiles-1;
+	int byte = sn >> 3, bit = 1 << (sn & 7);
+	if (!(crom_known[byte] & bit)) {
+		const uint8_t *pix = crom_get_sprite((int)sn);
+		uint32_t acc = 0;
+		for (int i=0; i<8*16; i+=4)
+			acc |= *(const uint32_t*)(pix + i);
+		crom_known[byte] |= bit;
+		if (acc == 0) crom_emptyb[byte] |= bit;
+	}
+	return (crom_emptyb[byte] & bit) != 0;
 }
 
 uint8_t* crom_get_sprite(int spritenum) {
@@ -95,16 +157,80 @@ uint8_t* crom_get_sprite(int spritenum) {
 
 	#ifdef N64
 	profile_dma_load -= TICKS_READ();
+	#ifdef MVS64_PERFCOUNT
+	{
+		// PLAN-DRAW-RDP Phase 0: per-frame miss count + DMA ticks
+		// ([PERF3], emu.c) — sizes the unique-tile floor Phase 1
+		// compresses the cache bucket toward.
+		extern uint32_t perf_dr_miss, perf_dr_missticks;
+		perf_dr_miss++;
+		perf_dr_missticks -= TICKS_READ();
+	}
+	#endif
 	dfs_seek(crom_file, spritenum*8*16, SEEK_SET);
 	dfs_read(pix, 1, 8*16, crom_file);
 	data_cache_hit_writeback_invalidate(pix, 8*16);  // FIXME: should not be required
+	#ifdef MVS64_PERFCOUNT
+	{
+		extern uint32_t perf_dr_missticks;
+		perf_dr_missticks += TICKS_READ();
+	}
+	#endif
 	profile_dma_load += TICKS_READ();
 	#else
 	fseek(crom_file, spritenum*8*16, SEEK_SET);
-	fread(pix, 1, 8*16, crom_file);
+	fread_ok(pix, 8*16, crom_file);
 	#endif
 
 	return pix;
+}
+
+// CROM direct table (CDT): one u16 per tile fusing the empty-tile fact and
+// the cache-resident pointer, so the per-record hot path is a single
+// sparse read instead of known-bitmap + empty-bitmap + hash-bucket probe
+// (+ a dirtying bucket tick write) — three independent dcache lines per
+// drawn record. Encoding:
+//   0 = unknown (never fetched)       1 = known empty (never drawn)
+//   2 = known non-empty, not resident >=3 = resident at pixel slot e-3
+// Invariant: e >= 3 => the tile is resident at that slot. It is set only
+// right after crom_get_sprite returned the slot, and sprite_cache_pop
+// demotes it to 2 in the same step that frees the slot (crom_cache.dt
+// hook); crom_set_bank clears the table with the cache. Current-tick
+// entries are never evicted (sprite_cache.c), so a resolved pointer is
+// valid for the rest of the frame — same lifetime as crom_get_sprite's.
+#define CDT_UNKNOWN 0
+#define CDT_EMPTY   1
+#define CDT_SOLID   2
+#define CDT_SLOT0   3
+static uint16_t *crom_dt;
+
+static uint8_t *crom_resolve_miss(unsigned sn, uint32_t e) {
+	uint8_t *pix = crom_get_sprite((int)sn);
+	if (e == CDT_UNKNOWN) {
+		uint32_t acc = 0;
+		for (int i=0; i<8*16; i+=4)
+			acc |= *(const uint32_t*)(pix + i);
+		if (acc == 0) {
+			crom_dt[sn] = CDT_EMPTY;
+			return NULL;
+		}
+	}
+	crom_dt[sn] = CDT_SLOT0 + sprite_cache_slot(&crom_cache, pix);
+	return pix;
+}
+
+uint8_t* crom_resolve(int spritenum) {
+	unsigned sn = (unsigned)spritenum & crom_mask;
+	if (sn >= crom_num_tiles) sn = crom_num_tiles-1;
+	uint32_t e = crom_dt[sn];
+	if (e >= CDT_SLOT0) {
+		e -= CDT_SLOT0;
+		crom_cache.slot_tick[e] = crom_cache.cur_tick;
+		return crom_cache.sprites + (e << 7);
+	}
+	if (e == CDT_EMPTY)
+		return NULL;
+	return crom_resolve_miss(sn, e);
 }
 
 void srom_set_bank(int bank) {
@@ -129,6 +255,11 @@ void srom_set_bank(int bank) {
 
 		sprite_cache_reset(&srom_cache);
 		srom_num_tiles = len / (4*8);
+		assertf(srom_num_tiles <= SROM_MAX_TILES, "SROM too large: %d tiles", srom_num_tiles);
+
+		// Tile numbers refer to the new bank now: relearn emptiness.
+		memset(srom_known, 0, sizeof(srom_known));
+		memset(srom_empty, 0, sizeof(srom_empty));
 	}
 }
 
@@ -151,6 +282,16 @@ void crom_set_bank(int bank) {
 
 	sprite_cache_reset(&crom_cache);
 	crom_num_tiles = len / (8*16);
+	assertf(crom_num_tiles <= CROM_MAX_TILES, "CROM too large: %d tiles",
+		crom_num_tiles);
+
+	// Tile numbers refer to the new bank now: relearn emptiness.
+	memset(crom_known, 0, sizeof(crom_known));
+	memset(crom_emptyb, 0, sizeof(crom_emptyb));
+	free(crom_dt);
+	crom_dt = calloc(crom_num_tiles, sizeof(uint16_t));
+	assertf(crom_dt, "CROM direct table: out of memory (%u tiles)", crom_num_tiles);
+	crom_cache.dt = crom_dt;
 
 	// Calculate mask based on next power of two
 	len /= 8*16;
@@ -267,7 +408,7 @@ void pbrom_init(const char *fn) {
 	dfs_read(PB_ROM, 1, len, pbrom_file);
 	dfs_close(pbrom_file); pbrom_file = -1;
 	#else
-	fread(PB_ROM, 1, len, pbrom_file);
+	fread_ok(PB_ROM, len, pbrom_file);
 	fclose(pbrom_file); pbrom_file = NULL;
 	#endif
 	pbrom_is_linear = true;
@@ -338,7 +479,7 @@ uint8_t *pbrom_cache_lookup(uint32_t address) {
 	dfs_read(mem, 1, (1<<PBROM_BANK_BITS)+2, pbrom_file);
 	#else
 	fseek(pbrom_file, base, SEEK_SET);
-	fread(mem, 1, (1<<PBROM_BANK_BITS)+2, pbrom_file);
+	fread_ok(mem, (1<<PBROM_BANK_BITS)+2, pbrom_file);
 	#endif
 
 	pbrom_last_mem = mem;
@@ -450,7 +591,7 @@ void vrom_read(uint32_t offset, uint8_t *buf, int len) {
 	#else
 	if (!vrom_file) { memset(buf, 0, len); return; }
 	fseek(vrom_file, offset, SEEK_SET);
-	fread(buf, 1, len, vrom_file);
+	fread_ok(buf, len, vrom_file);
 	#endif
 }
 
@@ -470,7 +611,8 @@ void rom_load(const char *dir) {
 	strcat(ini, "game.ini");
 	FILE *f = fopen(ini, "rb");
 	if (f) {
-		fread(ini, 1, sizeof(ini), f);
+		size_t n = fread(ini, 1, sizeof(ini) - 1, f);
+		ini[n] = 0;   // also fixes the unterminated-buffer parse
 		fclose(f);
 
 		bool ok;

@@ -27,6 +27,11 @@
 
 extern int _m64k_asmrun(m64k_t *m64k, int ncycles);
 
+// Live context pointer for the application's TLB/MMIO exception handler
+// (hw_n64.S), which maintains ts_cur and implements forced slice exits now
+// that the interpreter's main loop no longer polls per-instruction.
+m64k_t *__m64k_live;
+
 void __m64k_assert_invalid_opcode(uint16_t opcode, uint32_t pc) {
     assertf(0, "Invalid opcode: %04x @ %08lx", opcode, pc);
 }
@@ -55,11 +60,59 @@ static inline void exc_push16(m64k_t *m64k, uint16_t v)
     WM16(m64k->ssp, v);
 }
 
+#ifdef M64K_PREDECODE
+/* Phase-1a predecode scaffold (see PLAN-OPTIMIZATION.md, 60fps campaign):
+ * a 4096-entry L1 table maps every 4KB guest page to a record block of one
+ * 4-byte record per guest word {s16 handler offset from main_loop, u16
+ * operand}. Entries are PRE-BIASED so the asm dispatch computes the record
+ * address as L1[page] + (m_pc << 1) in 32-bit arithmetic — m_pc carries the
+ * 0xFF000000 memory-map base, and the bias cancels it mod 2^32. In phase 1a
+ * no page is ever promoted: every entry points (with its own bias) at ONE
+ * shared trampoline block whose every record targets classic_dispatch_body,
+ * so behavior is provably identical to the classic optable dispatch. */
+uint32_t __m64k_pd_l1[4096] __attribute__((aligned(16)));
+static uint16_t pd_trampoline[2048 * 2] __attribute__((aligned(16)));
+extern char main_loop[], classic_dispatch_body[];
+
+static void __m64k_predecode_init(void)
+{
+    int32_t off = (int32_t)((uint32_t)(uintptr_t)classic_dispatch_body
+                - (uint32_t)(uintptr_t)main_loop);
+    assertf(off >= -32768 && off <= 32767,
+            "predecode handler offset out of s16 range: %ld", (long)off);
+    for (int i = 0; i < 2048; i++) {
+        pd_trampoline[i * 2 + 0] = (uint16_t)(int16_t)off;
+        pd_trampoline[i * 2 + 1] = 0;
+    }
+    for (uint32_t page = 0; page < 4096; page++) {
+        uint32_t gbase = (uint32_t)M64K_CONFIG_MEMORY_BASE | (page << 12);
+        __m64k_pd_l1[page] =
+            (uint32_t)(uintptr_t)pd_trampoline - (gbase << 1);
+    }
+}
+#endif
+
+#ifdef M64K_DYNREC
+/* Dynarec state (arena, 2-way block table, publish primitive, emitter)
+ * lives in dynrec.c; the table is probed by m64k_asm.S at _m64k_asmrun
+ * entry and jmp_exec, and hw_n64.S range-checks fault EPCs against the
+ * arena. m64k_init resets the table+arena per init (the testsuite relies
+ * on this: vectors rewrite guest RAM at reused addresses). */
+extern void __m64k_dynrec_init(void);
+extern void __m64k_dyn_service(m64k_t *m64k);
+#endif
+
 void m64k_init(m64k_t *m64k)
 {
     memset(m64k, 0, sizeof(*m64k));
     m64k->sr = 0x2700;
     __m64k_tlb_reset(); // FIXME: this clears all TLB entries
+    #ifdef M64K_PREDECODE
+    __m64k_predecode_init();
+    #endif
+    #ifdef M64K_DYNREC
+    __m64k_dynrec_init();
+    #endif
 }
 
 void m64k_pulse_reset(m64k_t *m64k)
@@ -147,11 +200,63 @@ void m64k_exception_interrupt(m64k_t *m64k, int level)
     m64k->cycles += __m64k_exception_cycle_table[24 + level];
 }
 
+#ifdef M64K_TRACECRC
+/* Deterministic per-slice 68k state hash (dynarec bit-exactness rig): after
+ * every interpreter slice the full architectural state is folded into a
+ * running hash, printed+reset once per frame by emu.c ([TRCRC]). Two runs of
+ * the same inputs must produce identical streams; the dynarec build is later
+ * gated on matching the interpreter's stream frame by frame. */
+uint32_t __m64k_tracecrc = 2166136261u;
+uint32_t __m64k_tracecrc_slices;
+#ifdef M64K_TRCRC_SPLIT
+// Diagnostic split (2026-08-08 coverage-rung fork): the classic hash mixes
+// per-slice pc and the running cycle total, so a pure slice-boundary/charge
+// displacement diverges it forever while guest CONTENT stays identical.
+// The content hash (registers/SR only) separates the two classes.
+uint32_t __m64k_tracecrc_content = 2166136261u;
+#endif
+
+static void tracecrc_slice(const m64k_t *m64k)
+{
+    uint32_t h = __m64k_tracecrc;
+    #define MIX(v) (h = (h ^ (uint32_t)(v)) * 2654435761u)
+    MIX(m64k->pc);
+    for (int i = 0; i < 8; i++) MIX(m64k->dregs[i]);
+    for (int i = 0; i < 8; i++) MIX(m64k->aregs[i]);
+    MIX(m64k->usp);
+    MIX(m64k->ssp);
+    MIX(m64k->sr);
+    MIX((uint32_t)m64k->cycles);
+    MIX((uint32_t)((uint64_t)m64k->cycles >> 32));
+    #undef MIX
+    __m64k_tracecrc = h;
+    __m64k_tracecrc_slices++;
+#ifdef M64K_TRCRC_SPLIT
+    h = __m64k_tracecrc_content;
+    #define MIX(v) (h = (h ^ (uint32_t)(v)) * 2654435761u)
+    for (int i = 0; i < 8; i++) MIX(m64k->dregs[i]);
+    for (int i = 0; i < 8; i++) MIX(m64k->aregs[i]);
+    MIX(m64k->usp);
+    MIX(m64k->ssp);
+    MIX(m64k->sr);
+    #undef MIX
+    __m64k_tracecrc_content = h;
+#endif
+}
+#endif
+
 int64_t m64k_run(m64k_t *m64k, int64_t until)
 {
+    __m64k_live = m64k;
     while (until > m64k->cycles) {
         int timeslice = until - m64k->cycles;
         int remaining = _m64k_asmrun(m64k, timeslice);
+        if (__builtin_expect(m64k->forced_remaining != 0, 0)) {
+            // A forced slice exit (slice_break / reload_sr clamp) banked the
+            // cycle counter here; add it back so the guest clock stays exact.
+            remaining += m64k->forced_remaining;
+            m64k->forced_remaining = 0;
+        }
         m64k->cycles += timeslice - remaining;
 
         if (__builtin_expect(m64k->pending_exc[0] != 0, 0)) {
@@ -190,6 +295,13 @@ int64_t m64k_run(m64k_t *m64k, int64_t until)
             }
             m64k->pending_exc[0] = 0;
         }
+
+        #ifdef M64K_DYNREC
+        __m64k_dyn_service(m64k);
+        #endif
+        #ifdef M64K_TRACECRC
+        tracecrc_slice(m64k);
+        #endif
     }
 
     return m64k->cycles;
@@ -201,7 +313,7 @@ void m64k_set_irq(m64k_t *m64k, int level)
         m64k->nmi_pending = 1;
     }
     m64k->ipl = level;
-    m64k->check_interrupts = 1;
+    m64k->slice_break = 1;
 }
 
 void m64k_set_virq(m64k_t *m64k, int irq, bool on)
@@ -235,7 +347,7 @@ int64_t m64k_get_clock(m64k_t *m64k)
 
 void m64k_run_stop(m64k_t *m64k)
 {
-    m64k->check_interrupts = 2;
+    m64k->slice_break = 1;
 }
 
 void m64k_set_hook_irqack(m64k_t *m64k, int (*hook)(void *ctx, int level), void *ctx)

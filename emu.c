@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#ifdef MVS64_OPHIST
+#include <malloc.h>   // mallinfo, for the one-time [HEAP] report
+#endif
 #ifndef N64
 #include <stdlib.h>
 #endif
@@ -59,7 +62,9 @@ void cpu_start_trace(int cnt) {
 	cpu_trace_count = cnt;
 }
 
-static int g_frame;
+int g_frame;   // guest frame counter (non-static: the IOLOG gate in hw.c
+               // needs a GUEST-aligned key; N64_FRAME is the host VI count
+               // and skews with wall speed)
 
 #ifndef N64
 // --- Headless scripted input ---------------------------------------------
@@ -151,23 +156,108 @@ static void wav_close(void) {
 	fclose(wav_fp); wav_fp = NULL;
 }
 
-#define AUDIO_FREQ 44100
-static int16_t audio_frame[(AUDIO_FREQ / FPS + 16) * 2];
+#define AUDIO_FREQ MVS64_AUDIO_RATE
+// Sized for MVS64_SIMFPS as low as 5fps (AUDIO_FREQ/5 samples/frame); see emu loop.
+static int16_t audio_frame[(AUDIO_FREQ / 5 + 16) * 2];
 #endif
 #ifdef USE_M64K
 m64k_t m64k;
+#endif
+#if defined(N64) && defined(USE_M64K) && defined(M64K_DYNREC)
+// Boot-time proof that hw_n64.S's EPC-range checks accept dynarec-arena
+// addresses (a non-negotiable dynarec law: MMIO from translated code must
+// keep mid-slice clock accuracy and honor slice-break clamps). Publishes a
+// tiny stub into the arena ("lbu v0, 0(a2); jr ra") and calls it via the
+// hw_n64.S thunk with a1 = sentinel and a2 = an MMIO address (REG_P1CNT,
+// a pure input-port read). The stub's load TLB-faults with EPC inside the
+// arena; on success the handler must have (1) refreshed ts_cur from a1 and
+// (2) consumed slice_break: banked a1 into forced_remaining and clamped the
+// saved a1 to 0.
+static void m64k_dyntest(m64k_t *ctx)
+{
+	extern uint8_t __m64k_dyn_arena[];
+	extern void __m64k_dyn_publish(void *dst, const void *src, int len);
+	extern uint32_t __m64k_dyntest_thunk(uint32_t unused, uint32_t a1_sentinel, uint32_t mmio_addr);
+	extern m64k_t *__m64k_live;
+
+	// The load MUST target t0: the handler's SAFE_MODE check (tlb_readhwio)
+	// enforces the interpreter's canonical loads->t0 convention and bails to
+	// the crash screen for any other RT — emitted code is bound by the same
+	// law (first [DYNTEST] run proved the check fires: an lbu into v0 died).
+	static const uint32_t stub[4] = {
+		0x90C80000,  // lbu t0, 0(a2)   <- TLB-faults: EPC is arena-resident
+		0x03E00008,  // jr ra
+		0x00000000,  // nop (delay slot)
+		0x00000000,
+	};
+	__m64k_dyn_publish(__m64k_dyn_arena, stub, sizeof(stub));
+
+	const uint32_t sent = 0x00123456;
+	ctx->forced_remaining = 0;
+	ctx->ts_cur = 0xDEAD0001;
+	ctx->slice_break = 1;
+	__m64k_live = ctx;
+	uint32_t a1_after = __m64k_dyntest_thunk(0, sent, 0xFF300000);
+	__m64k_live = NULL;
+
+	bool ok_tscur = (ctx->ts_cur == sent);
+	bool ok_clamp = (ctx->forced_remaining == (int32_t)sent) && (a1_after == 0);
+	bool ok_break = (ctx->slice_break == 0);
+	debugf("[DYNTEST] arena EPC accept: ts_cur=%s clamp=%s break=%s -> %s\n",
+		ok_tscur ? "ok" : "FAIL", ok_clamp ? "ok" : "FAIL",
+		ok_break ? "ok" : "FAIL",
+		(ok_tscur && ok_clamp && ok_break) ? "PASS" : "FAIL");
+
+	ctx->forced_remaining = 0;
+	ctx->ts_cur = 0;
+	ctx->slice_break = 0;
+}
 #endif
 static uint64_t g_clock, g_clock_framebegin;
 static uint64_t m68k_clock;
 static EmuEvent events[MAX_EVENTS];
 uint32_t profile_hw_io;
 uint32_t profile_dma_load;
+uint32_t profile_m68k;   // ticks inside the 68k core this frame (incl. MMIO)
+uint32_t profile_snd;    // ticks synthesizing audio (Z80+YM2610) this frame
+#ifdef MVS64_PERFCOUNT
+// Draw-bucket split (see emu_render): framebuffer-wait vs command issue vs
+// detach. Diagnostic builds only.
+uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+#endif
+#ifdef MVS64_OPHIST
+// Exact per-opcode execution histogram; bumped per dispatched instruction
+// in m64k_asm.S (m64k_ophist_ptr points here). 256KB, diagnostic only.
+uint32_t m64k_ophist_tab[65536] __attribute__((aligned(16)));
+#endif
+#ifdef M64K_DYNSTAT
+// Dynarec coverage rig (m64k_asm.S dynstat_count): per-slot counts of
+// control-transfer targets seen at jmp_exec (= the dynarec probe's exact
+// visibility) + last-writer PC per slot for collision detection. 512KB,
+// diagnostic builds only. Dumped+reset every DYNSTAT_WINDOW frames.
+uint32_t m64k_dynstat_cnt[65536] __attribute__((aligned(16)));
+uint32_t m64k_dynstat_pc[65536] __attribute__((aligned(16)));
+#endif
+#ifdef MVS64_PERFCOUNT
+// m64k_run entries this frame: sizes the per-slice constant cost (icache
+// re-entry, register save/restore) vs the per-instruction marginal cost.
+uint32_t perf_m68k_slices;
+#endif
 
 static uint64_t m68k_exec(uint64_t clock) {
 	clock /= M68K_CLOCK_DIV;
 	if (clock > m68k_clock) {
 		#ifdef USE_M64K
+		#ifdef N64
+		uint32_t t0 = TICKS_READ();
+		#ifdef MVS64_PERFCOUNT
+		perf_m68k_slices++;
+		#endif
 		m68k_clock = m64k_run(&m64k, clock);
+		profile_m68k += TICKS_DISTANCE(t0, TICKS_READ());
+		#else
+		m68k_clock = m64k_run(&m64k, clock);
+		#endif
 		#else
 		m68k_clock += m68k_execute(clock - m68k_clock);
 		#endif
@@ -259,7 +349,7 @@ int cpu_irqack(void *ctx, int level)
 uint32_t emu_vblank_start(void* arg) {
 	emu_cpu_irq(1, true);
 	hw_vblank();
-	debugf("[EMU] VBlank - clock:%lld clock_frame:%lld\n", (long long)emu_clock(), (long long)emu_clock_frame());
+	framef("[EMU] VBlank - clock:%lld clock_frame:%lld\n", (long long)emu_clock(), (long long)emu_clock_frame());
 	return FRAME_CLOCK;
 }
 
@@ -277,6 +367,7 @@ uint32_t emu_render(void *arg) {
 			skip++;
 			if (skip < MAX_SKIP) {
 				debugf("[RENDER] skip frame\n");
+				plat_audio_pump();   // audio pumps once per frame regardless
 				return FRAME_CLOCK;
 			}
 			debugf("[RENDER] max skip\n");
@@ -291,22 +382,50 @@ uint32_t emu_render(void *arg) {
 	if (CONFIG_FRAMESKIP_MODE == 1) {
 		if (g_frame & 1) {
 			debugf("[RENDER] skip frame\n");
+			#ifdef N64
+			plat_audio_pump();   // audio pumps once per frame regardless
+			#endif
 			return FRAME_CLOCK;
 		}
 	}
 
-	debugf("[RENDER] render\n");
+	framef("[RENDER] render\n");
 	#ifdef N64
 	uint32_t t0 = TICKS_READ();
 	#endif
+	#if defined(N64) && defined(MVS64_PERFCOUNT)
+	// Split the draw bucket: display_get/attach wait vs command issue vs
+	// detach — tells whether draw% is CPU work or RSP/RDP back-pressure.
+	extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+	plat_beginframe();
+	perf_draw_wait = TICKS_DISTANCE(t0, TICKS_READ());
+	uint32_t t1 = TICKS_READ();
+	video_render();
+	perf_draw_issue = TICKS_DISTANCE(t1, TICKS_READ());
+	uint32_t t2 = TICKS_READ();
+	plat_endframe();
+	perf_draw_end = TICKS_DISTANCE(t2, TICKS_READ());
+	#else
 	plat_beginframe();
 	video_render();
 	plat_endframe();
+	#endif
 
 	rom_next_frame();
 
 	#ifdef N64
 	render_time = TICKS_DISTANCE(t0, TICKS_READ());
+
+	// Pump the audio HERE, right after the frame's draw commands were
+	// issued — not at the end of the main loop. The whole-pump offload
+	// bursts ~12-16ms of RSP work per pump; pumped at loop end, that
+	// burst was still draining when the NEXT frame's render (this event,
+	// at line 24) issued its commands, and the CPU ate it as rspq
+	// back-pressure (measured 60-76% of the frame in fights, tiles/frame
+	// constant). Pumped here, the RSP finishes the (fast) video queue
+	// first and chews the audio under the remaining ~90% of the frame's
+	// 68k work, so the next render meets a drained queue.
+	plat_audio_pump();
 	#endif
 
 	return FRAME_CLOCK;
@@ -334,7 +453,7 @@ void emu_run_frame(void) {
     	g_clock = m68k_exec(vsync);
 
     // Frame completed
-	debugf("[EMU] Frame completed: %d (vsync: %llu)\n", g_frame, (unsigned long long)vsync);
+	framef("[EMU] Frame completed: %d (vsync: %llu)\n", g_frame, (unsigned long long)vsync);
     g_frame++;
 	g_clock_framebegin += FRAME_CLOCK;
 }
@@ -349,7 +468,10 @@ int main(int argc, char *argv[]) {
 	argc = 0; argv = NULL;
 	#endif
 
-	plat_init(44100, FPS);
+	plat_init(MVS64_AUDIO_RATE, FPS);
+	#if defined(MVS64_PCPROF) && defined(N64)
+	{ extern void pcprof_init(void); pcprof_init(); }
+	#endif
 
 	#ifndef N64
 	// Headless test harness: when MVS64_FRAMES=N is set, run N frames with no
@@ -360,7 +482,17 @@ int main(int argc, char *argv[]) {
 	int headless = hl_env ? atoi(hl_env) : 0;
 	const char *shot_env = getenv("MVS64_SHOT");
 	int shot_interval = shot_env ? atoi(shot_env) : 0;
-	const int spf = AUDIO_FREQ / FPS;       // stereo frames produced per video frame
+	const char *sndchunk_env = getenv("MVS64_SNDCHUNK");
+	int sndchunk = sndchunk_env ? atoi(sndchunk_env) : 0;
+	// MVS64_SIMFPS=N reproduces the N64's REALTIME audio decoupling on the PC
+	// headless harness: the N64 AI drains at the wall-clock rate, so when the 68k
+	// loop runs at N fps it generates AUDIO_FREQ/N samples per LOGIC frame (more
+	// than the 1/60s the game logic assumes), desyncing 68k-driven sound events
+	// from the music. Setting this < 60 mimics a slow N64 so we can repro the
+	// in-combat stuck note without hardware. 0/unset = faithful 60fps lock.
+	const char *simfps_env = getenv("MVS64_SIMFPS");
+	int simfps = simfps_env ? atoi(simfps_env) : 0;
+	const int spf = AUDIO_FREQ / (simfps > 0 ? simfps : FPS); // samples per video frame
 	if (headless) {
 		keystate = hl_keys;                 // drive input from our scripted buffer
 		const char *script = getenv("MVS64_INPUT");
@@ -394,6 +526,9 @@ int main(int argc, char *argv[]) {
 
 	#ifdef USE_M64K
 	m64k_pulse_reset(&m64k);
+	#if defined(N64) && defined(M64K_DYNREC)
+	m64k_dyntest(&m64k);
+	#endif
 	#else
 	m68k_set_cpu_type(M68K_CPU_TYPE_68000);
 	m68k_pulse_reset();
@@ -411,6 +546,8 @@ int main(int argc, char *argv[]) {
 		render_time = 0;
 		profile_hw_io = 0;
 		profile_dma_load = 0;
+		profile_m68k = 0;
+		profile_snd = 0;
 		#ifdef N64
 		uint32_t t0 = TICKS_READ();
 		#endif
@@ -424,7 +561,22 @@ int main(int argc, char *argv[]) {
 		#ifndef N64
 		// Produce one video-frame's worth of audio through the sound seam.
 		if (headless) {
-			int n = sound_gen_samples(audio_frame, spf);
+			int n;
+			if (sndchunk > 0) {
+				// Validation: produce spf samples in arbitrary sub-chunks to
+				// exercise the rate-agnostic sound_gen_samples() path the N64
+				// AI pump uses (it asks for ~1764 at a time). Concatenation must
+				// be identical music to a single spf call (proves Rank 1 math).
+				int off = 0;
+				while (off < spf) {
+					int c = spf - off; if (c > sndchunk) c = sndchunk;
+					sound_gen_samples(audio_frame + off * 2, c);
+					off += c;
+				}
+				n = spf;
+			} else {
+				n = sound_gen_samples(audio_frame, spf);
+			}
 			wav_write(audio_frame, n);
 		} else {
 			int16_t *abuf; int an;
@@ -435,13 +587,13 @@ int main(int argc, char *argv[]) {
 		#endif
 
 		#ifdef N64
-		// Produce + push one video-frame of audio to the AI.
-		{
-			int16_t *abuf; int an;
-			plat_beginaudio(&abuf, &an);
-			sound_gen_samples(abuf, an);
-			plat_endaudio();
-		}
+		// The audio pump moved into emu_render (right after the draw
+		// commands are issued): pumped here at loop end, the RSP audio
+		// burst was still draining when the next frame's render issued
+		// its commands, and the CPU ate it as rspq back-pressure. See
+		// the comment in emu_render; sound_gen_samples() is rate-
+		// agnostic and the pump is wall-clock driven, so the phase
+		// shift within the frame does not affect audio timing.
 		#endif
 
 		#ifndef N64
@@ -461,8 +613,10 @@ int main(int argc, char *argv[]) {
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());
 
-		debugf("[PROFILE] cpu:%.2f%% io:%.2f%% draw:%.2f%% dma:%.2f%% PC:%06lx\n",
+		framef("[PROFILE] cpu:%.2f%% m68k:%.2f%% snd:%.2f%% io:%.2f%% draw:%.2f%% dma:%.2f%% PC:%06lx\n",
 			(float)emu_time * 100.f / (float)(TICKS_PER_SECOND / 60),
+			(float)profile_m68k * 100.f / (float)(TICKS_PER_SECOND / 60),
+			(float)profile_snd * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)profile_hw_io * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)render_time * 100.f / (float)(TICKS_PER_SECOND / 60),
 			(float)profile_dma_load * 100.f / (float)(TICKS_PER_SECOND / 60),
@@ -471,6 +625,263 @@ int main(int argc, char *argv[]) {
 			#else
 			(uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
 			#endif
+		#if defined(MVS64_PCPROF) && defined(USE_M64K)
+		{
+			extern void pcprof_frame(int frame, int in_fight);
+			uint32_t fpc = m64k_get_pc(&m64k) & 0xFFFFFF;
+			pcprof_frame(g_frame, fpc == 0x3200 || fpc == 0x31fe);
+		}
+		#endif
+		#ifdef M64K_DYNSTAT
+		#define DYNSTAT_WINDOW 600
+		if (g_frame && (g_frame % DYNSTAT_WINDOW) == 0) {
+			// One pass: total + PC-region aggregates (the blueprint's
+			// P_ROM / WORK_RAM / PBROM-window split — decides whether
+			// bank-keyed translation must be pulled forward) and the
+			// top-16 hottest control-transfer targets.
+			uint64_t total = 0;
+			uint32_t reg_prom = 0, reg_ram = 0, reg_pbrom = 0, reg_bios = 0, reg_other = 0;
+			enum { DYNH_N = 64 };   // wide list: cross-ref with [DYNTERM]
+			int top[DYNH_N]; int ntop = 0;
+			for (int i = 0; i < 65536; i++) {
+				uint32_t n = m64k_dynstat_cnt[i];
+				if (!n) continue;
+				total += n;
+				uint32_t pc = m64k_dynstat_pc[i] & 0xFFFFFF;
+				if      (pc < 0x100000) reg_prom  += n;
+				else if (pc < 0x200000) reg_ram   += n;
+				else if (pc < 0x300000) reg_pbrom += n;
+				else if (pc >= 0xC00000 && pc < 0xC20000) reg_bios += n;
+				else reg_other += n;
+				int j = ntop;
+				while (j > 0 && m64k_dynstat_cnt[top[j-1]] < n) j--;
+				if (j < DYNH_N) {
+					if (ntop < DYNH_N) ntop++;
+					for (int k = ntop - 1; k > j; k--) top[k] = top[k-1];
+					top[j] = i;
+				}
+			}
+			framef("[DYNSTAT] win=%d total=%llu prom=%lu ram=%lu pbrom=%lu bios=%lu other=%lu\n",
+				DYNSTAT_WINDOW, (unsigned long long)total,
+				(unsigned long)reg_prom, (unsigned long)reg_ram,
+				(unsigned long)reg_pbrom, (unsigned long)reg_bios,
+				(unsigned long)reg_other);
+			for (int i = 0; i < ntop; i++)
+				framef("[DYNH] pc=%06lx n=%lu\n",
+					(unsigned long)(m64k_dynstat_pc[top[i]] & 0xFFFFFF),
+					(unsigned long)m64k_dynstat_cnt[top[i]]);
+			memset(m64k_dynstat_cnt, 0, sizeof(m64k_dynstat_cnt));
+			#ifdef M64K_DYNREC
+			{
+				// Dynarec density: cumulative translations/chains — the
+				// coverage levers phase-3 escalations are gated on.
+				extern uint32_t __m64k_dyn_stat_blocks, __m64k_dyn_stat_insns;
+				extern uint32_t __m64k_dyn_stat_chains, __m64k_dyn_stat_refused;
+				// exec = guest insns EXECUTED inside blocks this window
+				// (emitted counter). exec/DYNSTAT_WINDOW vs the ~8-11k
+				// insns/frame the interpreter dispatches is the residency
+				// fraction — the only coverage number that predicts fps.
+				extern uint32_t __m64k_dyn_stat_exec;
+				framef("[DYNSTAT2] blocks=%lu insns=%lu chains=%lu refused=%lu exec=%lu execpf=%lu\n",
+					(unsigned long)__m64k_dyn_stat_blocks,
+					(unsigned long)__m64k_dyn_stat_insns,
+					(unsigned long)__m64k_dyn_stat_chains,
+					(unsigned long)__m64k_dyn_stat_refused,
+					(unsigned long)__m64k_dyn_stat_exec,
+					(unsigned long)(__m64k_dyn_stat_exec / DYNSTAT_WINDOW));
+				__m64k_dyn_stat_exec = 0;
+			}
+			#endif
+		}
+		#endif
+		#if defined(M64K_BLOCKOPS) && (defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT))
+		// Own window: the DYNSTAT rig costs a jal per control transfer and
+		// runs ~3x slower, which stops the autoinput harness reaching a
+		// fight at all — so blockop accounting must be usable without it.
+		if (g_frame && (g_frame % 600) == 0) {
+			{
+				// Why the fused VRAM-port copy declines: a rejected
+				// blockop is silent everywhere else (the loop just runs
+				// interpreted, one TLB exception per word).
+				extern uint32_t blockop_fire, blockop_rej_dst;
+				extern uint32_t blockop_rej_bud, blockop_rej_span;
+				extern uint32_t blockop_rej_dstval, blockop_rej_shape;
+				extern uint32_t blockop_seen, blockop_t3val, blockop_t9val;
+				extern uint32_t blockop_rej_pc;
+				framef("[BOSTAT] seen=%lu shape=%lu fire=%lu rej_dst=%lu rej_bud=%lu"
+				       " rej_span=%lu t3=%ld body=%04lx dstval=%06lx rejpc=%06lx\n",
+					(unsigned long)blockop_seen,
+					(unsigned long)blockop_rej_shape,
+					(unsigned long)blockop_fire,
+					(unsigned long)blockop_rej_dst,
+					(unsigned long)blockop_rej_bud,
+					(unsigned long)blockop_rej_span,
+					(long)(int32_t)blockop_t3val,
+					(unsigned long)blockop_t9val,
+					(unsigned long)blockop_rej_dstval,
+					(unsigned long)(blockop_rej_pc & 0xFFFFFF));
+				blockop_fire = blockop_rej_dst = 0;
+				blockop_rej_bud = blockop_rej_span = 0;
+				blockop_seen = blockop_rej_shape = 0;
+			}
+		}
+		#endif
+		#ifdef M64K_TRACECRC
+		{
+			// Per-frame 68k state-trace hash (dynarec bit-exactness rig,
+			// m64k.c): two runs of the same build+inputs must emit identical
+			// [TRCRC] streams; a dynarec build must match the interpreter's.
+			extern uint32_t __m64k_tracecrc, __m64k_tracecrc_slices;
+			framef("[TRCRC] f=%d crc=%08lx slices=%lu\n", g_frame,
+				(unsigned long)__m64k_tracecrc,
+				(unsigned long)__m64k_tracecrc_slices);
+			__m64k_tracecrc = 2166136261u;
+			__m64k_tracecrc_slices = 0;
+			#ifdef M64K_TRCRC_SPLIT
+			{
+				// Content-only hash (regs/SR, no pc/cycles): separates
+				// timing displacement from real state divergence.
+				extern uint32_t __m64k_tracecrc_content;
+				framef("[TRCCON] f=%d crc=%08lx\n", g_frame,
+					(unsigned long)__m64k_tracecrc_content);
+				__m64k_tracecrc_content = 2166136261u;
+			}
+			#endif
+		}
+		#endif
+		#ifdef MVS64_PERFCOUNT
+		{
+			// Diagnostic counters (m64k_asm.S / hw_n64.S): executed 68k
+			// instructions, idle-skip fires and TLB exceptions this frame,
+			// plus the draw-bucket split from emu_render (in 0.01%-of-frame
+			// units to stay integer: 100.00% == 10000).
+			extern uint32_t perf_m68k_insns, perf_idle_skips, perf_tlb_faults;
+			extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
+			extern uint32_t perf_snd_pub;
+			const uint32_t fb = TICKS_PER_SECOND / 60 / 10000;  // ticks per 0.01%
+			framef("[PERF] insns=%lu skips=%lu tlb=%lu slices=%lu dwait=%lu dissue=%lu dend=%lu pub=%lu\n",
+				(unsigned long)perf_m68k_insns,
+				(unsigned long)perf_idle_skips,
+				(unsigned long)perf_tlb_faults,
+				(unsigned long)perf_m68k_slices,
+				(unsigned long)(perf_draw_wait / fb),
+				(unsigned long)(perf_draw_issue / fb),
+				(unsigned long)(perf_draw_end / fb),
+				(unsigned long)(perf_snd_pub / fb));
+			perf_m68k_insns = perf_idle_skips = perf_tlb_faults = 0;
+			perf_m68k_slices = 0;
+			perf_draw_wait = perf_draw_issue = perf_draw_end = 0;
+			perf_snd_pub = 0;
+
+			// DRAW-1 fine split of the draw-issue bucket (video.c): phase
+			// ticks (same 0.01%-of-frame units) + per-frame draw counts.
+			// walk = sprite pass minus cache lookups minus rspq issue.
+			extern uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
+			extern uint32_t perf_dr_cache, perf_dr_rspq;
+			extern uint32_t perf_dr_tiles, perf_dr_cells, perf_dr_empty;
+			extern uint32_t perf_dr_wwait;
+			extern uint32_t perf_walk_spr, perf_walk_iter;
+			framef("[PERF2] begin=%lu spr=%lu (cache=%lu rspq=%lu) fix=%lu tiles=%lu cells=%lu empty=%lu wwait=%lu wspr=%lu witer=%lu\n",
+				(unsigned long)(perf_dr_begin / fb),
+				(unsigned long)(perf_dr_sprites / fb),
+				(unsigned long)(perf_dr_cache / fb),
+				(unsigned long)(perf_dr_rspq / fb),
+				(unsigned long)(perf_dr_fix / fb),
+				(unsigned long)perf_dr_tiles,
+				(unsigned long)perf_dr_cells,
+				(unsigned long)perf_dr_empty,
+				(unsigned long)(perf_dr_wwait / fb),
+				(unsigned long)perf_walk_spr,
+				(unsigned long)perf_walk_iter);
+			perf_dr_begin = perf_dr_sprites = perf_dr_fix = 0;
+			perf_dr_cache = perf_dr_rspq = 0;
+			perf_dr_tiles = perf_dr_cells = perf_dr_empty = 0;
+			perf_dr_wwait = 0;
+			perf_walk_spr = perf_walk_iter = 0;
+
+			// PLAN-DRAW-RDP Phase 0 decision data ([PERF3]): drawn-stream
+			// run/repeat/palette/modal stats (video.c consume), cache-miss
+			// split (roms.c), and RDP busy fractions from the free-running
+			// 24-bit DPC counters (delta per window, wrap-safe at >=4fps).
+			// dppipe/dpclk ~= RDP pipe busy fraction; dptmem = TMEM loads.
+			{
+				extern uint32_t perf_dr_recs, perf_dr_adjrep, perf_dr_maxrun;
+				extern uint32_t perf_dr_uniqx, perf_dr_psw, perf_dr_modal;
+				extern uint32_t perf_dr_miss, perf_dr_missticks;
+				static uint32_t dpc_clk0, dpc_pipe0, dpc_tmem0;
+				uint32_t clk  = *(volatile uint32_t*)0xA4100010 & 0xFFFFFF;
+				uint32_t pipe = *(volatile uint32_t*)0xA4100018 & 0xFFFFFF;
+				uint32_t tmem = *(volatile uint32_t*)0xA410001C & 0xFFFFFF;
+				framef("[PERF3] recs=%lu rep=%lu maxrun=%lu uniq=%lu psw=%lu modal=%lu miss=%lu dmat=%lu dpclk=%lu dppipe=%lu dptmem=%lu\n",
+					(unsigned long)perf_dr_recs,
+					(unsigned long)perf_dr_adjrep,
+					(unsigned long)perf_dr_maxrun,
+					(unsigned long)perf_dr_uniqx,
+					(unsigned long)perf_dr_psw,
+					(unsigned long)perf_dr_modal,
+					(unsigned long)perf_dr_miss,
+					(unsigned long)(perf_dr_missticks / fb),
+					(unsigned long)((clk  - dpc_clk0)  & 0xFFFFFF),
+					(unsigned long)((pipe - dpc_pipe0) & 0xFFFFFF),
+					(unsigned long)((tmem - dpc_tmem0) & 0xFFFFFF));
+				dpc_clk0 = clk; dpc_pipe0 = pipe; dpc_tmem0 = tmem;
+				perf_dr_recs = perf_dr_adjrep = perf_dr_maxrun = 0;
+				perf_dr_uniqx = perf_dr_psw = perf_dr_modal = 0;
+				perf_dr_miss = perf_dr_missticks = 0;
+			}
+		}
+		#endif
+		#ifdef MVS64_OPHIST
+		// Exact per-opcode execution histogram (bumped in m64k_asm.S's
+		// dispatch). Every 300 frames: dump every opcode above ~0.05% of
+		// the interval's executed instructions, then reset. Offline
+		// analysis: analyze-ophist.py (parent dir).
+		if ((g_frame % 300) == 299) {
+			// One-time: free-RDRAM report, to size the predecode table.
+			static bool mi_done = false;
+			if (!mi_done) {
+				struct mallinfo mi = mallinfo();
+				framef("[HEAP] used=%u free=%u\n",
+					(unsigned)mi.uordblks, (unsigned)mi.fordblks);
+				mi_done = true;
+			}
+			uint64_t total = 0;
+			for (int i = 0; i < 65536; i++) total += m64k_ophist_tab[i];
+			uint32_t thresh = (uint32_t)(total / 2000);
+			if (thresh < 4) thresh = 4;
+			enum { OPHIST_MAX = 384 };
+			static uint16_t sel_op[OPHIST_MAX];
+			static uint32_t sel_n[OPHIST_MAX];
+			int nsel = 0;
+			uint64_t selected = 0;
+			for (int i = 0; i < 65536 && nsel < OPHIST_MAX; i++) {
+				if (m64k_ophist_tab[i] >= thresh) {
+					sel_op[nsel] = (uint16_t)i;
+					sel_n[nsel] = m64k_ophist_tab[i];
+					selected += m64k_ophist_tab[i];
+					nsel++;
+				}
+			}
+			// insertion sort, descending by count (nsel <= 384)
+			for (int i = 1; i < nsel; i++) {
+				uint16_t o = sel_op[i]; uint32_t n = sel_n[i]; int j = i - 1;
+				while (j >= 0 && sel_n[j] < n) {
+					sel_op[j+1] = sel_op[j]; sel_n[j+1] = sel_n[j]; j--;
+				}
+				sel_op[j+1] = o; sel_n[j+1] = n;
+			}
+			framef("[OPHIST] total=%llu sel=%llu nsel=%d\n",
+				(unsigned long long)total, (unsigned long long)selected, nsel);
+			for (int i = 0; i < nsel; i += 8) {
+				char line[160]; int p = 0;
+				for (int j = i; j < nsel && j < i + 8; j++)
+					p += sprintf(line + p, " %04x:%lu",
+						sel_op[j], (unsigned long)sel_n[j]);
+				framef("[OPH]%s\n", line);
+			}
+			memset(m64k_ophist_tab, 0, sizeof(m64k_ophist_tab));
+		}
+		#endif
 		#ifdef MVS64_IDLEPROBE
 		{
 			extern uint32_t idle_probe_found;

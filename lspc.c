@@ -37,7 +37,7 @@ static uint16_t lspc_vram_modulo_r(void) {
 	return reg_vram_mod;
 }
 
-static uint16_t lspc_mode_r() {
+static __attribute__((noinline)) uint16_t lspc_mode_r() {
 	int64_t clk = emu_clock_frame();
 	int line = clk / (MVS_CLOCK / FPS / 264);
 

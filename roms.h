@@ -1,6 +1,9 @@
 #ifndef ROMS_H
 #define ROMS_H
 
+#include <stdint.h>
+#include <stdbool.h>
+
 extern uint8_t *P_ROM;
 extern unsigned int rom_pc_idle_skip;
 
@@ -15,6 +18,21 @@ void rom_load_prom(const char *dir);
 
 uint8_t* crom_get_sprite(int spritenum);
 uint8_t* srom_get_sprite(int spritenum);
+
+// True if the fix-layer tile decodes to all index-0 (fully transparent)
+// pixels — drawing it can never touch the screen, so callers skip it.
+// Learns lazily on first sight of each tile; reset by srom_set_bank.
+bool srom_tile_empty(int spritenum);
+
+// Same fact for sprite (C-ROM) tiles: all index-0 pixels can never touch
+// the screen (alpha-compare kills them in every palette). Learns lazily on
+// first fetch; reset by crom_set_bank.
+bool crom_tile_empty(int spritenum);
+
+// Fused empty-test + lookup through the per-tile direct table: NULL if the
+// tile is all-transparent (skip it), else the cached pixel pointer (valid
+// for the rest of the frame). One sparse table read on the hot path.
+uint8_t* crom_resolve(int spritenum);
 
 void srom_set_bank(int bank);  // 0 = fixed (BIOS), 1 = game
 

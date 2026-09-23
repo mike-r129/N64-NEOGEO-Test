@@ -1,0 +1,7 @@
+n_all=98453847
+n_match=46486750
+window=[2900..5600]
+bcc_taken=11592368
+bcc_nottaken=1749672
+dbcc_looped=2043814
+dbcc_fell=235042

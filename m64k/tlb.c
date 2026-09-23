@@ -35,6 +35,7 @@ static int tlb_map_area_internal(uint32_t virt, uint32_t vmask, uint32_t phys, i
 
 	// Create the new entry
 	uint32_t entry = (phys & 0x3FFFF000) >> 6;
+	entry |= 3<<3;   // coherency: cacheable noncoherent (0 is RESERVED on VR4300)
 	if (!(flags & TLBF_READONLY))
 		entry |= (1<<2); // dirty bit
 	entry |= 1<<1; // valid bit
@@ -126,6 +127,7 @@ void __m64k_tlb_change(uint32_t mid, uint32_t phys, int flags)
 
 	// Create the new entry
 	uint32_t entry = (phys & 0x3FFFF000) >> 6;
+	entry |= 3<<3;   // coherency: cacheable noncoherent (0 is RESERVED on VR4300)
 	if (!(flags & TLBF_READONLY))
 		entry |= (1<<2); // dirty bit
 	entry |= 1<<1; // valid bit

@@ -38,6 +38,10 @@ void sprite_cache_init(SpriteCache *c, int sprite_size, int max_sprites) {
 	// nothing and it also allows faster memory invalidations without writebacks.
 	c->sprites = memalign(16, sprite_size * max_sprites);
 	assertf(c->sprites, "memory allocation failed");
+	assertf((sprite_size & (sprite_size-1)) == 0, "sprite_size must be pow2");
+	c->sprite_shift = __builtin_ctz(sprite_size);
+	c->slot_tick = malloc(max_sprites);
+	assertf(c->slot_tick, "memory allocation failed");
 
 	c->free_sprite_indices = malloc(sizeof(uint16_t) * max_sprites);
 	assertf(c->free_sprite_indices, "memory allocation failed");
@@ -97,7 +101,7 @@ uint8_t* sprite_cache_lookup(SpriteCache *c, uint32_t key) {
 	while (1) {
 		SpriteCacheEntry *b = &c->buckets[bidx];
 		if (b->key == key && b->sprite) {
-			b->last_tick = c->cur_tick;
+			c->slot_tick[sprite_cache_slot(c, b->sprite)] = c->cur_tick;
 			return b->sprite;
 		}
 
@@ -132,6 +136,7 @@ uint8_t* sprite_cache_insert(SpriteCache *c, uint32_t key) {
 		.last_tick = c->cur_tick,
 	};
 	c->num_sprites++;
+	c->slot_tick[sprite_cache_slot(c, sprite)] = c->cur_tick;
 
 	int bidx = hash(key) & (c->num_buckets-1);
 	int dist = 0;
@@ -168,7 +173,12 @@ uint8_t* sprite_cache_insert(SpriteCache *c, uint32_t key) {
 // The actual number of sprites that will be removed depend on the cache
 // status.
 void sprite_cache_pop(SpriteCache *c) {
-	int bidx = rand() & (c->num_buckets-1);
+	// Deterministic scatter (PLAN rank 7): rand() here made eviction — and
+	// therefore CROM reload DMA — differ run to run, adding noise to perf
+	// A/Bs. An LCG gives the same anti-systematic scatter, reproducibly.
+	static uint32_t lcg = 0x2545F491;
+	lcg = lcg * 1664525u + 1013904223u;
+	int bidx = (lcg >> 16) & (c->num_buckets-1);
 
 	int cutoff = c->cur_tick - c->tick_cutoff;
 	int n = 0;
@@ -176,14 +186,19 @@ void sprite_cache_pop(SpriteCache *c) {
 	LOG("[CACHE] pop target %d => %d\n", c->num_sprites, target);
 	while (c->num_sprites > target && n < c->num_buckets) {
 		SpriteCacheEntry *b = &c->buckets[bidx];
-		if (b->sprite && (uint8_t)((c->cur_tick & 0xFF) - b->last_tick) > cutoff) {
+		if (b->sprite && (uint8_t)((c->cur_tick & 0xFF)
+		        - c->slot_tick[sprite_cache_slot(c, b->sprite)]) > cutoff) {
 			// Found an entry that is older than the cutoff, remove it
 			int sprite_idx = (b->sprite - c->sprites) / SPRITE_FREEIDX_SCALE;
+			if (c->dt && c->dt[b->key] >= 3)
+				c->dt[b->key] = 2;   // resident -> known non-empty
 			c->free_sprite_indices[c->max_sprites - c->num_sprites] = sprite_idx;
 			c->num_sprites--;
 			b->sprite = NULL;
+			c->evict_gen++;   // external memoized pointers are now stale
 			LOG("[CACHE] evicted (tick:%d cutoff:%d)\n", (int)b->last_tick, (int)c->tick_cutoff);
-			bidx = rand() & (c->num_buckets-1);
+			lcg = lcg * 1664525u + 1013904223u;
+			bidx = (lcg >> 16) & (c->num_buckets-1);
 		}
 
 		n++;

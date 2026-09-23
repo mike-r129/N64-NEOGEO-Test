@@ -6,6 +6,14 @@
 #define SR_MASK    0xA71F
 #define CCR_MASK   0x1F
 
+# The inline fast paths replicate the generic paths' cycle charges exactly at
+# TIMING_ACCURACY<=0. The >=1 penalty fixups (cyc_move_penalty, the .l
+# reg-direct quirks, etc.) are NOT replicated, so accuracy>=1 builds compile
+# the fast paths out and use the generic implementations everywhere.
+#if defined(M64K_FASTPATHS) && (M64K_CONFIG_TIMING_ACCURACY >= 1)
+#undef M64K_FASTPATHS
+#endif
+
 # When set to 1, most MIPS registers will be set to random values at start.
 # This is useful when running the testsuite, to verify that the code does not
 # depend on the initial values of the registers.
@@ -33,7 +41,85 @@
 .endm
 
      .section .sdata
+#ifdef M64K_SDATA_PAD
+# Layout steering (2026-08-07): the per-insn PERFCOUNT counter bump and the
+# per-insn m64k ctx accesses must not share a dcache set (8KB direct-mapped;
+# set=(addr>>4)&511). A collision (measured: counters at ctx+7*8KB exactly)
+# ping-pongs one set EVERY dispatched insn — ~2x m68k time, corrupting every
+# fps measurement in that build. Verify disjointness with nm-perfsyms.sh
+# after ANY build used for fps numbers; steer with -DM64K_SDATA_PAD=<bytes>.
+    .space M64K_SDATA_PAD
+#endif
+# .globl: dynrec.c bakes &pc_diff into absolute-target enders (JMP/JSR
+# (xxx).l recompute it; delta exits preserve it).
+    .globl pc_diff
 pc_diff:      .long 0
+#ifdef MVS64_PERFCOUNT
+# Per-frame diagnostic counters (read+reset by emu.c's [PERF] print):
+# executed 68k instructions and idle-skip fires. Diagnostic builds only —
+# the dispatch loop increment costs ~3 insns/instruction.
+    .globl perf_m68k_insns
+perf_m68k_insns: .long 0
+    .globl perf_idle_skips
+perf_idle_skips: .long 0
+#endif
+#ifdef MVS64_OPHIST
+# Exact per-opcode execution histogram (65536 u32 slots, table lives in
+# emu.c). Diagnostic builds only: the dispatch bump costs ~6 insns plus a
+# dcache touch per executed instruction, so absolute timings are skewed —
+# use the counts, not the fps, from an OPHIST run.
+    .globl m64k_ophist_ptr
+m64k_ophist_ptr: .long m64k_ophist_tab
+#endif
+#ifdef M64K_BLOCKOPS
+# Runtime gate for the fused copy/fill path. Twin builds differ ONLY by this
+# initializer, so ON-vs-OFF is a layout-identical A/B (the ±10-15fps
+# cache-set lottery makes any other cross-binary fps comparison worthless).
+    .globl mvs64_blockop_enable
+#ifdef MVS64_BLOCKOP_DISABLE
+mvs64_blockop_enable: .long 0
+#else
+mvs64_blockop_enable: .long 1
+#endif
+# Separate gate for the (An)+ -> (Am)+ long-copy fusion so its own fps
+# increment can be twinned independently of the established fusions.
+    .globl mvs64_blockop_copyl_enable
+#ifdef MVS64_COPYL_DISABLE
+mvs64_blockop_copyl_enable: .long 0
+#else
+mvs64_blockop_copyl_enable: .long 1
+#endif
+# Gate for the "move.w Dn,(An)" VRAM-port constant fill fusion.
+    .globl mvs64_blockop_fwp_enable
+#ifdef MVS64_FWP_DISABLE
+mvs64_blockop_fwp_enable: .long 0
+#else
+mvs64_blockop_fwp_enable: .long 1
+#endif
+#endif
+#if defined(M64K_BLOCKOPS) && (defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT))
+# Fused-blockop accounting ([BOSTAT]); diagnostic builds only.
+    .globl blockop_fire
+blockop_fire:     .long 0
+    .globl blockop_rej_dst
+blockop_rej_dst:  .long 0
+    .globl blockop_rej_bud
+blockop_rej_bud:  .long 0
+    .globl blockop_rej_span
+blockop_rej_span: .long 0
+    .globl blockop_rej_dstval
+blockop_rej_dstval: .long 0
+    .globl blockop_rej_shape
+blockop_rej_shape: .long 0
+    .globl blockop_seen
+blockop_seen:     .long 0
+    .globl blockop_t3val
+blockop_t3val:    .long 0
+    .globl blockop_t9val
+blockop_t9val:    .long 0
+    .globl blockop_rej_pc
+blockop_rej_pc:   .long 0
+#endif
 #ifdef MVS64_IDLEPROBE
 # Idle-spin probe: detects a branch/jump target hit many times CONSECUTIVELY
 # (a true wait-for-IRQ spin) vs a bounded backward loop (memcpy/DBRA). The PC
@@ -58,7 +144,11 @@ optable4e:
     .long   op_unk,    op_unk,    op_unk,    op_unk,    op_trap,   op_link,   op_mvusp,  op_tbl4e7
     .long   op_jsr,    op_jsr,    op_jsr,    op_jsr,    op_jmp,    op_jmp,    op_jmp,    op_jmp
 optable4e7:
+#ifdef M64K_FASTPATHS
+    .long   op_reset,  op_nop,    op_stop,   op_rte,    op_rtd,    rts_fast,  op_trapv,  op_rtr
+#else
     .long   op_reset,  op_nop,    op_stop,   op_rte,    op_rtd,    op_rts,    op_trapv,  op_rtr
+#endif
     .long   op_unk,    op_unk,    op_movec,  op_movec,  op_unk,    op_unk,    op_unk,    op_unk
 
 opshifts:
@@ -86,6 +176,15 @@ opshiftsmem:
 #define opcode      s0     // current opcode being executed
 #define eaptr       s1     // effective address pointer (in N64 space)
 #define dptr        s2     // pointer to the other register in the opcode (in N64 space)
+#ifdef M64K_PREDECODE
+#define pd_l1base   s3     // base of the predecode per-page L1 table (__m64k_pd_l1)
+#endif
+#ifdef M64K_DYNREC
+#ifdef M64K_PREDECODE
+#error "M64K_DYNREC and M64K_PREDECODE both claim s3"
+#endif
+#define dyn_tab     s3     // base of the dynarec block table (__m64k_dyn_table)
+#endif
 #define opsize      s4     // size of the current instruction (1=byte, 2=word, 4=long, 0=not decoded yet)
 #define __________  s5     // unused (NOTE: this is used within movem)
 #define flag_nv     s6     // bit 31: N; bit 63: N^V
@@ -319,6 +418,88 @@ opshiftsmem:
 .endm
 
 
+# "dispatch_body" macro: the real main_loop dispatch. In classic builds it is
+# also expanded at the tail of every M64K_FASTPATHS handler (as
+# "dispatch_next") to skip the "j main_loop" hop. In M64K_PREDECODE builds it
+# is expanded ONLY at main_loop (the record dispatch is bigger, and the
+# ~13.5KB icache law forbids inlining it ~30x — see PLAN-OPTIMIZATION.md);
+# the tails then compile to a plain "j main_loop". Any change here IS a
+# change to main_loop.
+#
+# Predecode record dispatch (phase 1): the guest-page L1 table (pd_l1base =
+# s3, entries pre-biased per page, built in m64k.c) yields a 4-byte record
+# per guest word: {s16 handler offset from main_loop (the lax base), u16
+# operand}. The record address is left in t1 for phase-2 specialized
+# handlers. The opcode lhu stays FIRST so odd-PC behavior (misaligned fault
+# / ADDRERR) is bit-identical to the classic dispatch.
+.macro dispatch_body
+    .set push
+    .set noreorder
+    blez m_cycles, main_loop_exit
+     lhu opcode, 0(m_pc)
+#ifdef MVS64_PERFCOUNT
+    lw t1, perf_m68k_insns
+    addiu t1, 1
+    sw t1, perf_m68k_insns
+#endif
+#ifdef MVS64_OPHIST
+    lw t1, m64k_ophist_ptr
+    sll t2, opcode, 2
+    addu t1, t2
+    lw t2, 0(t1)
+    addiu t2, 1
+    sw t2, 0(t1)
+#endif
+    #if M64K_CONFIG_ADDRERR
+    sw opcode, M64K_OFF_IR(ctx)
+    #endif
+    #if M64K_CONFIG_TIMING_ACCURACY < 0
+    addi m_cycles, M64K_CONFIG_TIMING_ACCURACY
+    #endif
+#ifdef M64K_PREDECODE
+    srl t1, m_pc, 10                   # page index * 4: (m_pc>>12)<<2
+    andi t1, 0x3FFC
+    addu t1, pd_l1base
+    lw t1, 0(t1)                       # biased record-block base
+    sll t2, m_pc, 1                    # 32-bit: the bias cancels the page bits
+    addu t1, t2                        # t1 = record address (phase-2 ABI)
+    lh t0, 0(t1)                       # s16 handler offset from main_loop
+    addu t0, lax_base
+    jr t0
+     addi m_pc, 2
+#else
+    srl t1, opcode, 12
+    sll t1, 2
+    lw t0, optable(t1)
+    jr t0
+     addi m_pc, 2
+#endif
+    .set pop
+.endm
+
+# "dispatch_next": fast-path handler tails. See dispatch_body.
+.macro dispatch_next
+#ifdef M64K_PREDECODE
+    j main_loop
+#else
+    dispatch_body
+#endif
+.endm
+
+# "check_addr_bail" macro. Used by the M64K_FASTPATHS handlers on ADDRERR
+# builds: an odd word address bails to the opcode's GENERIC implementation
+# (label) with no architectural state mutated, so the generic path re-executes
+# the instruction from scratch and raises the address error through its normal
+# machinery with bit-exact state. Compiles to nothing on non-ADDRERR builds.
+.macro check_addr_bail reg, label
+    #if M64K_CONFIG_ADDRERR
+    .set noat
+    andi $1, \reg, 1
+    bnez $1, \label
+    .set at
+    #endif
+.endm
+
     .globl _m64k_asmrun
 _m64k_asmrun:
     addiu sp,sp,-128
@@ -339,6 +520,12 @@ _m64k_asmrun:
     li mmap_mask, M64K_CONFIG_MEMORY_BASE
     #endif
     la lax_base, LAX_BASE_ADDR
+#ifdef M64K_PREDECODE
+    la pd_l1base, __m64k_pd_l1
+#endif
+#ifdef M64K_DYNREC
+    la dyn_tab, __m64k_dyn_table
+#endif
     dli zx64_mask, 0x00000000FFFFFFFF
     lw t1, M64K_OFF_PC(ctx)
     lw t0, M64K_OFF_SR(ctx)
@@ -355,10 +542,47 @@ _m64k_asmrun:
     jal reload_sr
     nop
 
+    # Entry-time IRQ check. The per-instruction check_interrupts poll is gone
+    # from main_loop: mid-slice IRQ/run_stop requests now force the timeslice
+    # to end (see slice_break / forced_remaining in the TLB handler and the
+    # reload_sr clamp), and the pending IRQ lines are re-examined here on the
+    # next entry. This keeps IRQ latency at the same instruction boundary as
+    # the old poll while removing 3 instructions from the dispatch hot path.
+    sb zero, M64K_OFF_SLICE_BREAK(ctx)
+    sb zero, M64K_OFF_CHECK_INTERRUPTS(ctx)
+    lbu t0, M64K_OFF_NMI_PENDING(ctx)
+    li t1, 7
+    bnez t0, entry_raise_irq
+    lbu t0, M64K_OFF_SR+2(ctx)
+    lbu t1, M64K_OFF_IPL(ctx)
+    andi t0, 7
+    bgt t1, t0, entry_raise_irq
+
     sw m_cycles, M64K_OFF_TS_START(ctx)
+    sw m_cycles, M64K_OFF_TS_CUR(ctx)
     #if M64K_CONFIG_TIMING_ACCURACY >= 0
     li rmw_cyctable, 0
     #endif
+
+#ifdef M64K_DYNREC
+    # Dynarec block-table probe, slice-entry site (phase 1: the table is
+    # empty — tags are all 0xFFFFFFFF and guest PCs are 24-bit, so the hit
+    # path is unreachable; this measures the shipping lookup cost and
+    # reserves the site). Set = ((pc >> 1) & (SETS-1)) * 16 bytes.
+    .set push
+    .set noreorder
+    lw t1, M64K_OFF_PC(ctx)
+    srl t2, t1, 1
+    andi t2, (M64K_DYN_TABLE_SETS-1)
+    sll t2, 4
+    addu t2, dyn_tab
+    lw t3, 0(t2)                       # way-0 tag
+    beq t3, t1, dyn_probe_hit
+     lw t3, 8(t2)                      # way-1 tag
+    beq t3, t1, dyn_probe_hit1
+     nop
+    .set pop
+#endif
 
     #if RANDOM_INITIAL_VALUES
     #define C0_COUNT	$9
@@ -384,23 +608,27 @@ _m64k_asmrun:
     or flag_x, t1
     #endif
 
+#if defined(M64K_PREDECODE) || defined(M64K_DYNREC)
+    .globl main_loop
+#endif
 ALIGN(main_loop):
-    blez m_cycles, main_loop_exit
-     sw m_cycles, M64K_OFF_TS_CUR(ctx)
-    lbu t0, M64K_OFF_CHECK_INTERRUPTS(ctx)
-    lhu opcode, 0(m_pc)
-    bnez t0, check_interrupt
-    #if M64K_CONFIG_ADDRERR
-    sw opcode, M64K_OFF_IR(ctx)
-    #endif
-    #if M64K_CONFIG_TIMING_ACCURACY < 0
-    addi m_cycles, M64K_CONFIG_TIMING_ACCURACY
-    #endif
+    dispatch_body
+#ifdef M64K_PREDECODE
+# Classic-dispatch record target: every record of an unpromoted page points
+# here (phase 1: every record, full stop). The opcode is already loaded and
+# m_pc already advanced by dispatch_body; this is exactly the classic
+# optable dispatch minus those two steps.
+    .globl classic_dispatch_body
+ALIGN(classic_dispatch_body):
+    .set push
+    .set noreorder
     srl t1, opcode, 12
     sll t1, 2
     lw t0, optable(t1)
     jr t0
-     addi m_pc, 2
+     nop
+    .set pop
+#endif
 op_tbl0:
     srl t0, opcode, 6
     andi t0, 0xF << 2
@@ -439,20 +667,8 @@ OP(shifts):
     jr t0
     li opsize, 2
 
-check_interrupt:
-    beq t0, 2, main_loop_exit
-    sb zero, M64K_OFF_CHECK_INTERRUPTS(ctx)
-    # Check if a NMI is pending
-    lbu t0, M64K_OFF_NMI_PENDING(ctx)
-    bnez t0, raise_irq
-    li t1, 7
-    # Check if IPL > SR.irq_mask
-    lbu t0, M64K_OFF_SR+2(ctx)
-    lbu t1, M64K_OFF_IPL(ctx)
-    andi t0, 7
-    ble t1, t0, main_loop
-raise_irq:
-    # Raise an IRQ (level in t1)
+entry_raise_irq:
+    # Raise an IRQ (level in t1). Reached only from the entry-time check.
     li t0, M64K_PENDINGEXC_IRQ
     sw_ctx t0, M64K_OFF_PENDINGEXC+0
     j main_loop_exit
@@ -556,10 +772,25 @@ reload_sr_chstack:
     lw_ctx t2, M64K_OFF_USP,t1       # Copy USP/SSP to A7
     sw_ctx t2, M64K_OFF_AREGS+7*4
 
-    li t1, 1
-    sb t1, M64K_OFF_CHECK_INTERRUPTS(ctx)
-
-    jr ra
+    # If the (new) SR leaves a pending IRQ unmasked (or an NMI is pending),
+    # force the timeslice to end: bank the live cycle counter into
+    # forced_remaining and zero it. The current instruction still completes
+    # (so e.g. RTE/STOP finish updating PC/SR first), then main_loop exits
+    # and the re-entry check raises the IRQ at the exact same instruction
+    # boundary the old per-instruction poll would have.
+    lbu t1, M64K_OFF_NMI_PENDING(ctx)
+    lbu t2, M64K_OFF_IPL(ctx)
+    bnez t1, reload_sr_clamp
+    srl t0, 8
+    andi t0, 7
+    ble t2, t0, 1f
+reload_sr_clamp:
+    lw t1, M64K_OFF_FORCED_REMAINING(ctx)
+    addu t1, m_cycles
+    sw t1, M64K_OFF_FORCED_REMAINING(ctx)
+    sw m_cycles, M64K_OFF_TS_CUR(ctx)
+    li m_cycles, 0
+1:  jr ra
     nop
 
 reload_stack:
@@ -1209,6 +1440,13 @@ invalid_opmode:
 OP(addq): OP(subq):
     andi t0, opcode, 3<<6
     beq t0, 3<<6, op_scc
+#ifdef M64K_FASTPATHS
+    # ADDQ/SUBQ #imm,Dn fast path; An destinations (no flags, always long)
+    # and memory EAs stay generic. Accuracy-0 charges: quick table, EA-reg
+    # column (4 for .b/.w, 8 for .l).
+    andi t0, opcode, 0x38
+    beqz t0, addq_fast
+#endif
     set_rmw_cyctable rmw_cyctable_quick
     use_cycles_opmask (7<<3)|(3<<6), (1<<3)|(2<<6), -2   # 2 fewer cycles if EA is An/long
     use_cycles_opmask (7<<3)|(3<<6), (1<<3)|(1<<6), +4   # 4 more cycles if EA is An/word
@@ -1239,18 +1477,275 @@ op_subq_rmwimpl:
     nop
     .set reorder
 
+#ifdef M64K_FASTPATHS
+addq_fast:
+    srl t0, opcode, 9                  # immediate: bits 11:9, 0 means 8
+    addi t0, -1
+    andi t0, 7
+    addi t0, 1
+    andi t2, opcode, 7                 # destination Dn
+    sll t2, 2
+    add t2, ctx
+    la dptr, M64K_OFF_PENDINGEXC+4(ctx) # generic-path dptr parity: successors
+                                       # may dummy-read a stale dptr, so it
+                                       # must stay a valid EVEN host pointer
+    andi t1, opcode, 0x100             # bit 8: 0 = ADDQ, 1 = SUBQ
+    bnez t1, subq_f
+    andi t3, opcode, 0xC0
+    beqz t3, addq_f_byte
+    xori t1, t3, 0x40
+    beqz t1, addq_f_word
+addq_f_long:                           # addq.l #,Dn (8 cycles)
+    lwu t1, M64K_OFF_DREGS(t2)
+    daddu result, t0, t1
+    move flag_zc, result
+    dsrl flag_x, flag_zc, 32
+    sll t0, 0
+    sll t1, 0
+    daddu flag_nv, t0, t1
+    sw result, M64K_OFF_DREGS(t2)
+    use_cycles 8
+    dispatch_next
+addq_f_word:                           # addq.w #,Dn (4 cycles)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    daddu flag_nv, t0, t1
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 4
+    dispatch_next
+addq_f_byte:                           # addq.b #,Dn (4 cycles)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 24
+    dsrl flag_x, flag_zc, 32
+    sll t0, 24
+    sll t1, 24
+    daddu flag_nv, t0, t1
+    sb result, M64K_OFF_DREGS+3(t2)
+    use_cycles 4
+    dispatch_next
+subq_f:
+    andi t3, opcode, 0xC0
+    beqz t3, subq_f_byte
+    xori t1, t3, 0x40
+    beqz t1, subq_f_word
+subq_f_long:                           # subq.l #,Dn (8 cycles)
+    lwu t1, M64K_OFF_DREGS(t2)
+    dsubu result, t1, t0
+    move flag_zc, result
+    dsrl flag_x, flag_zc, 32
+    sll t0, 0
+    sll t1, 0
+    dsubu flag_nv, t1, t0
+    sw result, M64K_OFF_DREGS(t2)
+    use_cycles 8
+    dispatch_next
+subq_f_word:                           # subq.w #,Dn (4 cycles)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    dsubu flag_nv, t1, t0
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 4
+    dispatch_next
+subq_f_byte:                           # subq.b #,Dn (4 cycles)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 24
+    dsrl flag_x, flag_zc, 32
+    sll t0, 24
+    sll t1, 24
+    dsubu flag_nv, t1, t0
+    sb result, M64K_OFF_DREGS+3(t2)
+    use_cycles 4
+    dispatch_next
+#endif
+
 OP(addi):
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+    # ADDI.w #,Dn fast path (wave 3, M64K_W3_FULL only). Charge: immediate table, EA-reg
+    # eadst column = 8. Full ADD flags including X (add_f_word idiom).
+    andi t0, opcode, 0x38
+    bnez t0, addi_slow
+    andi t0, opcode, 0xC0
+    xori t0, 0x40
+    bnez t0, addi_slow
+    andi t2, opcode, 7
+    sll t2, 2
+    add t2, ctx
+    addi dptr, m_pc, -2                # decode_imm parity (see ANDI note)
+    lhu t0, 0(m_pc)                    # immediate word (code stream)
+    addiu m_pc, 2
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    daddu flag_nv, t0, t1
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 8
+    dispatch_next
+addi_slow:
+#endif
     lax rmw_op, op_add_rmwimpl
     jal_and_j decode_imm, rmw_eadst
 op_subi:  # (same cacheline)
     lax rmw_op, op_sub_rmwimpl
     jal_and_j decode_imm, rmw_eadst
+#ifdef M64K_FASTPATHS
+# CMPI #imm,Dn fast path: CMP flags (no X), no writeback. The flag code is an
+# exact inline copy of op_cmp_rmwimpl with rmw_bitsize folded. Accuracy-0
+# charges: cmpi table, EA-reg column (8 for .b/.w, 14 for .l). The (illegal)
+# size-11 encoding keeps the generic path's behavior.
 op_cmpi:
+    andi t0, opcode, 0x38
+    bnez t0, cmpi_slow
+    andi t2, opcode, 7                 # Dn operand
+    sll t2, 2
+    add t2, ctx
+    andi t3, opcode, 0xC0
+    beqz t3, cmpi_f_byte
+    beq t3, 0xC0, cmpi_slow
+    xori t1, t3, 0x40
+    beqz t1, cmpi_f_word
+cmpi_f_long:                           # cmpi.l #,Dn (14 cycles)
+    move dptr, m_pc                    # imm_32 parity (stale-dptr rule)
+    lwl t0, 0(m_pc)                    # 32-bit immediate from the code stream
+    lwr t0, 3(m_pc)
+    addiu m_pc, 4
+    lwu t1, M64K_OFF_DREGS(t2)
+    zx64 t0
+    dsubu result, t1, t0
+    move flag_zc, result
+    sll t0, 0
+    sll t1, 0
+    dsubu flag_nv, t1, t0
+    use_cycles 14
+    dispatch_next
+cmpi_f_word:                           # cmpi.w #,Dn (8 cycles)
+    addi dptr, m_pc, -2                # imm_16 parity (stale-dptr rule)
+    lhu t0, 0(m_pc)
+    addiu m_pc, 2
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 16
+    sll t0, 16
+    sll t1, 16
+    dsubu flag_nv, t1, t0
+    use_cycles 8
+    dispatch_next
+cmpi_f_byte:                           # cmpi.b #,Dn (8 cycles)
+    addi dptr, m_pc, -2                # imm_8 parity (stale-dptr rule)
+    lbu t0, 1(m_pc)                    # low byte of the extension word
+    addiu m_pc, 2
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 24
+    sll t0, 24
+    sll t1, 24
+    dsubu flag_nv, t1, t0
+    use_cycles 8
+    dispatch_next
+cmpi_slow:
+#else
+op_cmpi:
+#endif
     set_rmw_cyctable rmw_cyctable_cmpi
     lax rmw_op, op_cmp_rmwimpl
     jal_and_j decode_imm_nocyctable, rmw_eadst
 
+#ifdef M64K_FASTPATHS
+# ADD <Dn>,Dm reg-direct fast path (~3% of in-match instructions). The flag
+# code is an exact inline copy of op_add_rmwimpl with rmw_bitsize folded to a
+# constant; charges are the generic accuracy-0 costs (logical table, EA-reg
+# column: 4 for .b/.w, 6 for .l — the hardware's 8 for .l only appears at
+# accuracy>=1, where fast paths are compiled out). ADDA/ADDX stay generic.
 OP(add):
+    andi t0, opcode, 0x138             # EA mode Dn, direction <ea>+Dm -> Dm
+    bnez t0, add_slow
+    andi t0, opcode, 0xC0
+#ifdef M64K_W3_FULL
+    beq t0, 0xC0, adda_f_w             # opmode 011 = ADDA.w (Dn source here)
+#else
+    beq t0, 0xC0, add_slow             # opmode 011 = ADDA.w
+#endif
+    andi t1, opcode, 7                 # source Dn
+    sll t1, 2
+    add t1, ctx
+    srl t2, opcode, 7                  # destination Dm
+    andi t2, 0x7<<2
+    add t2, ctx
+    move dptr, t2                      # decode_dptr parity (stale-dptr rule)
+    beqz t0, add_f_byte
+    xori t3, t0, 0x40
+    beqz t3, add_f_word
+add_f_long:                            # add.l Dn,Dm (6 cycles at accuracy 0)
+    lwu t0, M64K_OFF_DREGS(t1)
+    lwu t1, M64K_OFF_DREGS(t2)
+    daddu result, t0, t1
+    move flag_zc, result               # bit32 = carry, low32 = !Z
+    dsrl flag_x, flag_zc, 32
+    sll t0, 0                          # re-sign-extend, like sllv by 0
+    sll t1, 0
+    daddu flag_nv, t0, t1
+    sw result, M64K_OFF_DREGS(t2)
+    use_cycles 6
+    dispatch_next
+add_f_word:                            # add.w Dn,Dm (4 cycles)
+    lhu t0, M64K_OFF_DREGS+2(t1)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 16
+    dsrl flag_x, flag_zc, 32
+    sll t0, 16
+    sll t1, 16
+    daddu flag_nv, t0, t1
+    sh result, M64K_OFF_DREGS+2(t2)
+    use_cycles 4
+    dispatch_next
+add_f_byte:                            # add.b Dn,Dm (4 cycles)
+    lbu t0, M64K_OFF_DREGS+3(t1)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    daddu result, t0, t1
+    dsll flag_zc, result, 24
+    dsrl flag_x, flag_zc, 32
+    sll t0, 24
+    sll t1, 24
+    daddu flag_nv, t0, t1
+    sb result, M64K_OFF_DREGS+3(t2)
+    use_cycles 4
+    dispatch_next
+#ifdef M64K_W3_FULL
+adda_f_w:                              # adda.w Dn,An (wave 3; 8 cycles, no flags)
+    # Reached from the OP(add) prologue with EA mode already known to be Dn
+    # (0x138 clear) and opmode 011. Source word sign-extends, full 32-bit add
+    # into An. Charge is the generic op_adda 16-bit path's flat 8.
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lh t0, M64K_OFF_DREGS+2(t1)
+    srl t2, opcode, 7
+    andi t2, 0x7<<2
+    add t2, ctx
+    addi dptr, t2, 32                  # decode_dptr+op_adda parity (An slot)
+    lw t3, M64K_OFF_AREGS(t2)
+    addu t3, t0
+    sw t3, M64K_OFF_AREGS(t2)
+    use_cycles 8
+    dispatch_next
+#endif
+add_slow:
+#else
+OP(add):
+#endif
     set_rmw_cyctable rmw_cyctable_logical
     lax rmw_op, op_add_rmwimpl
     jal decode_dptr
@@ -1456,6 +1951,60 @@ OP(cmp):
     beq t0, 0b011 << 6, op_cmpa16
     beq t0, 0b111 << 6, op_cmpa32
     bge t0, 0b100 << 6, op_eor
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+    # CMP fast paths (wave 3, M64K_W3_FULL only): .w (d16,An),Dn and .b Dn,Dn — the two hot
+    # in-match CMP forms. Flags are the op_cmp_rmwimpl idiom with the
+    # bitsize folded (no X, no writeback). Charges: logical table — EA-mem
+    # .w = 4 + ea_101's 8 = 12 (all before the read, matching rmw16_easrc's
+    # use_cycles_table-first order); EA-reg .b = 4.
+    andi t1, opcode, 0x38
+    beqz t1, cmp_f_chk_dn
+    xori t2, t1, 0x28
+    bnez t2, cmp_slow
+    xori t2, t0, 0x40
+    bnez t2, cmp_slow                  # only .w for the (d16,An) source
+    andi t1, opcode, 7                 # ---- cmp.w (d16,An),Dn (12 cycles) ----
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, cmp_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lhu_m68k t0, eaptr
+    srl t2, opcode, 7
+    andi t2, 0x7<<2
+    add t2, ctx
+    move dptr, t2                      # decode_dptr parity (see ANDI note)
+    lhu t1, M64K_OFF_DREGS+2(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 16
+    sll t0, 16
+    sll t1, 16
+    dsubu flag_nv, t1, t0
+    dispatch_next
+cmp_f_chk_dn:
+    bnez t0, cmp_slow                  # only .b for the Dn source
+    andi t1, opcode, 7                 # ---- cmp.b Dn,Dm (4 cycles) ----
+    sll t1, 2
+    add t1, ctx
+    lbu t0, M64K_OFF_DREGS+3(t1)
+    srl t2, opcode, 7
+    andi t2, 0x7<<2
+    add t2, ctx
+    move dptr, t2                      # decode_dptr parity (see ANDI note)
+    lbu t1, M64K_OFF_DREGS+3(t2)
+    dsubu result, t1, t0
+    dsll flag_zc, result, 24
+    sll t0, 24
+    sll t1, 24
+    dsubu flag_nv, t1, t0
+    use_cycles 4
+    dispatch_next
+cmp_slow:
+#endif
     use_cycles_opmask (1<<7)|(7<<3), 1<<7, -2     # cmp.l with EA=Dn takes 2 cycle less
     use_cycles_opmask 0b11111111, 0b10111100, -2  # cmp.l #<data>,Dn takes 2 cycle less
     lax rmw_op, op_cmp_rmwimpl
@@ -1626,6 +2175,33 @@ OP(group_logical):
 OP(andi):
     andi t0, opcode, 0b111111
     beq t0, 0b111100, op_andi_sr
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+    # ANDI.w #,Dn fast path (wave 3, M64K_W3_FULL only). Charge: immediate table, EA-reg
+    # eadst column = 8. Flags are op_and_rmwimpl with bitsize folded
+    # (N/Z from result, V=C=0, X unchanged).
+    andi t0, opcode, 0x38
+    bnez t0, andi_slow
+    andi t0, opcode, 0xC0
+    xori t0, 0x40
+    bnez t0, andi_slow
+    addi dptr, m_pc, -2                # dptr as decode_imm leaves it: successor
+                                       # ops (shifts/singleops) dummy-read a
+                                       # stale dptr, so it must stay a valid
+                                       # EVEN host pointer (see wave-3 notes)
+    lhu t0, 0(m_pc)                    # immediate word (code stream)
+    addiu m_pc, 2
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lhu t2, M64K_OFF_DREGS+2(t1)
+    and result, t0, t2
+    sh result, M64K_OFF_DREGS+2(t1)
+    sll flag_nv, result, 16
+    zx64 flag_zc, flag_nv
+    use_cycles 8
+    dispatch_next
+andi_slow:
+#endif
     lax rmw_op, op_and_rmwimpl
     jal_and_j decode_imm, rmw_eadst
 OP(ori):
@@ -2006,6 +2582,75 @@ op_roxm_finish:
     j main_loop
 
 OP(clr):
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+    # CLR.b/.w (d16,An) and (An) fast paths (wave 3, M64K_W3_FULL only). The 68000's dummy
+    # read-before-write is kept (rmw*_eadst parity: MMIO pages observe the
+    # same read-then-write access pattern, loads land in t0 for the TLB trap
+    # decoder). Charges match the generic split: EA charge (8 for d16, 4
+    # for (An)) before the read, singleop-table eadst column (8) before the
+    # write. .l and every other EA stay generic.
+    andi t0, opcode, 0xC0
+    beq t0, 0x80, clr_slow             # .l stays generic
+    beq t0, 0xC0, clr_slow             # 0x42C0 form stays generic
+    andi t1, opcode, 0x38
+    xori t2, t1, 0x28
+    beqz t2, clr_f_d16
+    xori t2, t1, 0x10
+    beqz t2, clr_f_an
+    j clr_slow
+clr_f_d16:                             # ---- clr.b/.w (d16,An) (16 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    #if M64K_CONFIG_ADDRERR
+    beqz t0, 1f                        # byte accesses cannot fault
+    check_addr_bail eaptr32, clr_slow
+1:
+    #endif
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    use_cycles 8
+    beqz t0, clr_f_byte
+    lhu_m68k t0, eaptr                 # dummy read (rmw16_eadst parity)
+    li result, 0
+    li flag_nv, 0
+    li flag_zc, 0
+    use_cycles 8
+    sh_m68k result, eaptr
+    dispatch_next
+clr_f_an:                              # ---- clr.b/.w (An) (12 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    #if M64K_CONFIG_ADDRERR
+    beqz t0, 1f
+    check_addr_bail eaptr32, clr_slow
+1:
+    #endif
+    map_m68k eaptr, eaptr32
+    use_cycles 4
+    beqz t0, clr_f_byte
+    lhu_m68k t0, eaptr                 # dummy read (rmw16_eadst parity)
+    li result, 0
+    li flag_nv, 0
+    li flag_zc, 0
+    use_cycles 8
+    sh_m68k result, eaptr
+    dispatch_next
+clr_f_byte:
+    lbu_m68k t0, eaptr                 # dummy read (rmw8_eadst parity)
+    li result, 0
+    li flag_nv, 0
+    li flag_zc, 0
+    use_cycles 8
+    sb_m68k result, eaptr
+    dispatch_next
+clr_slow:
+#endif
     set_rmw_cyctable rmw_cyctable_singleop
     lax rmw_op, op_clr_rmwimpl
     j rmw_eadst                   # run rmw cycle (note: clr does a dummy read on 68000)
@@ -2015,7 +2660,47 @@ op_clr_rmwimpl:
     li flag_zc, 0
     jr ra
 
+#ifdef M64K_FASTPATHS
+# TST.b/.w (d16,An) fast path (the dominant productive TST forms in-match).
+# .l and every other EA keep the generic path. At TIMING_ACCURACY==0 the
+# generic byte/word path charges 4 (entry) + 8 (ea_101), consulted from no
+# cycle table, so the flat 12 below is exact; at >=1 the charges are the same
+# for these forms (the singleop-table quirk only affects .l).
 OP(tst):
+    andi t0, opcode, 0x38
+    xori t0, 0x28
+    bnez t0, tst_slow                  # only (d16,An)
+    andi t0, opcode, 0xC0
+    beq t0, 0x80, tst_slow             # .l stays generic
+    beq t0, 0xC0, tst_slow             # TAS stays generic
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    beqz t0, tst_f_byte
+    check_addr_bail eaptr32, tst_slow  # word: odd address raises via generic path
+    addiu m_pc, 2                      # ---- tst.w (d16,An)  (12 cycles) ----
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lhu_m68k t0, eaptr
+    move flag_zc, t0
+    sll flag_nv, t0, 16
+    dispatch_next
+tst_f_byte:
+    addiu m_pc, 2                      # ---- tst.b (d16,An)  (12 cycles) ----
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lbu_m68k t0, eaptr
+    move flag_zc, t0
+    sll flag_nv, flag_zc, 24
+    dispatch_next
+
+tst_slow:
+#else
+OP(tst):
+#endif
     srl rmw_bitsize, opcode, 6
     andi rmw_bitsize, 3
     beq rmw_bitsize, 3, op_tas
@@ -2059,7 +2744,107 @@ cyc_move_penalty:
     jr ra
 #endif
 
+#ifdef M64K_FASTPATHS
+# MOVE.b fast paths: (d16,An)->Dn is the single hottest MOVE form in-match,
+# (An)+->Dn the second. Byte accesses cannot raise address errors, so no
+# ADDRERR bail is needed; the A7 byte quirk (+2) keeps A7 on the generic path.
 OP(moveb):
+    andi t0, opcode, 0x1C0             # destination mode field
+#ifdef M64K_W3_FULL
+    bnez t0, moveb_fdst_mem
+#else
+    bnez t0, moveb_slow
+#endif
+    andi t0, opcode, 0x38
+#ifdef M64K_W3_FULL
+    beqz t0, moveb_f_dn_dn
+#endif
+    xori t1, t0, 0x28
+    beqz t1, moveb_f_d16
+    xori t1, t0, 0x18
+    bnez t1, moveb_slow
+    andi t1, opcode, 7                 # ---- move.b (An)+,Dm  (8 cycles) ----
+    xori t2, t1, 7
+    beqz t2, moveb_slow                # A7: +2 quirk stays generic
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    addiu t2, eaptr32, 1
+    sw t2, M64K_OFF_AREGS(t1)          # writeback before the load, like ea_011
+    map_m68k eaptr, eaptr32
+    use_cycles 8
+    lbu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sb t0, M64K_OFF_DREGS+3(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 24
+    dispatch_next
+
+#ifdef M64K_W3_FULL
+moveb_f_dn_dn:                         # ---- move.b Dn,Dm  (wave 3; 4 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lbu t0, M64K_OFF_DREGS+3(t1)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sb t0, M64K_OFF_DREGS+3(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 24
+    use_cycles 4
+    dispatch_next
+
+moveb_fdst_mem:
+    andi t1, opcode, 0x38              # source must be Dn
+    bnez t1, moveb_slow
+    xori t1, t0, 0x140                 # destination (d16,An)?
+    bnez t1, moveb_slow
+    # ---- move.b Dn,(d16,An)  (wave 3; 12 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lbu result, M64K_OFF_DREGS+3(t1)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addiu m_pc, 2
+    addu eaptr32, t2
+    map_m68k eaptr, eaptr32
+    move flag_zc, result
+    sll flag_nv, result, 24
+    use_cycles 12
+    sb_m68k result, eaptr
+    dispatch_next
+#endif
+
+moveb_f_d16:                           # ---- move.b (d16,An),Dm  (12 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addiu m_pc, 2
+    addu eaptr32, t2
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lbu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sb t0, M64K_OFF_DREGS+3(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 24
+    dispatch_next
+
+moveb_slow:
+#else
+OP(moveb):
+#endif
     use_cycles 4
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_move_penalty
@@ -2077,7 +2862,203 @@ OP(moveb):
     sll flag_nv, result, 24               # addect N, clear V
     j main_loop
 
+#ifdef M64K_FASTPATHS
+# MOVE.w fast paths for the profile-dominant forms (samsho2 in-match:
+# Dn->(d16,An)/(An)/(An)+/Dn, (d16,An)->Dn and #imm->(An) together are ~60%
+# of all MOVE.w). Each form decodes inline, skipping both decode_ea indirect
+# calls. Cycle charges are identical to the generic path and are applied
+# BEFORE the m68k-space data access so MMIO handlers observe the same
+# mid-instruction clock. Anything unusual — other EA modes, MOVEA, the A7
+# post-increment quirk, odd addresses on ADDRERR builds — bails to the
+# generic implementation below with no architectural state mutated.
 OP(movew):
+    andi t0, opcode, 0x38
+    bnez t0, movew_fsrc_other
+    andi t1, opcode, 7                 # ---- source Dn: value into t0 ----
+    sll t1, 2
+    add t1, ctx
+    lhu t0, M64K_OFF_DREGS+2(t1)
+    srl t1, opcode, 6                  # destination mode (bits 8:6)
+    andi t1, 7
+    beqz t1, movew_f_dst_dn
+    xori t2, t1, 2
+    beqz t2, movew_f_dst_an
+    xori t2, t1, 3
+    beqz t2, movew_f_dst_anp
+    xori t2, t1, 5
+    beqz t2, movew_f_dst_d16
+    j movew_slow
+
+movew_f_dst_dn:                        # move.w Dn,Dm  (4 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sh t0, M64K_OFF_DREGS+2(t1)
+    move flag_zc, t0                   # !Z = value, C cleared
+    sll flag_nv, t0, 16                # N from bit 15, V cleared
+    use_cycles 4
+    dispatch_next
+
+movew_f_dst_an:                        # move.w Dn,(An)  (8 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 8
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_f_dst_anp:                       # move.w Dn,(An)+  (8 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    xori t2, t1, 7<<2
+    beqz t2, movew_slow                # A7 keeps its word-align quirk generic
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    addiu t2, eaptr32, 2
+    sw t2, M64K_OFF_AREGS(t1)          # writeback before the store, like ea_011
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 8
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_f_dst_d16:                       # move.w Dn,(d16,An)  (12 cycles)
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movew_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 12
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_fsrc_other:
+    xori t1, t0, 0x28                  # source (d16,An)?
+    beqz t1, movew_fsrc_d16
+    xori t1, t0, 0x18                  # source (An)+?
+    beqz t1, movew_fsrc_anp
+    xori t1, t0, 0x38                  # source mode 111?
+    bnez t1, movew_slow
+    andi t1, opcode, 7
+    xori t1, 4                         # submode #imm?
+    bnez t1, movew_slow
+    srl t1, opcode, 6
+    andi t1, 7
+    xori t1, 2                         # only ->(An) is fast for #imm
+    bnez t1, movew_slow
+    srl t1, opcode, 7                  # ---- move.w #imm,(An)  (12 cycles) ----
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    lhu t0, 0(m_pc)                    # immediate word (code stream, cannot fault)
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 12
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_fsrc_anp:
+    srl t1, opcode, 6                  # destination mode
+    andi t1, 7
+    beqz t1, movew_fanp_dn
+    xori t2, t1, 2
+    bnez t2, movew_slow
+    # ---- move.w (An)+,(An)  (wave 3; 12 cycles: 8 before the read, +4
+    # before the write, matching entry+ea_011 / ea_010). The source
+    # post-increment commits before the load like ea_011, and the
+    # destination An is re-read after that writeback so the same-register
+    # case matches the generic src-then-dst decode order. Both addresses
+    # are parity-checked before any mutation (same-reg dst = src+2 shares
+    # the source's parity). No A7 quirk for word size.
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    srl t2, opcode, 7
+    andi t2, 0x7<<2
+    add t2, ctx
+    lw t3, M64K_OFF_AREGS(t2)
+    check_addr_bail t3, movew_slow
+    addiu t0, eaptr32, 2
+    sw t0, M64K_OFF_AREGS(t1)          # src post-increment (before load, like ea_011)
+    map_m68k eaptr, eaptr32
+    use_cycles 8
+    lhu_m68k t0, eaptr
+    lw eaptr32, M64K_OFF_AREGS(t2)     # dst An AFTER the src writeback
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 4
+    sh_m68k result, eaptr
+    dispatch_next
+movew_fanp_dn:                         # ---- move.w (An)+,Dn  (8 cycles) ----
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    check_addr_bail eaptr32, movew_slow
+    addiu t2, eaptr32, 2
+    sw t2, M64K_OFF_AREGS(t1)          # writeback before the load, like ea_011
+    map_m68k eaptr, eaptr32
+    use_cycles 8
+    lhu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sh t0, M64K_OFF_DREGS+2(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 16
+    dispatch_next
+
+movew_fsrc_d16:                        # ---- move.w (d16,An),Dm  (12 cycles) ----
+    srl t1, opcode, 6
+    andi t1, 7
+    bnez t1, movew_slow                # only ->Dn is fast
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movew_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lhu_m68k t0, eaptr
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sh t0, M64K_OFF_DREGS+2(t1)
+    move flag_zc, t0
+    sll flag_nv, t0, 16
+    dispatch_next
+
+movew_slow:
+#else
+OP(movew):
+#endif
     use_cycles 4
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_move_penalty
@@ -2099,7 +3080,102 @@ OP(movew):
     sh_m68k result, eaptr           # store the word into the destination
     j main_loop
 
+#ifdef M64K_FASTPATHS
+# MOVE.l/MOVEA.l fast paths: reg->reg copies (Dn/An -> Dn/An) and the hot
+# (d16,An) source. NOTE: at TIMING_ACCURACY==0 the generic path charges a
+# flat 12 at entry for every MOVE.l (the reg-direct -4/-4 penalties only
+# exist at accuracy>=1), so the reg->reg forms below charge 12 to stay
+# bit-identical to the generic path, not the hardware's 4.
 OP(movel):
+    andi t0, opcode, 0x38
+    xori t1, t0, 0x28
+    beqz t1, movel_fsrc_d16
+    andi t1, t0, 0x30                  # source mode 000/001 (Dn/An)?
+    bnez t1, movel_slow
+    andi t1, opcode, 0xF               # D0-D7/A0-A7 as one register file
+    sll t1, 2
+    add t1, ctx
+    lw t0, M64K_OFF_DREGS(t1)          # 32-bit value, sign-extended
+    srl t1, opcode, 6                  # destination mode
+    andi t1, 7
+    beqz t1, movel_f_dst_dn
+#ifdef M64K_W3_FULL
+    xori t2, t1, 5
+    beqz t2, movel_f_dst_d16
+#endif
+    xori t2, t1, 1
+    bnez t2, movel_slow
+    srl t1, opcode, 7                  # ---- movea.l Dn/An,Am: no flags ----
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_AREGS(t1)
+    use_cycles 12
+    dispatch_next
+#ifdef M64K_W3_FULL
+movel_f_dst_d16:                       # ---- move.l Dn/An,(d16,An)  (wave 3; 20 cycles) ----
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movel_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_nv, t0                   # sign-extended: N in bits 31 and 63, V=0
+    zx64 flag_zc, flag_nv
+    use_cycles 20
+    sw_m68k result, eaptr
+    dispatch_next
+#endif
+movel_f_dst_dn:                        # ---- move.l Dn/An,Dm ----
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_DREGS(t1)
+    move flag_nv, t0                   # sign-extended: N in bits 31 and 63, V=0
+    zx64 flag_zc, flag_nv
+    use_cycles 12
+    dispatch_next
+
+movel_fsrc_d16:                        # ---- move(a).l (d16,An),Dm/Am  (20 cycles) ----
+    srl t1, opcode, 6
+    andi t1, 7
+    xori t2, t1, 1
+    beqz t2, 1f                        # dst An ok
+    bnez t1, movel_slow                # else only dst Dn
+1:  andi t2, opcode, 7
+    sll t2, 2
+    add t2, ctx
+    lw eaptr32, M64K_OFF_AREGS(t2)
+    lh t2, 0(m_pc)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movel_slow
+    addiu m_pc, 2
+    map_m68k eaptr, eaptr32
+    use_cycles 20
+    lwl t0, 0(eaptr)                   # unaligned-capable pair, like lw_m68k
+    lwr t0, 3(eaptr)
+    bnez t1, movel_f16_an
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_DREGS(t1)
+    move flag_nv, t0
+    zx64 flag_zc, flag_nv
+    dispatch_next
+movel_f16_an:
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_AREGS(t1)
+    dispatch_next
+
+movel_slow:
+#else
+OP(movel):
+#endif
     use_cycles 12
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_movel_penalty
@@ -2472,6 +3548,24 @@ OP(pea):
 OP(lea):
     andi t0, opcode, 1<<6
     beqz t0, op_chk
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+    # LEA (xxx).L,An fast path (wave 3, M64K_W3_FULL only): low byte 0xF9 = mode 111 reg 001
+    # with bits 7:6 = 11. Charge is the generic path's (ea7_001's flat 12;
+    # OP(lea) itself charges nothing at accuracy 0). No flags.
+    andi t0, opcode, 0xFF
+    xori t0, 0xF9
+    bnez t0, lea_slow
+    lwl t0, 0(m_pc)
+    lwr t0, 3(m_pc)
+    addiu m_pc, 4
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    sw t0, M64K_OFF_AREGS(t1)
+    use_cycles 12
+    dispatch_next
+lea_slow:
+#endif
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_leapea_penalty
     #endif
@@ -2554,6 +3648,7 @@ jmp_exec_cycles:
     use_cycles_opmask 0b111111, 0b111001, -2
     jal cyc_leapea_penalty
     #endif
+    .globl jmp_exec
 jmp_exec:
     map_m68k m_pc, eaptr32             # map 32-bit target to host pointer
     subu t0, eaptr32, m_pc             # save new pc_diff
@@ -2573,21 +3668,131 @@ jmp_exec:
     sw m_pc, idle_probe_found          # record the spinning PC for the C side to print
 2:
 #endif
-    beq m_pc, 0xFF001FE2, idle_skip   # mslug
-    beq m_pc, 0xFFC18714, idle_skip   # Universe BIOS vblank wait
     # samsho2 vblank-wait spins: "clr.b $100A30; <here>: tst.b $100A30; beq <here>"
     # — pure side-effect-free polls of a flag the game's VBlank IRQ sets. Verified
     # via the in-match idle probe (0x00142C is the dominant in-game spin). Skipping
     # them fast-forwards the dead wait to the next scheduled IRQ. (See PLAN-OPTIMIZATION.md
     # rank 1/2; the general fix is a data-driven per-game table.)
-    beq m_pc, 0xFF00142C, idle_skip   # samsho2 main vblank wait
-    beq m_pc, 0xFF00FC02, idle_skip   # samsho2 secondary vblank wait
+    #
+    # The constants MUST be materialized with lui (sign-extending) so their
+    # 64-bit register value matches the map_m68k result: mmap_mask is loaded
+    # with lui, so m_pc is the SIGN-extended 0xFFFFFFFF_FFxxxxxx. Writing
+    # "beq m_pc, 0xFF00142C" makes GAS emit a ZERO-extended li+dsll+ori
+    # (0x00000000_FF00142C), and the 64-bit beq can then never be equal —
+    # which kept this whole skip list dead since it was introduced.
+    lui t0, 0xFF00
+    ori t1, t0, 0x142C
+    beq m_pc, t1, idle_skip           # samsho2 main vblank wait (hottest)
+    ori t1, t0, 0xFC02
+    beq m_pc, t1, idle_skip           # samsho2 secondary vblank wait
+    ori t1, t0, 0xFB4A
+    beq m_pc, t1, idle_skip           # samsho2 in-fight vblank wait #3
+    ori t1, t0, 0xFB74
+    beq m_pc, t1, idle_skip           # samsho2 in-fight vblank wait #4
+                                      # (both: tst.b $100A30; beq self —
+                                      # found by MVS64_IDLEPROBE 2026-08-07,
+                                      # byte-identical to the 0x142C shape)
+    ori t1, t0, 0x1FE2
+    beq m_pc, t1, idle_skip           # mslug
+    lui t1, 0xFFC1
+    ori t1, 0x8714
+    beq m_pc, t1, idle_skip           # Universe BIOS vblank wait
+#ifdef M64K_DYNREC
+    # Dynarec block-table probe, jmp_exec site (phase 1: unreachable hit
+    # path — see the slice-entry probe). eaptr32 is the 32-bit guest target.
+    srl t2, eaptr32, 1
+    andi t2, (M64K_DYN_TABLE_SETS-1)
+    sll t2, 4
+    addu t2, dyn_tab
+    lw t3, 0(t2)                       # way-0 tag
+    beq t3, eaptr32, dyn_probe_hit
+    lw t3, 8(t2)                       # way-1 tag
+    beq t3, eaptr32, dyn_probe_hit1
+    # Miss: note the target for the C-side translator (serviced at slice
+    # boundaries). Slot 0 = last-writer-wins (biased to slice-end heads).
+    # Slot 1 = every-61st-miss SAMPLE ([2] is the countdown): unbiased
+    # rotation over the whole miss population, so hot mid-frame heads the
+    # lottery never picks (the 00ceec/00cf2e upload loops, 80k misses/
+    # window) get attempted proportionally to their miss share. (A
+    # first-writer-when-empty design was tried first and WEDGES: the
+    # first miss of every slice is the same recurring head, and if that
+    # head is already tried-and-refused the frontier never advances.)
+    #
+    # Slot 1 is FIRST-UNTRIED-writer-wins (2026-09-22): a last-writer
+    # sample slot is overwritten by the ~5 later samples of the same slice,
+    # so a hot MID-slice head (the 00ceec/00cf2e upload loops, 30k misses
+    # per window) never survived to the slice-end service — not once in
+    # any DYNSTAT run. Known-refused heads are filtered here (exact
+    # dyn_tried2 tag compare, dynrec.c), which is what made the earlier
+    # first-writer attempt wedge on a recurring refused head.
+    la t2, __m64k_dyn_mailbox
+    sw eaptr32, 0(t2)
+    lw t3, 8(t2)
+    addiu t3, -1
+    bgtz t3, 1f
+    li t3, 61
+    lw t0, 4(t2)
+    bnez t0, 1f                        # slot taken this slice: keep it
+    sll t0, eaptr32, 8
+    srl t0, t0, 9                      # h = (pc & 0xFFFFFF) >> 1
+    andi t1, t0, 8191
+    sll t1, 1
+    la t2, __m64k_dyn_tried2
+    addu t1, t2
+    lhu t1, 0(t1)
+    srl t0, t0, 13
+    ori t0, 0xC000                     # refused tag: valid|refused|h>>13
+    la t2, __m64k_dyn_mailbox
+    beq t0, t1, 1f                     # known-refused: never sample it
+    sw eaptr32, 4(t2)
+1:  sw t3, 8(t2)
+#endif
+#ifdef M64K_DYNSTAT
+    jal dynstat_count                  # coverage rig: count this target PC
+#endif
     j main_loop
 idle_skip:
+#ifdef MVS64_PERFCOUNT
+    lw t0, perf_idle_skips
+    addiu t0, 1
+    sw t0, perf_idle_skips
+#endif
     li m_cycles, 0
     j main_loop
 
 OP(jsr):
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+# JSR (xxx).L fast path (wave 3, M64K_W3_FULL only: measured icache-negative
+# in the full-wave build - see PLAN-OPTIMIZATION.md 2026-08-06). Generic charge order: 8 (entry) + 12
+# (ea7_001) before the stack push, then +2 (jmp_exec_cycles) before the
+# target map — replicated as 20/2 below. The odd-SP check bails BEFORE any
+# mutation: the generic replay then decrements SP once and raises
+# write_address_error exactly like an all-generic run (push32 stores the
+# decremented SP before its own check). Spin-compare list skipped as in
+# rts_fast. Odd targets raise via the original pc_address_error machinery.
+    andi t0, opcode, 0x3F
+    xori t0, 0x39
+    bnez t0, jsr_slow
+    lw_ctx t1, M64K_OFF_AREGS+7*4
+    addiu t2, t1, -4
+    check_addr_bail t2, jsr_slow
+    lwl eaptr32, 0(m_pc)               # absolute 32-bit target (code stream)
+    lwr eaptr32, 3(m_pc)
+    addiu m_pc, 4
+    use_cycles 20
+    lw t0, pc_diff
+    addu result, t0, m_pc              # return address (68k space)
+    sw_ctx t2, M64K_OFF_AREGS+7*4
+    map_m68k t0, t2
+    sw_m68k result, t0
+    use_cycles 2
+    map_m68k m_pc, eaptr32
+    subu t0, eaptr32, m_pc
+    sw t0, pc_diff
+    check_addr_error eaptr32, pc_address_error
+    dispatch_next
+jsr_slow:
+#endif
     use_cycles 8
     jal decode_ea
 jsr_exec:
@@ -2603,6 +3808,61 @@ OP(rts):
     lwl eaptr32, 0(t0)
     lwr eaptr32, 3(t0)
     j jmp_exec
+
+#ifdef M64K_FASTPATHS
+# RTS fast path (~3% of in-match instructions; wave 3). Inline pop32 +
+# jmp_exec's map/pc_diff update, ending in dispatch_next. The jmp_exec
+# spin-target compare list is skipped: the registered idle-spin PCs are
+# beq loop heads, so even if an RTS returned into one, the loop's own Bcc
+# routes through branch_exec and the skip still fires one iteration later.
+# Charge is the generic flat 16, applied before the stack read like the
+# generic path. Odd SP bails to the generic path with no state mutated
+# (pop32 checks SP before its own writeback, so the replay is identical).
+ALIGN(rts_fast):
+    lw_ctx t1, M64K_OFF_AREGS+7*4
+    check_addr_bail t1, op_rts
+    use_cycles 16
+    map_m68k t0, t1
+    addiu t2, t1, 4
+    sw_ctx t2, M64K_OFF_AREGS+7*4
+    lwl eaptr32, 0(t0)
+    lwr eaptr32, 3(t0)
+    map_m68k m_pc, eaptr32
+    subu t0, eaptr32, m_pc
+    sw t0, pc_diff
+    check_addr_error eaptr32, pc_address_error
+    dispatch_next
+#endif
+
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+# BSR.w fast path (wave 3, M64K_W3_FULL only), reached from bcc_cctable entry 1 (t3 already
+# holds the signed 8-bit displacement loaded by the Bcc fast dispatch). The
+# short form and any odd new-SP bail to the generic op_bsr, which re-reads
+# everything from scratch (no state mutated here first). Charges mirror the
+# generic order: 16 (bsr_exec) before the stack push, +2 (jmp_exec_cycles)
+# before the target map. Spin-compare list skipped as in rts_fast.
+bsr_fast:
+    bnez t3, op_bsr                    # 8-bit form stays generic
+    lw_ctx t1, M64K_OFF_AREGS+7*4
+    addiu t2, t1, -4
+    check_addr_bail t2, op_bsr
+    lh t3, 0(m_pc)                     # 16-bit displacement
+    lw t0, pc_diff
+    addu eaptr32, t0, m_pc             # target = PC of ext word + disp
+    addu eaptr32, t3
+    addiu m_pc, 2
+    use_cycles 16
+    addu result, t0, m_pc              # return address (68k space, after ext)
+    sw_ctx t2, M64K_OFF_AREGS+7*4
+    map_m68k t0, t2
+    sw_m68k result, t0
+    use_cycles 2
+    map_m68k m_pc, eaptr32
+    subu t0, eaptr32, m_pc
+    sw t0, pc_diff
+    check_addr_error eaptr32, pc_address_error
+    dispatch_next
+#endif
 
 OP(bsr):
     lb t3, -1(m_pc)                    # fetch signed 8-bit displacement (from opcode)
@@ -2620,6 +3880,117 @@ bsr_exec:
     addu eaptr32, m_pc
     j jsr_exec
 
+#ifdef M64K_FASTPATHS
+# Bcc fast path (hottest opcode class in-match): dispatch directly on the
+# condition field (opcode bits 11:8) through bcc_cctable; each entry tests its
+# condition with the sense baked in and branches straight to bcc_taken /
+# bcc_nottaken. This removes the check_cc call/return pair and the generic
+# invert logic. BSR (cond 1) routes through the same table to its original
+# implementation. Displacement decode and cycle charges are identical to the
+# generic path (not-taken: 8 for the 8-bit form, 12 for the 16-bit form;
+# taken charges 10 in branch_exec). check_cc itself stays: DBcc/Scc use it.
+OP(bcc):
+    .set push
+    .set noreorder
+    srl t0, opcode, 6
+    andi t0, 0x3C
+    lw t0, bcc_cctable(t0)
+    lb t3, -1(m_pc)                    # signed 8-bit displacement (0 => 16-bit follows)
+    jr t0
+    #if M64K_CONFIG_TIMING_ACCURACY >= 0
+     li rmw_cyctable, 8                # not-taken charge for the 8-bit form
+    #else
+     nop
+    #endif
+    .set pop
+
+bcct_hi:                               # HI: C==0 && Z==0
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    bnez t0, bcc_nottaken
+    zx64 t0, flag_zc
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_ls:                               # LS: C==1 || Z==1
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    bnez t0, bcc_taken
+    zx64 t0, flag_zc
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_cc:                               # CC: C==0
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_cs:                               # CS: C==1
+    dsrl t0, flag_zc, 32
+    andi t0, 1
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_ne:                               # NE: Z==0
+    zx64 t0, flag_zc
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_eq:                               # EQ: Z==1
+    zx64 t0, flag_zc
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_vc:                               # VC: V==0  (V = bit63(N^V) ^ bit31(N))
+    dsrl t0, flag_nv, 63
+    srl t1, flag_nv, 31
+    xor t0, t1
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_vs:                               # VS: V==1
+    dsrl t0, flag_nv, 63
+    srl t1, flag_nv, 31
+    xor t0, t1
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_pl:                               # PL: N==0
+    srl t0, flag_nv, 31
+    beqz t0, bcc_taken
+    j bcc_nottaken
+bcct_mi:                               # MI: N==1
+    srl t0, flag_nv, 31
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_ge:                               # GE: N==V  (bit63 of flag_nv is N^V)
+    bgez flag_nv, bcc_taken
+    j bcc_nottaken
+bcct_lt:                               # LT: N!=V
+    bltz flag_nv, bcc_taken
+    j bcc_nottaken
+bcct_gt:                               # GT: N==V && Z==0
+    bltz flag_nv, bcc_nottaken
+    zx64 t0, flag_zc
+    bnez t0, bcc_taken
+    j bcc_nottaken
+bcct_le:                               # LE: N!=V || Z==1
+    bltz flag_nv, bcc_taken
+    zx64 t0, flag_zc
+    beqz t0, bcc_taken
+    j bcc_nottaken
+
+bcc_taken:
+    bnez t3, branch_exec               # 8-bit displacement: straight to the branch
+    lh t3, 0(m_pc)                     # 0 => fetch the 16-bit displacement
+    addiu m_pc, 2
+    addiu t3, -2                       # displacement refers to PC before increment
+    j branch_exec
+bcc_nottaken:
+    bnez t3, 1f
+    addiu m_pc, 2                      # skip the unused 16-bit displacement word
+    #if M64K_CONFIG_TIMING_ACCURACY >= 0
+    li rmw_cyctable, 12                # not-taken charge for the 16-bit form
+    #endif
+1:
+    #if M64K_CONFIG_TIMING_ACCURACY >= 0
+    sub m_cycles, rmw_cyctable
+    #endif
+    j main_loop
+#else
 OP(bcc):
     andi t0, opcode, 0xFF00
     beq t0, 0x6100, op_bsr
@@ -2645,6 +4016,7 @@ bcc_exec:
      nop
      #endif
     .set reorder
+#endif
 branch_exec:
     lw eaptr32, pc_diff                # calculate full 32bit branch target (using pc_diff)
     addu eaptr32, t3
@@ -2653,6 +4025,17 @@ branch_exec:
     j jmp_exec
 
 OP(dbcc):
+#ifdef M64K_FASTPATHS
+    # DBF (cond=false, i.e. DBRA) is by far the most common DBcc form and its
+    # condition can never be true: skip the check_cc call and go straight to
+    # the counter decrement.
+    andi t0, opcode, 0x0F00
+    xori t0, 0x0100
+    bnez t0, dbcc_checkcc
+    addiu m_pc, 2
+    j dbcc_dec
+dbcc_checkcc:
+#endif
     addiu m_pc, 2
     jal check_cc
     #if M64K_CONFIG_TIMING_ACCURACY >= 0
@@ -2663,6 +4046,7 @@ OP(dbcc):
     #else
     bnez t0, main_loop
     #endif
+dbcc_dec:
     andi t0, opcode, 0x7
     sll t0, 2
     la_ctx dptr, M64K_OFF_DREGS,t0
@@ -2679,7 +4063,433 @@ OP(dbcc):
     #endif
     lh t3, -2(m_pc)
     addiu t3, -2
+#ifdef M64K_BLOCKOPS
+# Blockop rejection accounting (DYNSTAT diagnostic builds only): the fused
+# VRAM-port copy has three guards, and a silent rejection is invisible in
+# every other metric — the loop just runs interpreted. Route each guard to
+# its own counting stub so [BOSTAT] says WHICH one declines.
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+#define BO_REJ_DST   bo_rej_dst
+#define BO_REJ_BUD   bo_rej_bud
+#define BO_REJ_SPAN  bo_rej_span
+#define BO_REJ_SHAPE bo_rej_shape
+#else
+#define BO_REJ_DST   dbcc_no_blockop
+#define BO_REJ_BUD   dbcc_no_blockop
+#define BO_REJ_SPAN  dbcc_no_blockop
+#define BO_REJ_SHAPE dbcc_no_blockop
+#endif
+    # Fused block-op fast path for single-instruction DBF copy/fill loops.
+    #
+    # LOOP-SHAPE LAW (fixed 2026-08-07; the guard was -4 and this path had
+    # therefore NEVER fired — [BOSTAT] fire=0 over 293k taken DBFs/window,
+    # 94% rejected right here). For the shape these charges are written
+    # for (1-word body + 2-word DBF), with dispatch_body's "addi m_pc,2"
+    # plus OP(dbcc)'s own, m_pc sits at body+6 when t3 is formed, so the
+    # self-loop delta is -6 and the body opcode is at -6(m_pc). -4 instead
+    # selects a DBF branching to its own opcode (a zero-body "dbra dn,*"
+    # delay loop) whose body fetch reads back the DBF word 0x51C8 — which
+    # is exactly what the diagnostic saw. The per-iteration charges below
+    # (22 = move.w mem-to-mem 12 + taken dbra 10; 18 = move.w Dn,(An)+ 8
+    # + 10) only balance for a REAL one-instruction body, so they are the
+    # independent confirmation that -6 is the intended constant.
+    # samsho2 spends several % of every frame in "move.w (As)+,(Ad)" uploads
+    # to the LSPC VRAM data port (one TLB exception per word on N64) and in
+    # "move.w/l Dn,(Ad)+" RAM fills, all shaped as 2-word DBRA self-loops.
+    # Execute up to count-1 iterations natively with identical cycle charges;
+    # the final (expiring) iteration and any budget tail always run through
+    # the normal interpreter, so flags, PC and register state at every
+    # observable boundary are bit-exact. Restricted to DBF (cc can never
+    # become true mid-loop; other DBcc react to flags the body changes).
+#if defined(M64K_DYNSTAT) && defined(M64K_BOSTAT_SEEN)
+    # COSTS REAL TIME: this fires on EVERY taken non-expiring DBF (8.8M per
+    # 600-frame window through the BIOS RAM test). It slowed the build
+    # enough that the autoinput harness never reached a fight — content is
+    # wall-speed-sensitive here. Opt-in only; the rejection counters below
+    # are on the rare paths and are always safe to leave enabled.
+    lw t8, blockop_seen
+    addiu t8, 1
+    sw t8, blockop_seen
+    sw t3, blockop_t3val               # loop-shape delta actually seen
+#endif
+    bne t3, -6, BO_REJ_SHAPE           # 1-word body + 2-word DBF only
+    andi t2, opcode, 0x0F00
+    bne t2, 0x0100, dbcc_no_blockop    # DBF only
+    lw t8, mvs64_blockop_enable        # runtime A/B gate
+    beqz t8, dbcc_no_blockop
+#ifdef M64K_DYNSTAT
+    lhu t8, -6(m_pc)
+    sw t8, blockop_t9val               # what the "body opcode" fetch sees
+#endif
+    addi t2, t0, -1                    # fast-loopable iterations (keep last)
+    blez t2, dbcc_no_blockop
+    lhu t9, -6(m_pc)                   # body opcode
+    andi t1, t9, 0xF1F8
+    beq t1, 0x3098, blockop_movew_port # move.w (As)+,(Ad)
+    beq t1, 0x30C0, blockop_fill_w     # move.w Dn,(Ad)+
+    beq t1, 0x20C0, blockop_fill_l     # move.l Dn,(Ad)+
+#ifndef MVS64_COPYL_NODISPATCH
+    beq t1, 0x20D8, blockop_copy_l     # move.l (As)+,(Ad)+
+#endif
+    beq t1, 0x3080, blockop_fillw_port # move.w Dn,(Ad)
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+bo_rej_dst:
+    lw t8, blockop_rej_dst
+    addiu t8, 1
+    sw t8, blockop_rej_dst
+    sw t1, blockop_rej_dstval          # the destination that did not match
+    lw t7, pc_diff                     # ...and WHICH loop it came from:
+    addu t7, m_pc                      # guest pc of the body = m_pc+diff-6
+    addiu t7, -6
+    sw t7, blockop_rej_pc
+    j dbcc_no_blockop
+bo_rej_bud:
+    lw t8, blockop_rej_bud
+    addiu t8, 1
+    sw t8, blockop_rej_bud
+    j dbcc_no_blockop
+bo_rej_span:
+    lw t8, blockop_rej_span
+    addiu t8, 1
+    sw t8, blockop_rej_span
+    j dbcc_no_blockop
+bo_rej_shape:
+#ifdef M64K_BOSTAT_SEEN
+    lw t8, blockop_rej_shape           # hot: same cost caveat as blockop_seen
+    addiu t8, 1
+    sw t8, blockop_rej_shape
+#endif
+    j dbcc_no_blockop
+#endif
+dbcc_no_blockop:
+#endif
     j branch_exec
+
+#ifdef M64K_BLOCKOPS
+blockop_movew_port:
+    # Destination (An) must be the LSPC VRAM data port (0x3C0002): the only
+    # (An)-fixed-destination copy the game runs hot, and the expensive one.
+    srl t1, t9, 7
+    andi t1, 7<<2
+    lw_ctx t1, M64K_OFF_AREGS,t1       # Ad
+    sll t1, 8
+    srl t1, 8                          # 24-bit address
+    li result, 0x003C0002
+    bne t1, result, BO_REJ_DST
+    # Budget: K = min(count-1, (m_cycles-11)/22); keeps m_cycles > 0 so the
+    # interpreter always resumes at the loop body. 22 = move.w (An)+,(An)
+    # [12] + taken dbra [10], matching the interpreter's own charges.
+    addi result, m_cycles, -11
+    blez result, BO_REJ_BUD
+    li t8, 22
+    divu zero, result, t8
+    mflo result
+    beqz result, BO_REJ_BUD
+    ble t2, result, 1f
+    move t2, result
+1:  # Source (As)+ span must stay inside the always-mapped P-ROM + work-RAM
+    # window (< 0x110000): a native lhu there can never TLB-fault.
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t9, M64K_OFF_AREGS,t1       # &As
+    lw t8, 0(t9)                       # As (full register value)
+    sll t1, t8, 8
+    srl t1, 8                          # 24-bit source address
+    sll result, t2, 1                  # 2K bytes
+    addu result, t1
+    li eaptr32, 0x00110000
+    bgt result, eaptr32, BO_REJ_SPAN
+    # ---- commit ----
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    lw t8, blockop_fire
+    addiu t8, 1
+    sw t8, blockop_fire
+    lw t8, 0(t9)                       # re-load As: the counter bump clobbered
+                                       # it. (This was "li t8, 22" — restoring
+                                       # the BUDGET constant, not As — so every
+                                       # INSTRUMENTED build corrupted As := 22
+                                       # + 2K on each fire: the real source of
+                                       # the "diagnostic builds diverge
+                                       # content" forks, first fire ~f=385.)
+#endif
+    sll result, t2, 1                  # As += 2K
+    addu t8, result
+    sw t8, 0(t9)
+    sub t8, t0, t2                     # counter = (old-1) - K
+    addi t8, -1
+    sh t8, 2(dptr)
+    li t8, 22                          # m_cycles -= 10 + 22K
+    multu t2, t8
+    mflo t8
+    sub m_cycles, t8
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    map_m68k t1                        # t1 = mapped src, t2 = count
+    jal mvs64_blockop_vram_copy_w
+    j main_loop
+
+blockop_fill_w:
+    # value = Dn.w
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t1, M64K_OFF_DREGS,t1
+    lhu result, 2(t1)
+    # Budget: 18 = move.w Dn,(An)+ [8] + taken dbra [10]
+    addi t1, m_cycles, -11
+    blez t1, dbcc_no_blockop
+    li t8, 18
+    divu zero, t1, t8
+    mflo t1
+    beqz t1, dbcc_no_blockop
+    ble t2, t1, 1f
+    move t2, t1
+1:  # Destination (Ad)+ span must stay inside work RAM [0x100000,0x110000)
+    srl t1, t9, 7
+    andi t1, 7<<2
+    la_ctx t9, M64K_OFF_AREGS,t1       # &Ad
+    lw t8, 0(t9)                       # Ad (full register value)
+    sll t1, t8, 8
+    srl t1, 8                          # 24-bit dest address
+    li eaptr32, 0x00100000
+    blt t1, eaptr32, dbcc_no_blockop
+    sll t7, t2, 1
+    addu t7, t1
+    li eaptr32, 0x00110000
+    bgt t7, eaptr32, dbcc_no_blockop
+    # ---- commit ----
+    sll t7, t2, 1                      # Ad += 2K
+    addu t8, t7
+    sw t8, 0(t9)
+    sub t7, t0, t2                     # counter = (old-1) - K
+    addi t7, -1
+    sh t7, 2(dptr)
+    li t7, 18                          # m_cycles -= 10 + 18K
+    multu t2, t7
+    mflo t7
+    sub m_cycles, t7
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    map_m68k t1                        # native fill (work RAM: mapped RW)
+1:  sh result, 0(t1)
+    addiu t1, 2
+    addiu t2, -1
+    bnez t2, 1b
+    j main_loop
+
+blockop_fill_l:
+    # value = Dn (32-bit)
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t1, M64K_OFF_DREGS,t1
+    lw result, 0(t1)
+    # Budget: 26 = move.l Dn,(An)+ as m64k charges it [16] + taken dbra [10]
+    addi t1, m_cycles, -11
+    blez t1, dbcc_no_blockop
+    li t8, 26
+    divu zero, t1, t8
+    mflo t1
+    beqz t1, dbcc_no_blockop
+    ble t2, t1, 1f
+    move t2, t1
+1:  # Destination (Ad)+ span must stay inside work RAM [0x100000,0x110000)
+    srl t1, t9, 7
+    andi t1, 7<<2
+    la_ctx t9, M64K_OFF_AREGS,t1       # &Ad
+    lw t8, 0(t9)                       # Ad (full register value)
+    sll t1, t8, 8
+    srl t1, 8                          # 24-bit dest address
+    li eaptr32, 0x00100000
+    blt t1, eaptr32, dbcc_no_blockop
+    sll t7, t2, 2
+    addu t7, t1
+    li eaptr32, 0x00110000
+    bgt t7, eaptr32, dbcc_no_blockop
+    # ---- commit ----
+    sll t7, t2, 2                      # Ad += 4K
+    addu t8, t7
+    sw t8, 0(t9)
+    sub t7, t0, t2                     # counter = (old-1) - K
+    addi t7, -1
+    sh t7, 2(dptr)
+    li t7, 26                          # m_cycles -= 10 + 26K
+    multu t2, t7
+    mflo t7
+    sub m_cycles, t7
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    map_m68k t1
+    srl t3, result, 16                 # high word first (68k byte order;
+1:  sh t3, 0(t1)                       #  2-byte stores keep any even address
+    sh result, 2(t1)                   #  legal, matching the 68000 bus)
+    addiu t1, 4
+    addiu t2, -1
+    bnez t2, 1b
+    j main_loop
+
+blockop_copy_l:
+    # move.l (As)+,(Ad)+ / dbf: the block-unpack memcpy the game runs at
+    # 0x31B8 (count word from the stream, longs copied ROM/RAM -> work RAM).
+    # As = bits 2-0, Ad = bits 11-9. The same-register form (e.g. 0x20D8
+    # proper, move.l (a0)+,(a0)+) interleaves the two pointer bumps and does
+    # NOT have memcpy semantics: reject it. NOTE: every reject path below
+    # must leave t3 intact (branch_exec consumes it).
+    lw t8, mvs64_blockop_copyl_enable  # runtime A/B gate (twin fps builds)
+    beqz t8, dbcc_no_blockop
+    srl t7, t9, 7
+    andi t7, 7<<2                      # Ad index*4
+    andi t1, t9, 7
+    sll t1, 2                          # As index*4
+    beq t1, t7, dbcc_no_blockop
+    la_ctx t1, M64K_OFF_AREGS,t1       # &As
+    la_ctx t7, M64K_OFF_AREGS,t7       # &Ad
+    # Budget: K = min(count-1, (m_cycles-11)/30); keeps m_cycles > 0 so the
+    # interpreter always resumes at the loop body. 30 = move.l (As)+,(Ad)+
+    # [12 entry + 4 src (An)+ + 4 dst (An)+] + taken dbra [10], matching the
+    # interpreter's own charges (charge placement inside the fused span is
+    # unobservable: both spans are guarded RAM/ROM and can never trap).
+    addi t9, m_cycles, -11
+    blez t9, BO_REJ_BUD
+    li t8, 30
+    divu zero, t9, t8
+    mflo t9
+    beqz t9, BO_REJ_BUD
+    ble t2, t9, 1f
+    move t2, t9
+1:  lw t8, 0(t1)                       # As (full register value)
+    lw t9, 0(t7)                       # Ad (full register value)
+    or result, t8, t9                  # an odd long access would raise an
+    andi result, 1                     #  address error in the interpreter:
+    bnez result, dbcc_no_blockop       #  leave those loops interpreted
+    # Source span must stay inside an always-mapped window: P-ROM + work RAM
+    # (< 0x110000) or the PB-ROM bank window [0x200000,0x300000) — samsho2's
+    # 2MB P-ROM upper half lives there (the unpack loops at 0x31B8 read it,
+    # measured 1584 span-rejects/window before this was widened). The bank
+    # mapping can only change via an MMIO write, which the 1-insn loop body
+    # cannot issue, so the window is stable across the fused span.
+    sll eaptr32, t8, 8
+    srl eaptr32, 8                     # 24-bit source address (kept for map)
+    sll result, t2, 2                  # 4K bytes
+    addu result, eaptr32
+    li eaptr, 0x00110000
+    ble result, eaptr, 1f              # low window: end <= 0x110000
+    li eaptr, 0x00200000
+    blt eaptr32, eaptr, bo_cpl_rejsrc  # straddles/starts in unmapped gap
+    li eaptr, 0x00300000
+    bgt result, eaptr, bo_cpl_rejsrc   # PB-ROM window: end <= 0x300000
+1:
+    # Destination span must stay inside work RAM [0x100000,0x110000).
+    sll result, t9, 8
+    srl result, 8                      # 24-bit dest address (kept for map)
+    li eaptr, 0x00100000
+    blt result, eaptr, bo_cpl_rejdst
+    sll t9, t2, 2
+    addu t9, result
+    li eaptr, 0x00110000
+    bgt t9, eaptr, bo_cpl_rejdst
+    # ---- commit ----
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    lw t9, blockop_fire
+    addiu t9, 1
+    sw t9, blockop_fire
+#endif
+    sll t9, t2, 2                      # bytes = 4K
+    addu t8, t9                        # As += 4K
+    sw t8, 0(t1)
+    lw t8, 0(t7)
+    addu t8, t9                        # Ad += 4K
+    sw t8, 0(t7)
+    sub t8, t0, t2                     # counter = (old-1) - K
+    addi t8, -1
+    sh t8, 2(dptr)
+    li t8, 30                          # m_cycles -= 10 + 30K
+    multu t2, t8
+    mflo t8
+    sub m_cycles, t8
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    map_m68k eaptr32                   # mapped source
+    map_m68k result                    # mapped dest
+1:  lwl t8, 0(eaptr32)                 # unaligned-capable pairs, byte order
+    lwr t8, 3(eaptr32)                 #  identical to lw_m68k/sw_m68k; the
+    swl t8, 0(result)                  #  sequential forward long-by-long
+    swr t8, 3(result)                  #  order matches the interpreter, so
+    addiu eaptr32, 4                   #  overlapping src/dst behave the same
+    addiu result, 4
+    addiu t2, -1
+    bnez t2, 1b
+    j main_loop
+
+    # copy_l span-reject diagnostics: record WHICH bound rejected and the
+    # offending 24-bit address in the otherwise-unused [BOSTAT] t3/body
+    # slots (t3val = rejecting SRC, t9val = rejecting DST). Finding
+    # (2026-08-08): ALL of samsho2's (As)+,(Ad)+ DBF loops target PALETTE
+    # RAM (0x401558/0x401eb8) — trapped MMIO with conversion side effects,
+    # ~2 entries/frame in-fight — so copy_l has no RAM->RAM traffic in
+    # this game and stays as correct-but-idle infrastructure.
+bo_cpl_rejsrc:
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    sw eaptr32, blockop_t3val
+#endif
+    j BO_REJ_SPAN
+bo_cpl_rejdst:
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    sw result, blockop_t9val
+#endif
+    j BO_REJ_SPAN
+
+blockop_fillw_port:
+    # move.w Dn,(An) / dbf with An = the LSPC VRAM data port (0x3C0002):
+    # a constant-value fill through the port's auto-increment (the #1
+    # remaining un-fused DBF class: masked 0x3080 at guest 0x3412,
+    # 8k-24k rejected entries per 600-frame window in-fight, one TLB
+    # exception per word when interpreted). Same structure as the port
+    # copy: K = count-1 iterations run natively via the hw_n64.S helper
+    # (identical modulo/mask/bank semantics), the expiring iteration and
+    # any budget tail stay interpreted, charges match the interpreter
+    # exactly. NOTE: every reject path must leave t3 intact (branch_exec).
+    lw t8, mvs64_blockop_fwp_enable    # runtime A/B gate (twin fps builds)
+    beqz t8, dbcc_no_blockop
+    srl t1, t9, 7
+    andi t1, 7<<2
+    lw_ctx t1, M64K_OFF_AREGS,t1       # Ad
+    sll t1, 8
+    srl t1, 8                          # 24-bit address
+    li result, 0x003C0002
+    bne t1, result, BO_REJ_DST
+    # Budget: K = min(count-1, (m_cycles-11)/18); keeps m_cycles > 0 so
+    # the interpreter always resumes at the loop body. 18 = move.w
+    # Dn,(An) [4 entry + 0 Dn + 4 (An)] + taken dbra [10].
+    addi result, m_cycles, -11
+    blez result, BO_REJ_BUD
+    li t8, 18
+    divu zero, result, t8
+    mflo result
+    beqz result, BO_REJ_BUD
+    ble t2, result, 1f
+    move t2, result
+1:  # value = Dn.w (constant across the run: the body cannot change Dn)
+    andi t1, t9, 7
+    sll t1, 2
+    la_ctx t1, M64K_OFF_DREGS,t1
+    lhu t1, 2(t1)                      # 16-bit fill value
+    # ---- commit ----
+#if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
+    lw t8, blockop_fire
+    addiu t8, 1
+    sw t8, blockop_fire
+#endif
+    sub t8, t0, t2                     # counter = (old-1) - K
+    addi t8, -1
+    sh t8, 2(dptr)
+    li t8, 18                          # m_cycles -= 10 + 18K
+    multu t2, t8
+    mflo t8
+    sub m_cycles, t8
+    addi m_cycles, -10
+    addi m_pc, -6                      # resume at the loop body
+    jal mvs64_blockop_vram_fill_w      # t1 = value, t2 = count
+    j main_loop
+#endif
 
 OP(scc):
     andi t0, opcode, 0b111000
@@ -2707,6 +4517,19 @@ OP(scc):
     .section .sdata
 opcctable:
     .long   cc_t, cc_hi, cc_cc, cc_ne, cc_vc, cc_pl, cc_ge, cc_gt
+#ifdef M64K_FASTPATHS
+# Bcc fast-path dispatch: one entry per condition code (opcode bits 11:8),
+# sense baked in. Cond 0 (BRA) is always taken; cond 1 is BSR.
+bcc_cctable:
+#ifdef M64K_W3_FULL
+    .long   bcc_taken, bsr_fast, bcct_hi, bcct_ls
+#else
+    .long   bcc_taken, op_bsr,   bcct_hi, bcct_ls
+#endif
+    .long   bcct_cc,   bcct_cs, bcct_ne, bcct_eq
+    .long   bcct_vc,   bcct_vs, bcct_pl, bcct_mi
+    .long   bcct_ge,   bcct_lt, bcct_gt, bcct_le
+#endif
 
     .text
 ALIGN(check_cc):
@@ -2832,6 +4655,38 @@ OP(trapv):
 OP(bitsr):  # bit operation using a register as index
     jal_and_j decode_dptr, op_bits_start
 op_bitsi:   # bit operation using immediate value as index
+#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
+    # BTST #imm,(d16,An) fast path (wave 3, M64K_W3_FULL only). Generic charge order: 4
+    # (op_bitsi) + 8 (ea_101) before the byte read, then bits_impl's 8 and
+    # op_btst_e's -4 after — replicated as 12 / +4. Only Z is affected
+    # (set to the tested bit's value); byte reads cannot fault.
+    andi t0, opcode, 0xC0
+    bnez t0, bitsi_slow                # BTST only (bchg/bclr/bset generic)
+    andi t0, opcode, 0x38
+    xori t0, 0x28
+    bnez t0, bitsi_slow                # only (d16,An)
+    addi dptr, m_pc, -2                # op_bitsi parity (see ANDI note)
+    lbu t3, 1(m_pc)                    # bit index (low byte of first ext word)
+    andi t1, opcode, 7
+    sll t1, 2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 2(m_pc)                     # d16 (second ext word)
+    addiu m_pc, 4
+    addu eaptr32, t2
+    map_m68k eaptr, eaptr32
+    use_cycles 12
+    lbu_m68k t0, eaptr
+    use_cycles 4
+    andi t3, 7
+    srlv t0, t0, t3
+    andi t0, 1
+    dsrl flag_zc, 32                   # keep C, clear the Z field...
+    dsll flag_zc, 32
+    or flag_zc, t0                     # ...then set !Z = tested bit
+    dispatch_next
+bitsi_slow:
+#endif
     use_cycles 4
     addi dptr, m_pc, -2
     addiu m_pc, 2
@@ -3040,3 +4895,51 @@ op_pack: op_rtm: op_trapcc: op_unpk:
     sw_ctx t0, M64K_OFF_PENDINGEXC+0
     addi m_pc, -2                          # 68000 stacks PC of the faulting opcode
     j main_loop_exit
+
+#ifdef M64K_DYNREC
+# Dynarec probe hit: way-resolved block dispatch. Both probe sites leave
+# t2 = &set; the emitted block (dynrec.c) carries its own C_max entry gate
+# and every exit restores the m_pc/main_loop contract. "jr t0" is in the
+# TLB handler's delay-slot resolver set; delay slots stay nop regardless.
+    .set push
+    .set noreorder
+ALIGN(dyn_probe_hit):                  # way-0 hit
+    lw t0, 4(t2)
+    jr t0
+     nop
+ALIGN(dyn_probe_hit1):                 # way-1 hit
+    lw t0, 12(t2)
+    jr t0
+     nop
+    .set pop
+#endif
+
+#ifdef M64K_DYNSTAT
+# Dynarec coverage rig (diagnostic builds only, like MVS64_OPHIST): count
+# every control-transfer target seen at jmp_exec — deliberately the SAME
+# visibility as the dynarec block-table probe (taken Bcc and non-blockop-
+# fused DBcc route through branch_exec->jmp_exec; JMP/JSR/BSR/RTS generic
+# paths land here; rts_fast/bsr_fast bypass this exactly as they bypass the
+# probe). Tables live in emu.c ([DYNSTAT] dump); slot = (pc>>1) & 0xFFFF,
+# last-writer PC recorded for collision detection. Clobbers t0/t2/t3 and
+# ra — all dead on the jmp_exec -> main_loop edge.
+ALIGN(dynstat_count):
+    srl t2, eaptr32, 1
+    andi t2, 0xFFFF
+    sll t2, 2
+    la t3, m64k_dynstat_cnt
+    addu t3, t2
+    lw t0, 0(t3)
+    addiu t0, 1
+    sw t0, 0(t3)
+    la t3, m64k_dynstat_pc
+    addu t3, t2
+    sw eaptr32, 0(t3)
+    jr ra
+#endif
+
+    # End-of-text marker: the TLB handler (hw_n64.S) uses [_m64k_asmrun,
+    # __m64k_asm_end) to recognize faults coming from the interpreter itself
+    # (where saved a1 == live m_cycles) vs nested/outside faults.
+    .globl __m64k_asm_end
+__m64k_asm_end:

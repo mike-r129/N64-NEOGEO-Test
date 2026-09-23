@@ -49,7 +49,11 @@ static const uint8_t cyc_ddfd[256] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 15, 4, 4, 4, 4,
 #define GET_BIT(n, val) (((val) >> (n)) & 1)
 
 static inline uint8_t rb(z80* const z, uint16_t addr) {
+#ifndef Z80_RMAP_OFF
+  return *(const uint8_t*)(z->rmap[addr >> 8] + addr);
+#else
   return z->read_byte(z->userdata, addr);
+#endif
 }
 
 static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
@@ -57,8 +61,12 @@ static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
 }
 
 static inline uint16_t rw(z80* const z, uint16_t addr) {
+#ifndef Z80_RMAP_OFF
+  return (rb(z, (uint16_t)(addr + 1)) << 8) | rb(z, addr);
+#else
   return (z->read_byte(z->userdata, addr + 1) << 8) |
          z->read_byte(z->userdata, addr);
+#endif
 }
 
 static inline void ww(z80* const z, uint16_t addr, uint16_t val) {
@@ -707,6 +715,9 @@ static inline void process_interrupts(z80* const z) {
 // and userdata must be manually set by the user afterwards.
 void z80_init(z80* const z) {
   z->read_byte = NULL;
+#ifndef Z80_RMAP_OFF
+  z->rmap = NULL;
+#endif
   z->write_byte = NULL;
   z->port_in = NULL;
   z->port_out = NULL;
@@ -761,16 +772,54 @@ void z80_init(z80* const z) {
   z->int_data = 0;
 }
 
+// MVS64_Z80OPHIST (PC diagnostic): opcode/prefix/PC-page histogram of every
+// stepped instruction, dumped to stderr at exit.
+#ifdef MVS64_Z80OPHIST
+#include <stdlib.h>
+static unsigned long z80_oph[6][256];
+static void z80_oph_dump(void) {
+  static const char *pn[6] = {"", "CB", "ED", "DD", "FD", "PC"};
+  unsigned long tot = 0;
+  for (int i = 0; i < 256; i++) tot += z80_oph[0][i];
+  fprintf(stderr, "[OPH] total=%lu\n", tot);
+  for (int p = 0; p < 6; p++) {
+    for (int k = 0; k < (p ? 12 : 60); k++) {
+      unsigned long best = 0; int bi = -1;
+      for (int i = 0; i < 256; i++) if (z80_oph[p][i] > best) { best = z80_oph[p][i]; bi = i; }
+      if (bi < 0) break;
+      fprintf(stderr, "[OPH] %s%02X %lu %.2f%%\n", pn[p], bi, best, 100.0 * best / (tot ? tot : 1));
+      z80_oph[p][bi] = 0;
+    }
+  }
+}
+#endif
 // executes the next instruction in memory + handles interrupts
 void z80_step(z80* const z) {
   if (z->halted) {
     exec_opcode(z, 0x00);
   } else {
     const uint8_t opcode = nextb(z);
+#ifdef MVS64_Z80OPHIST
+    { static int reg; if (!reg) { reg = 1; atexit(z80_oph_dump); } }
+    z80_oph[0][opcode]++;
+    { uint8_t n = z->read_byte(z->userdata, z->pc);
+      if (opcode == 0xCB) z80_oph[1][n]++;
+      else if (opcode == 0xED) z80_oph[2][n]++;
+      else if (opcode == 0xDD) z80_oph[3][n]++;
+      else if (opcode == 0xFD) z80_oph[4][n]++; }
+    z80_oph[5][(z->pc - 1) >> 8 & 0xff]++;
+#endif
     exec_opcode(z, opcode);
   }
 
-  process_interrupts(z);
+  // Fused event check (mvs64): process_interrupts does nothing at all
+  // unless one of these conditions holds (EI delay pending, NMI pending,
+  // or a maskable INT that iff1 would accept), so gate the call on the
+  // exact same predicate — zero new state to maintain, and the flags
+  // share one bitfield byte so this is a couple of loads. The common
+  // in-fight case (~97% of steps) skips the call entirely.
+  if (z->iff_delay | (uint8_t)(z->nmi_pending | (z->int_pending & z->iff1)))
+    process_interrupts(z);
 }
 
 // outputs to stdout a debug trace of the emulator

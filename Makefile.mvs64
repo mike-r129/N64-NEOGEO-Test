@@ -9,8 +9,8 @@ BUILD_DIR = build/mvs64
 
 include $(N64_INST)/include/n64.mk
 
-core_src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80.c ym2610/ym2610.c lib/rdl.c $(wildcard hle_*.c)
-rsp = rsp_video.S
+core_src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80.c ym2610/ym2610.c lib/rdl.c pcprof.c $(wildcard hle_*.c)
+rsp = rsp_video.S rsp_audio.S rsp_fm.S
 ifdef MUSASHI
 # Fallback 68k core: portable Musashi (proven on the PC build). Slower than m64k
 # but known-good — use while m64k opcode bugs are investigated. No m64k TLB asm;
@@ -19,9 +19,61 @@ src = $(core_src) m68kcpu.c m68kops.c m68kdasm.c
 asm =
 else
 # Default: fast m64k MIPS-asm 68k interpreter (0xFF000000 TLB window + hw_n64.S).
-src = $(core_src) m64k/m64k.c m64k/tlb.c
+src = $(core_src) m64k/m64k.c m64k/tlb.c m64k/dynrec.c
 asm = hw_n64.S m64k/m64k_asm.S
 CFLAGS += -DUSE_M64K
+# DBF block-op fast path (fused copy/fill loops; VRAM-port helper lives in
+# hw_n64.S, so only game builds enable it — the standalone testsuite link
+# has no hw_n64.S and must not reference its symbols).
+# Disable with make ... BLOCKOPS_OFF=1: the fused path must be bit- and
+# cycle-exact against the unfused interpreter, so ON-vs-OFF is its gate
+# (identical [TRCRC] streams).
+ifndef BLOCKOPS_OFF
+CFLAGS += -DM64K_BLOCKOPS
+ASFLAGS += -DM64K_BLOCKOPS
+N64_ASFLAGS += -DM64K_BLOCKOPS
+endif
+# m64k inline fast paths for the profile-dominant opcode forms (Bcc condition
+# dispatch, hot MOVE.b/.w forms, TST.b/.w (d16,An)) — testsuite-covered (the
+# standalone m64k testsuite build enables the same define). Disable with
+# make ... FP_OFF=1 for A/B measurement.
+ifndef FP_OFF
+CFLAGS += -DM64K_FASTPATHS
+ASFLAGS += -DM64K_FASTPATHS
+N64_ASFLAGS += -DM64K_FASTPATHS
+endif
+# Per-PC predecode record dispatch (60fps campaign track A). Phase 1a is a
+# semantics-neutral scaffold (all pages route through the classic trampoline);
+# testsuite-covered via the standalone m64k Makefile. Opt-in: make ... PD_ON=1.
+ifdef PD_ON
+CFLAGS += -DM64K_PREDECODE
+ASFLAGS += -DM64K_PREDECODE
+N64_ASFLAGS += -DM64K_PREDECODE
+endif
+# m64k dynarec (60fps campaign, PLAN-OPTIMIZATION.md blueprint). Phase 1 is
+# infrastructure only: 256KB code arena + publish primitive, empty
+# block-table probes at the two blessed sites (_m64k_asmrun entry, jmp_exec),
+# and the hw_n64.S EPC-range extension proven at boot by [DYNTEST]. No guest
+# code is emitted yet. Opt-in: make ... DYNREC_ON=1.
+ifdef DYNREC_ON
+CFLAGS += -DM64K_DYNREC
+ASFLAGS += -DM64K_DYNREC
+N64_ASFLAGS += -DM64K_DYNREC
+endif
+# Deterministic per-slice 68k state-trace hash printed per frame ([TRCRC]);
+# the dynarec bit-exactness gate. Opt-in: make ... TRCRC_ON=1.
+ifdef TRCRC_ON
+CFLAGS += -DM64K_TRACECRC
+endif
+# Dynarec coverage rig ([DYNSTAT]/[DYNH], diagnostic like OPHIST — use the
+# counts, not the fps): counts control-transfer targets at jmp_exec with
+# the probe's exact visibility, dumps totals + PC-region split + top-16
+# heads every 600 frames. Opt-in: make ... DYNSTAT_ON=1.
+ifdef DYNSTAT_ON
+CFLAGS += -DM64K_DYNSTAT
+ASFLAGS += -DM64K_DYNSTAT
+N64_ASFLAGS += -DM64K_DYNSTAT
+endif
 endif
 obj = $(src:%.c=$(BUILD_DIR)/%.o) $(asm:%.S=$(BUILD_DIR)/%.o) $(rsp:%.S=$(BUILD_DIR)/%.o)
 
@@ -30,10 +82,76 @@ obj_makerom = $(src_makerom:%.c=$(BUILD_DIR)/%.o)
 
 CFLAGS += -Wno-unused-function
 CFLAGS += $(EXTRA_DEFINES)
+
+# RSP ADPCM offload (rsp_audio.S + ym2610.c rspa_* glue): default ON.
+# The YM2610 ADPCM-A/B decoders run on the RSP pipelined under the CPU's FM
+# pass (gated bit-exact vs the C core; ares 300s dual-compute run, 35840
+# chunks, 0 mismatches; in-fight fps 22.0 -> 26.3). Disable with
+# make ... ADPCM_CPU=1 to force the C decoders (debug/fallback).
+ifndef ADPCM_CPU
+CFLAGS += -DMVS64_RSPADPCM
+endif
+# FM synthesis offload (rsp_fm.S + ym2610.c rspfm_* glue): default OFF.
+# The port is bit-exact (300s dual-compute gate, 35840 chunks, 0 mismatches)
+# but measured NET-NEGATIVE when collected synchronously: the CPU idles for
+# the RSP compute time ([RSPWAIT] fm~2.4ms/chunk, q=0), and a 2-channel
+# CPU/RSP split still loses ~4fps to per-chunk glue overhead. Needs the
+# cross-pump deferred-collect architecture to pay off. Enable with RSPFM=1.
+ifdef RSPFM
+CFLAGS += -DMVS64_RSPFM
+endif
+# Whole-pump audio batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM AND
+# ADPCM on the RSP with RSP-resident dynamic state, cross-pump output
+# deferral in plat_audio_pump. Default ON since full WP-M2 (2026-07-08):
+# same-source 600s ares A/B, content-matched fight buckets, roughly DOUBLES
+# in-fight fps (19.2->35.9, 17.2->31.5, 16.5->26.4, 14.3->21.6 across spr
+# density buckets; snd 150-310% -> 51-64%). Bit-exactness gate green (300s,
+# 40960 chunks, 0 mismatches FM+ADPCM, 0 hatches). Disable with WP_OFF=1;
+# add EXTRA_DEFINES=-DMVS64_RSPWP_VERIFY for the dual-compute gate
+# ([RSPWP] counters).
+ifndef WP_OFF
+CFLAGS += -DMVS64_RSPFM -DMVS64_RSPWP
+endif
+
+# Offload dead-latch revive (MVS64_WP_REVIVE, 8113e6f): retry a runtime
+# dead-latch on a 1s..16s doubling backoff instead of writing the offload
+# off for the session (the permanent mid-round sound-loss class diagnosed
+# 2026-08-09). Default ON since 2026-08-30: the user confirmed the sndfix
+# build survives real-hardware play sessions with no sound loss. Disable
+# with WP_REVIVE_OFF=1.
+ifndef WP_REVIVE_OFF
+CFLAGS += -DMVS64_WP_REVIVE
+endif
+
+# NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
+# REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll
+# bloat thrashes the VR4300's 16KB icache in the synthesis loop. Keep -O2.
+# The opposite experiment (code-size-first, AUDIO_OS=1) was ALSO tried
+# (2026-07-07): -Os REGRESSED in-match snd% 136->155 (fps 22->19.3) — the
+# shorter-but-branchier codegen loses more in the synthesis inner loops than
+# the icache saves. -O2 is the confirmed sweet spot from both directions.
+ifdef AUDIO_OS
+$(BUILD_DIR)/ym2610/ym2610.o: CFLAGS += -Os
+$(BUILD_DIR)/z80.o: CFLAGS += -Os
+$(BUILD_DIR)/sound_neogeo.o: CFLAGS += -Os
+endif
+# Z80-core-only -Os (Z80_OS=1): MEASURED FLAT (2026-07-09). Text shrank 40%
+# (39KB->23KB) but us/Z80-step 3.37->3.42 and bucket-matched fps identical —
+# the interpreter's per-step cost is not switch-footprint-bound either (the
+# inline-bus experiment already ruled out callback overhead; struct layout is
+# already 3 hot dcache lines). Z80 stepping (~60% of snd, ~5.7ms/frame) is at
+# its practical interpreter floor; the next lever there is structural.
+# Knob kept off-by-default for reproducing the measurement.
+ifdef Z80_OS
+$(BUILD_DIR)/z80.o: CFLAGS += -Os
+endif
 # Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
 # (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
 ASFLAGS += $(EXTRA_DEFINES)
 N64_ASFLAGS += $(EXTRA_DEFINES)
+# ...and to the RSP assembler (rsp_*.S build with RSPASFLAGS, not ASFLAGS),
+# so ucode-side verify gates (MVS64_BATCHDBG) can be driven the same way.
+RSPASFLAGS += $(EXTRA_DEFINES)
 
 ROMNAME=$(notdir $(basename $(ROM)))
 ROMDIR=$(ROM:%.zip=%.n64)

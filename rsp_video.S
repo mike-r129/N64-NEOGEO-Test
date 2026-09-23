@@ -12,6 +12,12 @@
         RSPQ_DefineCommand cmd_sprite_draw, 12 # 0x2
         RSPQ_DefineCommand cmd_pal_convert, 8  # 0x3
         RSPQ_DefineCommand cmd_sprite_begin, 4 # 0x4
+        RSPQ_DefineCommand cmd_sprite_walk, 12 # 0x5
+#ifdef MVS64_BATCHDBG
+        RSPQ_DefineCommand cmd_sprite_batch, 16 # 0x6 (+a3: journal ring)
+#else
+        RSPQ_DefineCommand cmd_sprite_batch, 12 # 0x6
+#endif
 	RSPQ_EndOverlayHeader
 
 RSPQ_BeginSavedState
@@ -19,6 +25,13 @@ RSPQ_BeginSavedState
 PALETTE_CACHE: .half -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 LAST_PALETTE:  .long 0
 RDRAM_PALETTE: .long 0
+# Phase 3 rotation state (PLAN-DRAW-RDP §7): must live in the SAVED state
+# block — overlay .data/.bss reset on every overlay swap (the audio ucode
+# swaps in mid-frame constantly), and this state persists record-to-record
+# across the whole sprite pass. Reset by cmd_sprite_begin each frame.
+SPR_RSTATE:    .byte 0        # descriptor/TMEM pair in rotation (0..2)
+SPR_MODE:      .byte 0        # current RDP cycle mode: 0=1cyc, 1=copy
+    .align 3                  # keep saved-state DMA size a multiple of 8
 RSPQ_EndSavedState
 
 .macro vsll_acc vdstreg, vsrcreg, qty
@@ -369,18 +382,41 @@ fix_draw:
 
     .data
 
-    .align 4
-RDP_SPRITE_DRAW:
-    .quad RdpSyncPipe()
-    .quad RdpSyncTile()
-    .quad RdpSyncLoad()
+    # Phase 3 (PLAN-DRAW-RDP §7.1): the per-record syncs left the template.
+    # Three baked variants rotate BOTH the tile-descriptor pair (draw tile
+    # 2p, load tile 2p+1) and the TMEM slot (p*128B; the TLUT half at
+    # 0x800+ is untouched, TILE7 stays the TLUT-load descriptor). A
+    # descriptor/slot is reused every 3rd record, so SyncTile+SyncLoad are
+    # emitted only on rotation wrap (see sprite_draw prologue): between
+    # wraps the RDP overlaps record i+1's LoadBlock with record i's
+    # TexRect instead of ping-ponging load→draw per tile. The old stream
+    # paid SyncTile+SyncLoad per record, ~565+/frame in fights.
+    # Variants sit 64B apart (7 quads + pad): base = TPL0 + (pair<<6).
+.macro SPRITE_DRAW_TPL ldtile, drtile, tmemw
     .quad RdpSetTexImage(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, 4)
-    .quad RdpSetTile(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, 0, TILE1)
-    .quad RdpSetTile(RDP_TILE_FORMAT_INDEX, RDP_TILE_SIZE_4BIT, 8/8, 0, TILE0)
-    .quad RdpSetTileSizeI(TILE0, 0, 0, 16-1, 16-1)
-    .quad RdpLoadBlock(TILE1, 0, 0, 16*16/4, 16/2)
-    .quad RdpTextureRectangle1I(TILE0, 0, 0, 0, 0)         # x0,y1,x1,y1
+    .quad RdpSetTile(RDP_TILE_FORMAT_RGBA, RDP_TILE_SIZE_16BIT, 0, \tmemw, \ldtile)
+    .quad RdpSetTile(RDP_TILE_FORMAT_INDEX, RDP_TILE_SIZE_4BIT, 8/8, \tmemw, \drtile)
+    .quad RdpSetTileSizeI(\drtile, 0, 0, 16-1, 16-1)
+    .quad RdpLoadBlock(\ldtile, 0, 0, 16*16/4, 16/2)
+    .quad RdpTextureRectangle1I(\drtile, 0, 0, 0, 0)       # x1,y1 / x0,y0
     .quad RdpTextureRectangle2I(0, 0, 0, 0)                # s,t,ds,dt
+    .quad 0                                                # pad to 64B stride
+.endm
+    .align 4
+RDP_SPRITE_TPL0: SPRITE_DRAW_TPL 1, 0, 0
+RDP_SPRITE_TPL1: SPRITE_DRAW_TPL 3, 2, 16
+RDP_SPRITE_TPL2: SPRITE_DRAW_TPL 5, 4, 32
+
+# Layout-identical fps-twin knob (matched-pair law): with -DMVS64_ROTA_OFF
+# this single DATA byte flips to 1 and the body pins pair=0 (TPL0 = tiles
+# 0/1, tmem 0, syncs every record — byte-identical to the pre-Phase-3
+# stream) and never picks copy mode. Both twin binaries carry identical
+# text and layout; only this initializer differs.
+#ifdef MVS64_ROTA_OFF
+ROTA_DISABLE: .byte 1
+#else
+ROTA_DISABLE: .byte 0
+#endif
 
     .align 4
 RDP_SPRITE_LOAD_PALETTE:
@@ -416,6 +452,11 @@ cmd_sprite_begin:
     li s0, %lo(PALETTE_CACHE)
     sqv $v01, 0,s0
     sqv $v01, 16,s0
+
+    # Reset Phase 3 rotation/mode state: the CPU emits the standard-mode
+    # SetOtherModes right after this command each frame, so pair=0 and
+    # mode=1cyc are consistent with the RDP state by construction.
+    sh zero, %lo(SPR_RSTATE)
 
     jr ra
     sw a0, %lo(RDRAM_PALETTE)
@@ -523,29 +564,8 @@ cmd_sprite_draw:
     addi s3, 48
 
 sprite_draw:
-    li s0, %lo(RDP_SPRITE_DRAW)
-    lqv vload0,  0,s0
-    lqv vload1, 16,s0
-    lqv vload2, 32,s0
-    lqv vload3, 48,s0
-    lqv vload4, 64,s0
-
-    sqv vload0,  0,s3
-    sqv vload1, 16,s3
-    sqv vload2, 32,s3
-    sqv vload3, 48,s3
-    sqv vload4, 64,s3
-
-    # Store sprite pixel address in SetTexImage
-    sw a0, 3*8+4(s3)
-
-    # Store palette number into SetTile
-    lbu t0, 5*8+5(s3)
-    sll t1, palslot, 4
-    or t0, t1
-    sb t0, 5*8+5(s3)
-
-    # Extract X/Y
+    # Extract X/Y and size fields first: the rotation prologue (and the
+    # Phase 3 copy-mode decision) need them before the template is staged.
     sll rect_x0, a1, 8
     sll rect_y0, a1, 20
     sra rect_x0, 20
@@ -560,10 +580,119 @@ sprite_draw:
     nop
     addi rect_y0, -512
 2:
-
     andi rect_sw, a2, 0xF
     srl rect_sh, a2, 4
     andi rect_sh, 0xF
+
+    # --- Phase 3.2 modal test: copy-eligible iff full 16x16, no flips,
+    # and no x-clipping — the proven predicate of the old CPU dual-mode
+    # path (video_n64.c draw_sprite). Top y-clip is handled inside the
+    # copy path, bottom by the 224 clamp; y is additionally bounded to
+    # (-16, 224) so the copy rect can never go degenerate (the 1cyc
+    # fallback scissors those away, same as today). t3 = record mode.
+    li t3, 0                  # 1cyc
+    andi t0, a2, 0x3FF
+    xori t0, 0xFF             # sw-1==15 && sh-1==15 && !flipx && !flipy
+    bnez t0, 9f
+    nop
+    bltz rect_x0, 9f          # x0 >= 0
+    sltiu t0, rect_x0, 305    # x0 <= 304 (x0+16 <= 320), delay slot
+    beqz t0, 9f
+    addi t0, rect_y0, 15      # y0 >= -15, delay slot
+    bltz t0, 9f
+    slti t0, rect_y0, 224     # y0 <= 223, delay slot
+    beqz t0, 9f
+    nop
+    li t3, 1                  # copy
+9:
+    lbu t0, %lo(ROTA_DISABLE)
+    beqz t0, 10f
+    nop
+    li t3, 0                  # legacy twin: never copy
+10:
+
+    # --- Rotation prologue (§7.1): t2 = descriptor/TMEM pair in use for
+    # this record. Syncs are emitted only on rotation wrap (pair 0 about
+    # to be reused): the previous user of pair 0's descriptors and TMEM
+    # slot is record i-3, and SyncTile+SyncLoad here drain every record
+    # <= i-1. Between wraps there are no syncs, so the RDP loads record
+    # i+1's texels into its own slot while record i's rect still draws.
+    # A mode switch (§7.2) instead emits SyncPipe + SetOtherModes: the
+    # pipe drain covers every rotation hazard too, so the wrap syncs are
+    # skipped on those records. SOM words are the VERBATIM payloads the
+    # rdpq engine composes for these two modes, captured off the
+    # validated stream (MVS64_RDPDBG rig, 2026-08-08):
+    #   1cyc: EF008CF000000201  "1cyc tlut alpha_compare cvg=[zap]"
+    #   copy: EF20800000000001  "copy tlut alpha_compare" (fix layer's
+    #         own copy mode — proven with the same CI4+TLUT+alpha setup)
+    lbu t2, %lo(SPR_RSTATE)
+    lbu t0, %lo(SPR_MODE)
+    beq t0, t3, 3f
+    addi t1, t2, 1            # next pair (delay slot, all paths)
+    # mode switch
+    sb t3, %lo(SPR_MODE)
+    li t0, 0x27000000         # SyncPipe
+    sw t0, 0(s3)
+    sw zero, 4(s3)
+    bnez t3, 1f
+    nop
+    li t0, 0x2F008CF0         # -> standard 1cyc
+    li t4, 0x00000201
+    b 2f
+    nop
+1:  li t0, 0x2F208000         # -> copy
+    li t4, 0x00000001
+2:  sw t0, 8(s3)
+    sw t4, 12(s3)
+    b 5f
+    addi s3, 16
+3:  bnez t2, 5f
+    nop
+    li t0, 0x28000000         # SyncTile
+    sw t0, 0(s3)
+    sw zero, 4(s3)
+    li t0, 0x26000000         # SyncLoad
+    sw t0, 8(s3)
+    sw zero, 12(s3)
+    addi s3, 16
+5:
+    slti t0, t1, 3
+    bnez t0, 4f
+    nop
+    li t1, 0
+4:
+    lbu t0, %lo(ROTA_DISABLE)
+    beqz t0, 6f
+    nop
+    li t1, 0                  # legacy twin: pair pinned to 0 (per-record syncs)
+6:  sb t1, %lo(SPR_RSTATE)
+
+    # Stage this pair's template (7 quads, 56B; the 4th quad copy
+    # over-copies the 8B pad, harmless: s3 advances 56 and RDPQ_Send
+    # sends up to s3).
+    sll t4, t2, 6
+    addi t4, %lo(RDP_SPRITE_TPL0)
+    lqv vload0,  0,t4
+    lqv vload1, 16,t4
+    lqv vload2, 32,t4
+    lqv vload3, 48,t4
+
+    sqv vload0,  0,s3
+    sqv vload1, 16,s3
+    sqv vload2, 32,s3
+    sqv vload3, 48,s3
+
+    # Store sprite pixel address in SetTexImage
+    sw a0, 0*8+4(s3)
+
+    # Store palette slot into the draw-tile SetTile
+    lbu t0, 2*8+5(s3)
+    sll t1, palslot, 4
+    or t0, t1
+    sb t0, 2*8+5(s3)
+
+    bnez t3, sprite_copy_rect
+    nop
 
     # Fetch scale factors from table
     sll rect_ds, rect_sw, 1
@@ -572,34 +701,34 @@ sprite_draw:
     lhu rect_dt, %lo(SCALE_FACTORS)(rect_dt)
 
     # Handle negative rectangle positions
-    bgez rect_x0, 1f
+    bgez rect_x0, 5f
     li rect_s0, 0
     neg rect_s0, rect_x0
     sub rect_sw, rect_s0
     li rect_x0, 0
-1:
-    bgez rect_y0, 2f
+5:
+    bgez rect_y0, 6f
     li rect_t0, 0
     neg rect_t0, rect_y0
     sub rect_sh, rect_t0
     li rect_y0, 0
-2:
+6:
 
     # Handle flipping
     andi t0, a2, 1<<8
-    beqz t0, 1f
+    beqz t0, 7f
     nop
     li t0, 16
     sub rect_s0, t0, rect_s0
     neg rect_ds, rect_ds
-1:
+7:
     andi t0, a2, 1<<9
-    beqz t0, 2f
+    beqz t0, 8f
     nop
     li t0, 16
     sub rect_t0, t0, rect_t0
     neg rect_dt, rect_dt
-2:
+8:
 
     # Calculate X1/Y1 coordinates
     add rect_sw, rect_x0
@@ -613,27 +742,78 @@ sprite_draw:
     sll rect_x0, 14
     sll rect_y0, 2
     or rect_x0, rect_y0
-    lw t0, 8*8+4(s3)
+    lw t0, 5*8+4(s3)
     or t0, rect_x0
-    sw t0, 8*8+4(s3)
+    sw t0, 5*8+4(s3)
 
     andi rect_sw, 0x3FF
     andi rect_sh, 0x3FF
     sll rect_sw, 14
     sll rect_sh, 2
     or rect_sw, rect_sh
-    lw t0, 8*8+0(s3)
+    lw t0, 5*8+0(s3)
     or t0, rect_sw
-    sw t0, 8*8+0(s3)
+    sw t0, 5*8+0(s3)
 
     sll rect_s0, 5
     sll rect_t0, 5
-    sh rect_s0, 9*8+0(s3)
-    sh rect_t0, 9*8+2(s3)
-    sh rect_ds, 9*8+4(s3)
-    sh rect_dt, 9*8+6(s3)
+    sh rect_s0, 6*8+0(s3)
+    sh rect_t0, 6*8+2(s3)
+    sh rect_ds, 6*8+4(s3)
+    sh rect_dt, 6*8+6(s3)
 
-    addi s3, 10*8
+    addi s3, 7*8
+
+    # Send to RDP and go back to main loop
+    j RDPQ_Send
+    li s4, %lo(RDPQ_CMD_STAGING)
+
+sprite_copy_rect:
+    # COPY-mode rect (§7.2): full 16x16, no flip, no x-clip guaranteed by
+    # the modal test. Top y-clip via the t texel offset (the old CPU copy
+    # path's workaround), bottom clamped to 224. COPY semantics follow
+    # the libdragon fixup + the fix layer's own template: XL/YL are
+    # INCLUSIVE (one full pixel less than the exclusive x1/y1, hence
+    # -0x4004 on the packed 10.2 pair), dsdx = 4 texels/pixel (the RDP
+    # copies 4 16-bit texels per clock), dtdy = 1.
+    li rect_t0, 0
+    bgez rect_y0, 1f
+    addi rect_sw, rect_x0, 16      # x1 exclusive (delay slot, both paths)
+    neg rect_t0, rect_y0           # t offset = -y0
+    li rect_y0, 0
+1:
+    li t0, 16
+    sub t0, rect_t0
+    add rect_sh, rect_y0, t0       # y1 exclusive = y0 + 16 - t
+    li t0, 224
+    ble rect_sh, t0, 2f
+    nop
+    move rect_sh, t0               # bottom clamp
+2:
+    sll rect_sw, 14
+    sll rect_sh, 2
+    or rect_sw, rect_sh
+    addi rect_sw, -0x4004          # exclusive -> inclusive XL/YL
+    lw t0, 5*8+0(s3)
+    or t0, rect_sw
+    sw t0, 5*8+0(s3)
+
+    sll rect_x0, 14
+    sll rect_y0, 2
+    or rect_x0, rect_y0
+    lw t0, 5*8+4(s3)
+    or t0, rect_x0
+    sw t0, 5*8+4(s3)
+
+    sh zero, 6*8+0(s3)             # s = 0
+    sll rect_t0, 5
+    sh rect_t0, 6*8+2(s3)          # t
+    li t0, 4<<10
+    sh t0, 6*8+4(s3)               # dsdx = 4.0
+    li t0, 1<<10
+    sh t0, 6*8+6(s3)               # dtdy = 1.0
+
+    addi s3, 7*8
 
     # Send to RDP and go back to main loop
     j RDPQ_Send
@@ -641,6 +821,510 @@ sprite_draw:
 
     .endfunc
 
+
+
+#########################################################################
+# SPRITE BATCH (PLAN-DRAW-RDP Phase 2: one command per record chunk)
+#########################################################################
+#
+# cmd_sprite_batch replaces the per-tile rspq_write dispatch: the CPU
+# resolves tile pointers once (uncached parallel u32 ptrs[], 0 = skip:
+# empty tile), then issues ONE command per chunk of <=64 SprWalkRec
+# records. The ucode DMAs both arrays into DMEM and jal's the EXISTING
+# cmd_sprite_draw body per non-empty record — the per-record RDP stream
+# is bit-identical by construction (same code, same args, same order),
+# which is what the MVS64_BATCHDBG triple-journal gate checks.
+#
+# DMEM: records stage in WALK_LIST (512B) — DEAD SHARING invariant: batch
+# commands are only issued after the walk's collect (sentinel wait) in
+# the same frame, and pal_convert touches only PAL_BUFFER. BATCH_PTRS
+# dead-shares the TAIL of PAL_BUFFER (last 256B): both are pure
+# per-command scratch (each batch command DMAs its pointers in at start;
+# pal_convert DMAs its result out before returning), pal_convert runs
+# once per frame BEFORE the sprite pass, and RSP commands execute
+# serially — the regions are never live at the same time. This freed the
+# DMEM that the Phase 3 rotation templates consumed (the overlay sat 16B
+# from the 4KB ceiling). Loop state lives in DMEM because the draw body +
+# RDPQ_Send clobber nearly every scalar register; three loads per record
+# is noise against the ~100-instruction body.
+#define BATCH_PTRS (PAL_BUFFER + 0x800 - 256)
+#
+# Command: 0x6, 12 bytes
+#   a0: records RDRAM phys (SprWalkRec[], 8 bytes each)
+#   a1: resolved-pointer array RDRAM phys (u32[], parallel; 0 = skip)
+#   a2: record count in this chunk (1..64)
+#   a3 (MVS64_BATCHDBG builds only; command widens to 16 bytes): RDRAM
+#       phys of this chunk's journal slice. The ucode DMAOuts one 16-byte
+#       entry {a0, a1, a2, w0} per record (skips included) BEFORE the skip
+#       branch; the CPU pre-fills the slice with a sentinel and compares
+#       every entry against independently-derived expected triples. This
+#       is the Phase 2 bit-exactness gate (plan §6).
+
+    .bss
+    .align 2
+BATCH_STATE: .dcb.b 16        # rec cursor / ptr cursor / remaining / journal cursor
+#ifdef MVS64_BATCHDBG
+    .align 3
+BATCH_JSTAGE: .dcb.b 16       # one journal entry staging for DMAOut
+#endif
+
+    .text
+
+# a1/a2 synthesis from the DMA'd record words (t7 = w0, t8 = w1, t0
+# scratch) — the exact packing rsp_sprite_draw does on the CPU. One
+# macro shared by the live path and the BATCHDBG journal path, so the
+# text the gate verifies is the text that ships.
+.macro batch_synth_args
+    # a1 = pal<<24 | x<<12 | y  (exactly what rsp_sprite_draw packs)
+    srl t0, t7, 20
+    andi t0, 0xFF
+    sll a1, t0, 24
+    andi t0, t8, 0xFFF
+    sll t0, 12
+    or a1, t0
+    srl t0, t8, 12
+    andi t0, 0xFFF
+    or a1, t0
+    # a2 = (sw-1)|((sh-1)<<4) | flips — (w1>>24)&0xFF passes both size
+    # fields through; flips relocate from w0[28..29] to bits [8..9].
+    srl a2, t8, 24
+    andi a2, 0xFF
+    srl t0, t7, 20
+    andi t0, 0x300
+    or a2, t0
+.endm
+
+    .func cmd_sprite_batch
+cmd_sprite_batch:
+    move s0, a0
+    li s4, %lo(WALK_LIST)
+    sll t0, a2, 3
+    jal DMAIn
+    addi t0, -1               # DMA_SIZE(n*8, 1)
+
+    move s0, a1
+    li s4, %lo(BATCH_PTRS)
+    sll t0, a2, 2
+    jal DMAIn
+    addi t0, -1               # DMA_SIZE(n*4, 1)
+
+    li t1, %lo(WALK_LIST)
+    li t2, %lo(BATCH_PTRS)
+    sw t1, %lo(BATCH_STATE)+0
+    sw t2, %lo(BATCH_STATE)+4
+    sw a2, %lo(BATCH_STATE)+8
+#ifdef MVS64_BATCHDBG
+    sw a3, %lo(BATCH_STATE)+12
+#endif
+
+batch_loop:
+    lw t1, %lo(BATCH_STATE)+0
+    lw t2, %lo(BATCH_STATE)+4
+    lw a0, 0(t2)              # resolved pixel pointer (phys), 0 = skip
+    lw t7, 0(t1)              # w0: tnum[0..19] pal[20..27] fx[28] fy[29]
+    lw t8, 4(t1)              # w1: x[0..11] y[12..23] sw-1[24..27] sh-1[28..31]
+    addi t1, 8
+    addi t2, 4
+    sw t1, %lo(BATCH_STATE)+0
+    sw t2, %lo(BATCH_STATE)+4
+#ifdef MVS64_BATCHDBG
+    # Journal EVERY record (skips included): synth args first, DMAOut
+    # {a0,a1,a2,w0} to the CPU ring, THEN apply the skip. DMAOut is
+    # synchronous (rsp_dma.inc waits for completion), so BATCH_JSTAGE
+    # is safe to rewrite on the next iteration; it clobbers only t2/at
+    # beyond its s0/s4/t0 args, so a0/a1/a2/t7 survive.
+    batch_synth_args
+    li t0, %lo(BATCH_JSTAGE)
+    sw a0, 0(t0)
+    sw a1, 4(t0)
+    sw a2, 8(t0)
+    sw t7, 12(t0)
+    lw s0, %lo(BATCH_STATE)+12
+    li s4, %lo(BATCH_JSTAGE)
+    jal DMAOut
+    li t0, DMA_SIZE(16, 1)
+    lw t0, %lo(BATCH_STATE)+12
+    addiu t0, 16
+    sw t0, %lo(BATCH_STATE)+12
+    beqz a0, batch_next
+    nop
+#else
+    beqz a0, batch_next
+    nop
+    batch_synth_args
+#endif
+    jal cmd_sprite_draw       # body tail-jumps RDPQ_Send -> jr ra -> here
+    nop
+batch_next:
+    lw t0, %lo(BATCH_STATE)+8
+    addi t0, -1
+    sw t0, %lo(BATCH_STATE)+8
+    bgtz t0, batch_loop
+    nop
+    j RSPQ_Loop
+    nop
+    .endfunc
+
+#########################################################################
+# SPRITE WALK (SCB -> visible-tile record list)
+#########################################################################
+#
+# cmd_sprite_walk ports sprite_walk_produce() (video.c) bit-exactly: it
+# walks the 381-sprite SCB + tilemaps out of the emulated VRAM (writeback'd
+# by the CPU before the kick), applies the same chaining / vshrink / cull /
+# auto-animation math, and emits the same 8-byte SprWalkRec records the C
+# producer would, in the same order. No pixel pointers, no palette work:
+# the CPU consume pass is unchanged. Gated by the MVS64_WALKDBG
+# dual-compute build (C and RSP lists compared per frame).
+#
+# DMEM budget note: the 2KB tilemap staging shares PAL_BUFFER (pal_convert
+# and the walk never overlap — FIFO command order). Everything else is
+# dedicated: 96B SCB group, 512B list staging, 32B magic, ~40B state.
+#
+# Command: 0x5, 12 bytes
+#   a0 (word0, cmd byte in top): VRAM physical base
+#   a1: record list RDRAM physical base
+#   a2: aa byte [0..7] | aa_enabled [8] | maxrecs [16..28]
+# Trailer written at list + maxrecs*8: {u32 nrec, u32 ovfl}.
+
+    .data
+    .align 4
+WALK_MAGIC:   # copy of VSHRINK_MAGIC (video.c)
+    .byte 1, 9, 5, 13, 3, 11, 7, 15, 0, 8, 4, 12, 2, 10, 6, 14
+    .byte 14, 6, 10, 2, 12, 4, 8, 0, 15, 7, 11, 3, 13, 5, 9, 1
+
+    .bss
+    .align 4
+WALK_SCB:     .dcb.b 96        # one 16-sprite group: z[32] y[32] x[32]
+WALK_LIST:    .dcb.b 512       # 64-record staging
+WALK_TRAILER: .dcb.b 8
+    .align 2
+WALK_VRAM:    .dcb.b 4         # VRAM phys base
+WALK_LBASE:   .dcb.b 4         # list RDRAM base
+WALK_LCUR:    .dcb.b 4         # current flush phys
+WALK_FILL:    .dcb.b 4         # bytes staged in WALK_LIST
+WALK_NREC:    .dcb.b 4
+WALK_OVFL:    .dcb.b 4
+WALK_MAX:     .dcb.b 4
+
+    .text
+
+    # Register map (DMAIn/DMAOut clobber only t2/at; args in s0/s4/t0):
+    #   v0 = group (0..23)      v1 = sprite-in-group (0..15)
+    #   s1 = VRAM phys          s2/s3 = free (unused)
+    #   s5 = sx   s6 = sy   s7 = sh   s8 = sw
+    #   k0 = vshrink   k1 = repeat_tiles
+    #   a2 = half flag   a3 = aa | aa_en<<8
+    #   t3 = y   t4 = nt   t5 = maxy   t7 = ssh (per iteration)
+    #   t6/t8/t9/t0/t1 = scratch
+    .func cmd_sprite_walk
+cmd_sprite_walk:
+    sll a0, 8                    # strip the rspq command byte from arg word 0
+    srl a0, 8
+    sw a0, %lo(WALK_VRAM)
+    sw a1, %lo(WALK_LBASE)
+    sw a1, %lo(WALK_LCUR)
+    sw zero, %lo(WALK_FILL)
+    sw zero, %lo(WALK_NREC)
+    sw zero, %lo(WALK_OVFL)
+    andi a3, a2, 0x1FF           # aa | aa_en<<8
+    srl t0, a2, 16
+    sw t0, %lo(WALK_MAX)
+
+    li v0, 0                     # group index
+walk_group:
+    # --- DMA this group's SCB (3 x 32B) and tilemaps (2048B) ---
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 5                # g*32
+    addu s0, s1, t4
+    li t5, 0x10000               # SCB z at word 0x8000
+    addu s0, s0, t5
+    li s4, %lo(WALK_SCB)
+    jal DMAIn
+    li t0, DMA_SIZE(32, 1)
+
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 5
+    addu s0, s1, t4
+    li t5, 0x10400               # SCB y at word 0x8200
+    addu s0, s0, t5
+    li s4, %lo(WALK_SCB) + 32
+    jal DMAIn
+    li t0, DMA_SIZE(32, 1)
+
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 5
+    addu s0, s1, t4
+    li t5, 0x10800               # SCB x at word 0x8400
+    addu s0, s0, t5
+    li s4, %lo(WALK_SCB) + 64
+    jal DMAIn
+    li t0, DMA_SIZE(32, 1)
+
+    lw s1, %lo(WALK_VRAM)
+    sll t4, v0, 11               # g*2048
+    addu s0, s1, t4
+    li s4, %lo(PAL_BUFFER)
+    jal DMAIn
+    li t0, DMA_SIZE(2048, 1)
+
+    li v1, 0                     # sprite-in-group
+walk_sprite:
+    sll t4, v0, 4
+    addu t4, t4, v1              # snum
+    li t5, 381
+    beq t4, t5, walk_group_next
+    nop
+    sll t4, v1, 1
+    addiu t5, t4, %lo(WALK_SCB)
+    lhu t6, 0(t5)                # zc
+    lhu t7, 32(t5)               # yc
+    lhu t8, 64(t5)               # xc
+
+    andi t9, t7, 0x40
+    bnez t9, walk_chain
+    nop
+    # fresh sprite: sx/sy/sh/vshrink/repeat from SCB
+    srl s5, t8, 7                # sx = xc>>7
+    srl s6, t7, 7
+    li t9, 496
+    subu s6, t9, s6              # sy = 496 - (yc>>7)
+    andi s7, t7, 0x3F
+    sll s7, s7, 4                # sh = (yc&0x3F)*16
+    li k1, 0                     # repeat = false
+    li t9, 512
+    slt t9, t9, s7               # sh > 512 ?
+    beqz t9, 1f
+    nop
+    li s7, 512
+    li k1, 1                     # repeat = true
+1:  andi k0, t6, 0xFF            # vshrink
+    b walk_scb_done
+    nop
+walk_chain:
+    addu s5, s5, s8              # sx += sw (previous sprite's sw)
+walk_scb_done:
+    srl s8, t6, 8
+    andi s8, s8, 0xF
+    addiu s8, s8, 1              # sw = ((zc>>8)&0xF)+1
+
+    beqz s7, walk_next_sprite    # sh == 0
+    nop
+    slti t9, s5, 320
+    bnez t9, walk_chk_y          # sx < 320: not x-skipped
+    nop
+    addu t9, s5, s8
+    slti t9, t9, 513
+    bnez t9, walk_next_sprite    # sx >= 320 && sx+sw <= 512: skip
+    nop
+walk_chk_y:
+    slti t9, s6, 224
+    bnez t9, walk_visible        # sy < 224: cannot Y-cull
+    nop
+    addu t9, s6, s7
+    slti t9, t9, 513
+    bnez t9, walk_next_sprite    # sy >= 224 && sy+sh <= 512: skip
+    nop
+walk_visible:
+    li t3, 0                     # y = 0
+    li t4, 0                     # nt = 0
+    li a2, 0                     # half = 0
+    # maxy = min(sh, 256)
+    li t5, 256
+    slti t9, s7, 256
+    beqz t9, walk_tile_loop
+    nop
+    move t5, s7
+
+walk_tile_loop:
+    slt t9, t3, t5               # while (y < maxy)
+    beqz t9, walk_half_end
+    nop
+    # ssh = (vs+1)>>4 + (((vs+1)&15) > MAGIC[nt])
+    addiu t6, k0, 1
+    srl t7, t6, 4
+    andi t6, t6, 15
+    addiu t8, t4, %lo(WALK_MAGIC)
+    lbu t8, 0(t8)
+    slt t6, t8, t6
+    addu t7, t7, t6              # t7 = ssh
+    beqz t7, walk_advance        # ssh == 0: no draw, no clip
+    nop
+    # clip: when y + ssh > sh, ssh becomes sh - y
+    addu t6, t3, t7
+    slt t6, s7, t6
+    beqz t6, 2f
+    nop
+    subu t7, s7, t3
+2:
+    # ssy = sy + y; visible if ssy < 224 || ssy+ssh > 512
+    addu t6, s6, t3
+    slti t8, t6, 224
+    bnez t8, walk_emit
+    nop
+    addu t8, t6, t7
+    slti t8, t8, 513
+    bnez t8, walk_advance
+    nop
+walk_emit:
+    # tmap fetch: PAL_BUFFER + i*128 + nt*4
+    sll t6, v1, 7
+    sll t8, t4, 2
+    addu t6, t6, t8
+    addiu t6, t6, %lo(PAL_BUFFER)
+    lhu t9, 0(t6)                # tnum (low 16)
+    lhu t8, 2(t6)                # tc
+    srl t6, t8, 4                # tnum |= ((tc>>4)&0xF)<<16
+    andi t6, t6, 0xF
+    sll t6, t6, 16
+    or t9, t9, t6
+    # auto animation (a3 = aa | aa_en<<8)
+    andi t6, a3, 0x100
+    beqz t6, 4f
+    nop
+    andi t6, t8, 8
+    beqz t6, 3f
+    nop
+    addi t6, zero, -8
+    and t9, t9, t6               # tnum &= ~7
+    andi t6, a3, 7
+    or t9, t9, t6                # tnum |= aa & 7
+    b 4f
+    nop
+3:  andi t6, t8, 4
+    beqz t6, 4f
+    nop
+    addi t6, zero, -4
+    and t9, t9, t6               # tnum &= ~3
+    andi t6, a3, 3
+    or t9, t9, t6                # tnum |= aa & 3
+4:
+    # w0 = tnum | palnum<<20 | (tc&1)<<28 | (tc&2)<<28
+    srl t6, t8, 8
+    andi t6, t6, 0xFF
+    sll t6, t6, 20
+    or t9, t9, t6
+    andi t6, t8, 1
+    sll t6, t6, 28
+    or t9, t9, t6
+    andi t6, t8, 2
+    sll t6, t6, 28               # bit 29
+    or t9, t9, t6                # t9 = w0
+    # w1 = (sx&0xFFF) | (ssy&0xFFF)<<12 | (sw-1)<<24 | (ssh-1)<<28
+    addu t6, s6, t3              # ssy
+    andi t6, t6, 0xFFF
+    sll t6, t6, 12
+    andi t8, s5, 0xFFF
+    or t6, t6, t8
+    addiu t8, s8, -1
+    sll t8, t8, 24
+    or t6, t6, t8
+    addiu t8, t7, -1
+    sll t8, t8, 28
+    or t6, t6, t8                # t6 = w1
+    # capacity check
+    lw t8, %lo(WALK_NREC)
+    lw t0, %lo(WALK_MAX)
+    slt t0, t8, t0
+    beqz t0, walk_over
+    nop
+    lw t0, %lo(WALK_FILL)
+    addiu t1, t0, %lo(WALK_LIST)
+    sw t9, 0(t1)
+    sw t6, 4(t1)
+    addiu t0, t0, 8
+    sw t0, %lo(WALK_FILL)
+    addiu t8, t8, 1
+    sw t8, %lo(WALK_NREC)
+    li t1, 512
+    bne t0, t1, walk_advance     # staging not full yet
+    nop
+    # flush 512B of records
+    lw s0, %lo(WALK_LCUR)
+    li s4, %lo(WALK_LIST)
+    jal DMAOut
+    li t0, DMA_SIZE(512, 1)
+    lw t0, %lo(WALK_LCUR)
+    addiu t0, t0, 512
+    sw t0, %lo(WALK_LCUR)
+    sw zero, %lo(WALK_FILL)
+    b walk_advance
+    nop
+walk_over:
+    lw t0, %lo(WALK_OVFL)
+    addiu t0, t0, 1
+    sw t0, %lo(WALK_OVFL)
+walk_advance:
+    addu t3, t3, t7              # y += ssh
+    addiu t4, t4, 1
+    andi t4, t4, 31              # nt = (nt+1) & 31
+    bnez k1, walk_tile_loop      # repeat: no nt==16 break
+    nop
+    li t6, 16
+    beq t4, t6, walk_half_end    # non-repeat: break at tile #16
+    nop
+    b walk_tile_loop
+    nop
+walk_half_end:
+    li t6, 256
+    slt t6, t6, s7               # sh > 256 ?
+    beqz t6, walk_next_sprite
+    nop
+    bnez a2, walk_next_sprite    # second half already done
+    nop
+    li a2, 1                     # half = 1
+    move t5, s7                  # maxy = sh
+    beqz k1, walk_h1_norep
+    nop
+    # repeat: y -= (y-256)*2 ; nt = (32-nt) & 31
+    addiu t6, t3, -256
+    sll t6, t6, 1
+    subu t3, t3, t6
+    li t6, 32
+    subu t4, t6, t4
+    andi t4, t4, 31
+    b walk_tile_loop
+    nop
+walk_h1_norep:
+    li t6, 512
+    subu t3, t6, t3              # y = 512 - y
+    b walk_tile_loop
+    nop
+walk_next_sprite:
+    addiu v1, v1, 1
+    li t6, 16
+    bne v1, t6, walk_sprite
+    nop
+walk_group_next:
+    addiu v0, v0, 1
+    li t6, 24
+    bne v0, t6, walk_group
+    nop
+
+    # final partial flush (fill is a multiple of 8)
+    lw t0, %lo(WALK_FILL)
+    beqz t0, walk_trailer
+    nop
+    lw s0, %lo(WALK_LCUR)
+    li s4, %lo(WALK_LIST)
+    jal DMAOut
+    addiu t0, t0, -1             # DMA_SIZE(fill, 1)
+walk_trailer:
+    lw t0, %lo(WALK_NREC)
+    sw t0, %lo(WALK_TRAILER)
+    lw t0, %lo(WALK_OVFL)
+    sw t0, %lo(WALK_TRAILER) + 4
+    lw t0, %lo(WALK_MAX)
+    sll t0, t0, 3
+    lw s0, %lo(WALK_LBASE)
+    addu s0, s0, t0              # trailer at list + maxrecs*8
+    li s4, %lo(WALK_TRAILER)
+    jal DMAOut
+    li t0, DMA_SIZE(8, 1)
+
+    j RSPQ_Loop
+    nop
+    .endfunc
 
 
 #include <rsp_rdpq.inc>
