@@ -40,8 +40,11 @@ static struct dyn_statics {
 #define dyn_tried      (dyn_s.tried)
 
 // Exact tried-tag table (see dyn_tried_test_set): 16KB, 8KB-aligned per
-// the layout law's big-array rule.
-static uint16_t dyn_tried2[8192] __attribute__((aligned(8192)));
+// the layout law's big-array rule. Global (not static) because the
+// jmp_exec miss path reads it to keep known-refused heads out of the
+// first-writer sample slot (m64k_asm.S); same object, same placement.
+uint16_t __m64k_dyn_tried2[8192] __attribute__((aligned(8192)));
+#define dyn_tried2 __m64k_dyn_tried2
 _Static_assert(sizeof(struct dyn_statics) == 8192, "dynrec statics must stay 8KB");
 
 // Runtime translation gate: compile-time default only differs by one

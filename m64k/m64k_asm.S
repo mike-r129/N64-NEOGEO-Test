@@ -3717,13 +3717,34 @@ jmp_exec:
     # first-writer-when-empty design was tried first and WEDGES: the
     # first miss of every slice is the same recurring head, and if that
     # head is already tried-and-refused the frontier never advances.)
+    #
+    # Slot 1 is FIRST-UNTRIED-writer-wins (2026-09-22): a last-writer
+    # sample slot is overwritten by the ~5 later samples of the same slice,
+    # so a hot MID-slice head (the 00ceec/00cf2e upload loops, 30k misses
+    # per window) never survived to the slice-end service — not once in
+    # any DYNSTAT run. Known-refused heads are filtered here (exact
+    # dyn_tried2 tag compare, dynrec.c), which is what made the earlier
+    # first-writer attempt wedge on a recurring refused head.
     la t2, __m64k_dyn_mailbox
     sw eaptr32, 0(t2)
     lw t3, 8(t2)
     addiu t3, -1
     bgtz t3, 1f
-    sw eaptr32, 4(t2)
     li t3, 61
+    lw t0, 4(t2)
+    bnez t0, 1f                        # slot taken this slice: keep it
+    sll t0, eaptr32, 8
+    srl t0, t0, 9                      # h = (pc & 0xFFFFFF) >> 1
+    andi t1, t0, 8191
+    sll t1, 1
+    la t2, __m64k_dyn_tried2
+    addu t1, t2
+    lhu t1, 0(t1)
+    srl t0, t0, 13
+    ori t0, 0xC000                     # refused tag: valid|refused|h>>13
+    la t2, __m64k_dyn_mailbox
+    beq t0, t1, 1f                     # known-refused: never sample it
+    sw eaptr32, 4(t2)
 1:  sw t3, 8(t2)
 #endif
 #ifdef M64K_DYNSTAT
