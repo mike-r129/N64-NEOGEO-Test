@@ -136,8 +136,18 @@ static void render_fix(void) {
 }
 
 
+static inline void sprite_consume_begin(void);
+static inline void sprite_consume_one(uint32_t w0, uint32_t w1);
+
 // Bit-exact reference walk: same SCB reads, same vshrink math, same culls,
 // same order as the historical direct-draw loop.
+// recs == NULL is the FUSED mode (default path): each record is consumed
+// (empty-skip + draw) the moment it is produced instead of being stored —
+// the list only exists for the RSP-walk / batch paths that need it. Same
+// records, same order, same maxrecs drop rule => the draw stream is
+// identical by construction; what goes away is the cached record-list
+// write+readback (~5KB/frame modal, up to 32KB dense: a streaming sweep
+// through the 8KB dcache, PLAN-DRAW-RDP §9 law 1).
 static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	int sx = 0, sy = 0, sh = 0, sw = 0, vshrink = 0;
 	bool repeat_tiles = false;
@@ -147,6 +157,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	bool aa_enabled = lspc_get_auto_animation(&aa);
 
 	sprwalk_overflow = 0;
+	if (!recs) sprite_consume_begin();
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -253,10 +264,15 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 					// Emit the record the consume pass will draw.
 					if (nrec < maxrecs) {
-						recs[nrec].w0 = tnum | (palnum << 20)
-						              | ((tc & 1) << 28) | ((tc & 2) << 28);
-						recs[nrec].w1 = (sx & 0xFFF) | ((ssy & 0xFFF) << 12)
-						              | ((sw-1) << 24) | ((ssh-1) << 28);
+						uint32_t w0 = tnum | (palnum << 20)
+						            | ((tc & 1) << 28) | ((tc & 2) << 28);
+						uint32_t w1 = (sx & 0xFFF) | ((ssy & 0xFFF) << 12)
+						            | ((sw-1) << 24) | ((ssh-1) << 28);
+						if (recs) {
+							recs[nrec].w0 = w0;
+							recs[nrec].w1 = w1;
+						} else
+							sprite_consume_one(w0, w1);
 						nrec++;
 					} else {
 						sprwalk_overflow++;
@@ -280,8 +296,71 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	return nrec;
 }
 
-// Consume pass: identical tail of the historical loop — empty-tile skip,
-// then draw_sprite, in record order (cache side effects unchanged).
+#ifdef DRAW_PERF
+// Phase 0 run/repeat/palette stats over the DRAWN stream (post empty-skip:
+// that is the stream Phase 1's memo and Phase 3's mode runs would see).
+// Reset per consume pass (sprite_consume_begin); gen bump ages the uniq
+// table without clearing it.
+static uint32_t p0_last_tnum, p0_last_pal, p0_run;
+#endif
+
+static inline void sprite_consume_begin(void) {
+#ifdef DRAW_PERF
+	p0_last_tnum = ~0u; p0_last_pal = ~0u; p0_run = 0;
+	perf_uniq_gen++;
+#endif
+}
+
+#ifdef DRAW_PERF
+static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
+		volatile uint32_t *p0_uniq =
+			(volatile uint32_t *)UncachedAddr(perf_uniq_tab);
+		uint32_t pal = (w0 >> 20) & 0xFF;
+		uint32_t sw = ((w1 >> 24) & 0xF) + 1, sh = ((w1 >> 28) & 0xF) + 1;
+		if (tnum == p0_last_tnum) {
+			perf_dr_adjrep++;
+			if (++p0_run > perf_dr_maxrun) perf_dr_maxrun = p0_run;
+		} else
+			p0_run = 0;
+		if (pal != p0_last_pal) perf_dr_psw++;
+		if (sw == 16 && sh == 16 && !(w0 & (3u << 28))) perf_dr_modal++;
+		p0_last_tnum = tnum; p0_last_pal = pal;
+		uint32_t h = (tnum * 2654435761u) >> 21;
+		uint32_t key = (perf_uniq_gen << 20) | tnum;
+		if (p0_uniq[h] != key) { perf_dr_uniqx++; p0_uniq[h] = key; }
+}
+#endif
+
+// Consume one record: identical tail of the historical loop — empty-tile
+// skip, then draw_sprite (cache side effects unchanged).
+static inline void sprite_consume_one(uint32_t w0, uint32_t w1) {
+	uint32_t tnum = w0 & 0xFFFFF;
+
+#ifdef DRAW_PERF
+	perf_dr_recs++;
+#endif
+	// Skip tiles known to decode to all-transparent
+	// pixels — the sprite-layer analogue of the fix
+	// skip above (ROM-stable fact, learned on first
+	// fetch; pixel-identical by construction: index-0
+	// pixels never pass the alpha compare).
+	if (crom_tile_empty(tnum)) {
+#ifdef DRAW_PERF
+		perf_dr_empty++;
+#endif
+		return;
+	}
+
+#ifdef DRAW_PERF
+	sprite_consume_p0(tnum, w0, w1);
+#endif
+	draw_sprite(tnum, (w0 >> 20) & 0xFF,
+	            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
+	            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
+	            w0 & (1 << 28), w0 & (1 << 29));
+}
+
+// Consume pass over a produced record list, in record order.
 static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 #if defined(N64) && defined(MVS64_SPRBATCH)
 	// Phase 2 batch path (video_n64.c): resolve pointers once, one RSP
@@ -291,58 +370,9 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 		return;
 	}
 #endif
-#ifdef DRAW_PERF
-	// Phase 0 run/repeat/palette stats over the DRAWN stream (post
-	// empty-skip: that is the stream Phase 1's memo and Phase 3's mode
-	// runs would see). Reset per consume pass; gen bump ages the uniq
-	// table without clearing it.
-	uint32_t p0_last_tnum = ~0u, p0_last_pal = ~0u;
-	uint32_t p0_run = 0;
-	perf_uniq_gen++;
-	volatile uint32_t *p0_uniq =
-		(volatile uint32_t *)UncachedAddr(perf_uniq_tab);
-#endif
-	for (int i=0;i<nrec;i++) {
-		uint32_t w0 = recs[i].w0, w1 = recs[i].w1;
-		uint32_t tnum = w0 & 0xFFFFF;
-
-#ifdef DRAW_PERF
-		perf_dr_recs++;
-#endif
-		// Skip tiles known to decode to all-transparent
-		// pixels — the sprite-layer analogue of the fix
-		// skip above (ROM-stable fact, learned on first
-		// fetch; pixel-identical by construction: index-0
-		// pixels never pass the alpha compare).
-		if (crom_tile_empty(tnum)) {
-#ifdef DRAW_PERF
-			perf_dr_empty++;
-#endif
-			continue;
-		}
-
-#ifdef DRAW_PERF
-		{
-			uint32_t pal = (w0 >> 20) & 0xFF;
-			uint32_t sw = ((w1 >> 24) & 0xF) + 1, sh = ((w1 >> 28) & 0xF) + 1;
-			if (tnum == p0_last_tnum) {
-				perf_dr_adjrep++;
-				if (++p0_run > perf_dr_maxrun) perf_dr_maxrun = p0_run;
-			} else
-				p0_run = 0;
-			if (pal != p0_last_pal) perf_dr_psw++;
-			if (sw == 16 && sh == 16 && !(w0 & (3u << 28))) perf_dr_modal++;
-			p0_last_tnum = tnum; p0_last_pal = pal;
-			uint32_t h = (tnum * 2654435761u) >> 21;
-			uint32_t key = (perf_uniq_gen << 20) | tnum;
-			if (p0_uniq[h] != key) { perf_dr_uniqx++; p0_uniq[h] = key; }
-		}
-#endif
-		draw_sprite(tnum, (w0 >> 20) & 0xFF,
-		            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
-		            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
-		            w0 & (1 << 28), w0 & (1 << 29));
-	}
+	sprite_consume_begin();
+	for (int i=0;i<nrec;i++)
+		sprite_consume_one(recs[i].w0, recs[i].w1);
 }
 
 #if defined(N64) && defined(MVS64_WALK_RSP)
@@ -358,12 +388,37 @@ int mvs64_walk_enable = 1;
 static int walk_kicked_this_frame;
 #endif
 
+// Fused walk knob (runtime twin, layout-identical A/B: the OFF twin differs
+// by this one initializer; pinned to .data so a 0 initializer cannot move
+// it into .bss and shift the layout). The batch path consumes a list, so
+// it always takes the split walk.
+#ifdef MVS64_FUSE_OFF
+int mvs64_walk_fuse __attribute__((section(".data"))) = 0;
+#else
+int mvs64_walk_fuse __attribute__((section(".data"))) = 1;
+#endif
+
+static void sprite_walk_default(void) {
+#if defined(N64) && defined(MVS64_SPRBATCH)
+	if (mvs64_batch_enable) {
+		int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
+		sprite_walk_consume(sprwalk_recs, nrec);
+		return;
+	}
+#endif
+	if (mvs64_walk_fuse) {
+		sprite_walk_produce(NULL, SPRWALK_MAX_RECS);
+		return;
+	}
+	int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
+	sprite_walk_consume(sprwalk_recs, nrec);
+}
+
 static void render_sprites(void) {
 	render_begin_sprites();
 #if defined(N64) && defined(MVS64_WALK_RSP)
 	if (!walk_kicked_this_frame) {
-		int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
-		sprite_walk_consume(sprwalk_recs, nrec);
+		sprite_walk_default();
 		render_end_sprites();
 		return;
 	}
@@ -405,8 +460,7 @@ static void render_sprites(void) {
 	sprite_walk_consume(sprwalk_recs, nrec);
 	#endif
 #else
-	int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
-	sprite_walk_consume(sprwalk_recs, nrec);
+	sprite_walk_default();
 #endif
 	render_end_sprites();
 }
