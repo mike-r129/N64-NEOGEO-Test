@@ -1187,11 +1187,16 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
             e->buf[e->len++] = ADDIU(R_T4, hd, d16);
             emit_bail_check(e, R_T4);
             e->buf[e->len++] = OR(R_T3, R_T4, R_A2);
-            e->buf[e->len++] = MOVE(R_S6, hv);
-            e->buf[e->len++] = AND(R_S7, hv, R_V1);
+            // MMIO store-source law: the TLB trap decoder reads the stored
+            // value from the saved t6, whatever rt the faulting SWL names —
+            // a cached An (t7..t9) must be copied to t6 first.
+            if (hv != R_T6)
+                e->buf[e->len++] = MOVE(R_T6, hv);
+            e->buf[e->len++] = MOVE(R_S6, R_T6);
+            e->buf[e->len++] = AND(R_S7, R_T6, R_V1);
             e->buf[e->len++] = ADDIU(R_A1, R_A1, -20);
-            e->buf[e->len++] = SWL(hv, R_T3, 0);   // sw_m68k pair
-            e->buf[e->len++] = SWR(hv, R_T3, 3);
+            e->buf[e->len++] = SWL(R_T6, R_T3, 0);   // sw_m68k pair
+            e->buf[e->len++] = SWR(R_T6, R_T3, 3);
             emit_break_check(e, e->goff + 4);
             *cmax += 20;
             return 4;
