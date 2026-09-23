@@ -49,11 +49,14 @@ _Static_assert(sizeof(struct dyn_statics) == 8192, "dynrec statics must stay 8KB
 
 // Runtime translation gate: compile-time default only differs by one
 // initializer constant, so ON and OFF binaries are layout-identical —
-// the only clean A/B this platform allows.
+// the only clean A/B this platform allows. Pinned to .sdata: a plain 0
+// initializer lets GCC move the variable into .sbss, which shifted every
+// gp-relative small-data global by 8 bytes in the OFF twin (2026-09-23:
+// 1962 loadable bytes differed between the "identical" twins).
 #ifdef M64K_DYN_DISABLE
-int __m64k_dyn_enable = 0;
+int __m64k_dyn_enable __attribute__((section(".sdata"))) = 0;
 #else
-int __m64k_dyn_enable = 1;
+int __m64k_dyn_enable __attribute__((section(".sdata"))) = 1;
 #endif
 
 extern char main_loop[];
