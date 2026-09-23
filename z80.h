@@ -35,6 +35,15 @@ struct z80 {
   bool iff1 : 1, iff2 : 1;
   bool halted : 1;
   bool int_pending : 1, nmi_pending : 1;
+#ifndef Z80_RMAP_OFF
+  // MVS64 read page map: byte at addr = *(uint8_t*)(rmap[addr >> 8] + addr).
+  // Entries are host pointers pre-biased by the page's Z80 base address, so
+  // every memory READ (opcode/operand fetch, data) is a branchless inline
+  // table lookup instead of the read_byte callback. The owner keeps it in
+  // sync with its memory map (bank switches); read_byte must still be set
+  // for owners that call it directly. Writes stay on write_byte.
+  const uintptr_t* rmap;
+#endif
 };
 
 void z80_init(z80* const z);

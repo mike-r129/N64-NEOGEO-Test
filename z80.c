@@ -49,7 +49,11 @@ static const uint8_t cyc_ddfd[256] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 15, 4, 4, 4, 4,
 #define GET_BIT(n, val) (((val) >> (n)) & 1)
 
 static inline uint8_t rb(z80* const z, uint16_t addr) {
+#ifndef Z80_RMAP_OFF
+  return *(const uint8_t*)(z->rmap[addr >> 8] + addr);
+#else
   return z->read_byte(z->userdata, addr);
+#endif
 }
 
 static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
@@ -57,8 +61,12 @@ static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
 }
 
 static inline uint16_t rw(z80* const z, uint16_t addr) {
+#ifndef Z80_RMAP_OFF
+  return (rb(z, (uint16_t)(addr + 1)) << 8) | rb(z, addr);
+#else
   return (z->read_byte(z->userdata, addr + 1) << 8) |
          z->read_byte(z->userdata, addr);
+#endif
 }
 
 static inline void ww(z80* const z, uint16_t addr, uint16_t val) {
@@ -707,6 +715,9 @@ static inline void process_interrupts(z80* const z) {
 // and userdata must be manually set by the user afterwards.
 void z80_init(z80* const z) {
   z->read_byte = NULL;
+#ifndef Z80_RMAP_OFF
+  z->rmap = NULL;
+#endif
   z->write_byte = NULL;
   z->port_in = NULL;
   z->port_out = NULL;
