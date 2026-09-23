@@ -469,6 +469,9 @@ int main(int argc, char *argv[]) {
 	#endif
 
 	plat_init(MVS64_AUDIO_RATE, FPS);
+	#if defined(MVS64_PCPROF) && defined(N64)
+	{ extern void pcprof_init(void); pcprof_init(); }
+	#endif
 
 	#ifndef N64
 	// Headless test harness: when MVS64_FRAMES=N is set, run N frames with no
@@ -622,6 +625,13 @@ int main(int argc, char *argv[]) {
 			#else
 			(uint32_t)m68k_get_reg(NULL, M68K_REG_PC));
 			#endif
+		#if defined(MVS64_PCPROF) && defined(USE_M64K)
+		{
+			extern void pcprof_frame(int frame, int in_fight);
+			uint32_t fpc = m64k_get_pc(&m64k) & 0xFFFFFF;
+			pcprof_frame(g_frame, fpc == 0x3200 || fpc == 0x31fe);
+		}
+		#endif
 		#ifdef M64K_DYNSTAT
 		#define DYNSTAT_WINDOW 600
 		if (g_frame && (g_frame % DYNSTAT_WINDOW) == 0) {
