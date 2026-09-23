@@ -109,6 +109,43 @@ sequence; WSL scripts source `emu-guard.sh`.
   binary carries its own luck. Next lever candidate: make the CDT hot path
   layout-robust (hoist table pointers out of the per-record call, or keep the
   LRU tick on the crom_dt line).
+- **Dynarec re-test (cc6d19d sampler fix + d7b7723 MMIO store-source fix +
+  39783a2 knob pin; all DYNREC/DYNSTAT-only, merged, default stays OFF).**
+  The sampler fix works (the VRAM upload loops 00ceec/00cf2e now translate),
+  but residency stays ~10%: 2,990 refused heads over 352 distinct opcodes, the
+  top ten only ~half the refused heat. Layout-identical twins, 3,149 paired
+  in-fight frames: cpu −0.6 median / −1.6 mean, m68k −0.7 / −1.7; content
+  identical (0 record mismatches, 0 frame-end PC mismatches over 4,145
+  frames); testsuite 123 differential sequences 0 fails, vectors 125 PASS +
+  CHK (pre-existing). The payer is template coverage, a multi-session job.
+- **TWIN-KNOB LAW:** a runtime twin knob with a plain `= 0` initializer lands
+  in .sbss in the OFF twin and shifts every gp-relative small-data global by
+  8 bytes: the dynrec "identical" twins differed in 1,962 loadable bytes, so
+  every past dynrec on-vs-disabled verdict carried a layout shift (also the
+  walk and batch knobs, pinned in 2f43b5a). Pin knobs to .data/.sdata and
+  check twins with a loadable-section compare (objcopy .text/.data/.rodata/
+  .sdata), not `cmp` on the ELF (DWARF records the -D flags).
+- **Walk occupancy (aaf19d6 counters, 9,455 in-fight frames):** 81 sprites
+  reach the tile loop, 1,042 iterations/frame, 622 records → 437 culled
+  iterations. The real (uninstrumented) walk is ~0.7-0.9ms/frame spread over
+  per-sprite and per-tile work: no cheap big win.
+- **SNDOSD overlay cost: below layout noise** (QUIET+AUTOINPUT without OSD
+  vs sndfix6auto: −1.1 fps median over 41 windows, range −3.1..+1.4). OSD test
+  builds are representative of release speed.
+- **Integrated profile (QUIET, pcprof2, sndfix6-equivalent, in-fight):** Z80
+  ~17% (exec_opcode 8.4, z80_step 2.8, ddfd 1.7, sound_gen_samples 3.5), YM glue
+  ~12.5% (YM2610Update_stream 7.3, rspwp_collect 2.9, rspa_stage 2.3),
+  sprite_walk_produce 6.6%, **rspq_next_buffer 3.7% + wait-loop checks 2.1% ≈
+  5.7% of in-fight time the CPU now WAITS on the RSP** (tail frames: rspq issue
+  407µs median, 1.85ms p90 — the RSP still chewing the previous pump's audio
+  burst), dma_read 2.5%, memset 2.1%, 68k interpreter ~30%.
+- **NEXT LEVERS (ranked):** (1) larger lowpri rspq buffers so the CPU can run
+  ahead of the RSP's audio burst (CPU-side-only libdragon constant; MUST first
+  add a pointer-lifetime guard — the RSP DMAs sprite tiles straight from
+  sprite-cache slots, PLAN-DRAW-RDP law 5); (2) ADPCM window async prefetch
+  (dma_read 2.5%; all async DMAs completed before the pump returns, since
+  io_read does not wait for DMA and logging/SD share the PI bus); (3) dynarec
+  template coverage; (4) CDT hit path made layout-robust.
 - **Profile (MVS64_PCPROF host-PC sampler, in-fight, pre-CDT):** draw
   video_render 7.8% (walk loop ~4.5%, fix scan ~2%), CROM lookup 8.1% (CDT
   target), Z80 ~15% (z80_read 3.4% = rmap target), YM2610Update_stream 6.6%,
