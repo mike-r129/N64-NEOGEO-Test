@@ -745,13 +745,27 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 	// varying RMS = the Z80 music driver is feeding the YM2610).
 	{
 		static int sc = 0;
-		uint64_t acc = 0; int pk = 0;
-		for (int i = 0; i < nsamples * 2; i++) {
-			int v = out[i]; if (v < 0) v = -v;
-			acc += (uint64_t)v * v; if (v > pk) pk = v;
-		}
-		int rms = 0; if (nsamples) { uint64_t m = acc / (nsamples * 2); while ((uint64_t)(rms+1)*(rms+1) <= m) rms++; }
 		if ((sc++ % 60) == 0) {
+			// rms/peak of THIS call's buffer, computed only on the reporting
+			// call (they feed nothing but the print). Computing them every
+			// call — with a linear-search square root of up to ~32k 64-bit
+			// multiplies — cost ~2.8% of in-fight frame time in every
+			// SND_HEALTH build (pcprof, 2026-09-23). isqrt below is the exact
+			// floor(sqrt(m)) the linear search produced.
+			uint64_t acc = 0; int pk = 0;
+			for (int i = 0; i < nsamples * 2; i++) {
+				int v = out[i]; if (v < 0) v = -v;
+				acc += (uint64_t)v * v; if (v > pk) pk = v;
+			}
+			int rms = 0;
+			if (nsamples) {
+				uint64_t m = acc / (nsamples * 2), r = 0;
+				for (uint64_t bit = 1ull << 62; bit; bit >>= 2) {
+					if (m >= r + bit) { m -= r + bit; r = (r >> 1) + bit; }
+					else r >>= 1;
+				}
+				rms = (int)r;
+			}
 			// steps = z80 instrs actually run; skipcyc = idle cycles fast-forwarded.
 			// High skipcyc:steps ratio = idle-skip working (cheap waits).
 #if defined(SND_HEALTH) && defined(N64)
