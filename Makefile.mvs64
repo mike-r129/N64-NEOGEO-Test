@@ -50,11 +50,14 @@ CFLAGS += -DM64K_PREDECODE
 ASFLAGS += -DM64K_PREDECODE
 N64_ASFLAGS += -DM64K_PREDECODE
 endif
-# m64k dynarec (60fps campaign, PLAN-OPTIMIZATION.md blueprint). Phase 1 is
-# infrastructure only: 256KB code arena + publish primitive, empty
-# block-table probes at the two blessed sites (_m64k_asmrun entry, jmp_exec),
-# and the hw_n64.S EPC-range extension proven at boot by [DYNTEST]. No guest
-# code is emitted yet. Opt-in: make ... DYNREC_ON=1.
+# m64k dynarec (60fps campaign, PLAN-OPTIMIZATION.md blueprint): translates
+# hot 68000 ROM code into MIPS blocks in a 256KB arena (per-instruction
+# templates, branch enders, direct block chaining, write-through An register
+# cache), entered through the block-table probes at _m64k_asmrun entry and
+# jmp_exec; hw_n64.S traps accept arena EPCs ([DYNTEST] proves it at boot).
+# Bit-exact vs the interpreter (TRCRC + the m64k emitter-differential rig)
+# but fps-flat at ~10% residency: template coverage is the missing piece.
+# Opt-in: make ... DYNREC_ON=1.
 ifdef DYNREC_ON
 CFLAGS += -DM64K_DYNREC
 ASFLAGS += -DM64K_DYNREC
@@ -91,12 +94,14 @@ CFLAGS += $(EXTRA_DEFINES)
 ifndef ADPCM_CPU
 CFLAGS += -DMVS64_RSPADPCM
 endif
-# FM synthesis offload (rsp_fm.S + ym2610.c rspfm_* glue): default OFF.
-# The port is bit-exact (300s dual-compute gate, 35840 chunks, 0 mismatches)
-# but measured NET-NEGATIVE when collected synchronously: the CPU idles for
-# the RSP compute time ([RSPWAIT] fm~2.4ms/chunk, q=0), and a 2-channel
-# CPU/RSP split still loses ~4fps to per-chunk glue overhead. Needs the
-# cross-pump deferred-collect architecture to pay off. Enable with RSPFM=1.
+# Synchronous FM offload experiment (rsp_fm.S + ym2610.c rspfm_* glue):
+# make ... WP_OFF=1 RSPFM=1. The port is bit-exact (300s dual-compute gate,
+# 35840 chunks, 0 mismatches) but measured NET-NEGATIVE when collected per
+# chunk: the CPU idles for the RSP compute time ([RSPWAIT] fm~2.4ms/chunk,
+# q=0), and a 2-channel CPU/RSP split still loses ~4fps to per-chunk glue.
+# The whole-pump offload below (default ON) replaced it. Whole-pump reuses
+# this machinery and defines MVS64_RSPFM itself, so RSPFM=1 without
+# WP_OFF=1 changes nothing.
 ifdef RSPFM
 CFLAGS += -DMVS64_RSPFM
 endif
