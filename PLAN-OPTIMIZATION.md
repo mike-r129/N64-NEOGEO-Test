@@ -1,5 +1,91 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🔴 2026-09-23 — HARDWARE RSP CRASH AFTER 30+ MIN = rspq HIGHPRI WEDGE (libdragon race), FIXED; CDT +1.2ms/frame
+
+**Hardware report:** first long session on the sndfix4 line — sound healthy past
+the 17.9-min wrap (cd0b72f validated on real HW) — ended after 30+ min in
+`RSP CRASH | rsp_queue | rspq_next_buffer (rspq.c:951)`, "wait loop timed out
+(200 ms)", `SP_STATUS=0x1403` = HALTED|BROKE|SIG3 HIGHPRI_RUNNING|SIG5
+BUFDONE_HIGH, kernel PC 0x018 (just past the idle `break` in
+RSPQCmd_WaitNewInput), current DRAM 0x18d994 == saved highpri pointer,
+overlay rsp_fm. NOT the known lost-wakeup: SIG_MORE clear, so neither the
+closed-loop flush nor the pump watchdog applies.
+
+**Mechanism:** upstream `rspq_highpri_begin` appended its
+WRITE_STATUS(CLEAR_REQUESTED|SET_RUNNING) *before* storing
+SET_HIGHPRI_REQUESTED. The audio offload issues highpri segments back to back
+(~500/s); an RSP still running the previous segment follows the epilog-skip
+JUMP and can execute the new WRITE_STATUS inside that few-store window, so
+REQUESTED lands afterwards and stays stale. At the SWAP_BUFFERS epilog the
+kernel drops to lowpri, sees REQUESTED, re-enters highpri at the EMPTY end of
+the stream and sleeps there with RUNNING set — CLEAR_HALT-immune (every lowpri
+flush refetches the same 0x00 terminator). Lowpri starves until the next
+highpri segment; a frame's video commands fill both 2KB lowpri buffers first
+and the CPU dies in rspq_next_buffer. Every field of the HW dump matches.
+
+**Fix** (f8fbf75, `patches/libdragon-rspq-highpri-wedge.patch`, vendored into
+/root/libdragon and installed; applies after the closed-loop-flush patch):
+1. Root cause: raise REQUESTED *before* appending the WRITE_STATUS (uncached
+   stores reach the RCP in order → the WRITE_STATUS always consumes it).
+2. Safety net: `__rspq_wedge_check` on every RSP_WAIT_LOOP iteration (weak hook
+   in rsp.c `__rsp_check_assert`): wedge signature held 2ms with the CPU in
+   lowpri → queue an empty highpri segment; the RSP runs it back to lowpri.
+   Telemetry 88c4974: `[AIPUMP] hpwedge=` / SNDOSD `W` (healthy: 0).
+
+**Gates (ares, one emulator at a time):**
+- Fault injection (d323d88, MVS64_RSPQ_WEDGETEST: stale REQUESTED by hand).
+  Unpatched toolchain: the EXACT hardware crash screen (rspq.c:951, "wait loop
+  timed out", PC:018, STATUS:1403 [halt broke sig3 sig5], current == highpri
+  pointer) at the first injection that stuck (1 of 5 — injected while the
+  pump's segments are still queued, their own WRITE_STATUS eats it). Patched:
+  17 injections, 7 stuck → 7 recoveries (hpwedge=7), 0 crashes, 11,758 frames.
+  Drain-first rig (every injection sticks): 43 injections → 43 recoveries
+  (hpwedge=43), 0 crashes, 0 audio deaths, 13,660 frames.
+- Race-window widening (throwaway libdragon variants, 50us busy-wait inside
+  highpri_begin): upstream order vs fixed order — RESULTS PENDING (queued).
+- Deliverable soak (sndfix5 code + AUTOINPUT, 600s): 15,121 pump passes, 0 crashes,
+  0 audio deaths, hpwedge=0, sound in 131/142 [SNDRMS] windows; the only underrun
+  is pass 1 (boot, before the first fill).
+
+**Deliverables** (built at 1daf5c6, patched toolchain; handed to the user for the next HW soak): `mvs64-samsho2-sndfix5.z64`
+(QUIET+SNDOSD, as sndfix4) and `mvs64-samsho2-release5.z64` (QUIET). Contents
+over sndfix4: the highpri-wedge fix + telemetry, CDT, fused walk, Z80 self-jump
+fast-forward, SND_HEALTH rms-probe fix.
+
+### Perf work this session (tracks resumed after the 2026-09-22 crash)
+The previous session ran four forked tracks in parallel that together launched
+~12 ares instances and froze the host. NEW STANDING RULE: one emulator at a
+time — `ps-ares-run.ps1` now refuses to start (mutex + process checks) if ares
+or a WSL PC emu run is active; `ps-ares-queue.ps1` runs jobs strictly in
+sequence; WSL scripts source `emu-guard.sh`.
+
+- **CDT — CROM direct table (1daf5c6): cpu −7.3, draw −7.2 points/frame**
+  (DET twins frame-paired, 692 in-fight frames, content-matched; ~1.2ms/frame,
+  ≈+1.5fps at 35fps). One u16 per tile fuses the empty-tile fact and the
+  resident slot; per-slot LRU ticks. Pixel: CDT off vs on identical 2354
+  frames; fuse-OFF baseline vs CDT on identical 2521 frames.
+- **Fused sprite walk (9952b78):** −0.5 cpu points; pixel-identical (N64 2354
+  frames, PC 101 shots).
+- **Z80 self-jump fast-forward (4f87318):** JP $/JR $ spins (the boot DI park
+  = 48% of all Z80 steps) fast-forwarded bit-exactly; WAV IDENTICAL; boot only.
+- **SND_HEALTH rms probe (2571377):** the per-call linear-search isqrt cost
+  ~2.8% of frame time in every SND_HEALTH build (SNDOSD HW builds + all
+  measurement twins). Now computed only on the reporting call, exact isqrt.
+  NOTE: genms in [SNDRMS] is not comparable across this commit.
+- **FIXBLK (fix-layer rspq block replay): NOT landed.** Frame-paired 2693
+  frames: fix 639→358µs median but mean cpu only −0.5 (re-records on 5-75% of
+  frames; a re-record costs more than the old path; dense bucket +1.2).
+  Refined version (compare the 28 drawn rows only, evict_gen fast path,
+  slot_tick refresh) under measurement (queued).
+- **B5 Z80 read page map (rmap): WAV IDENTICAL, measurement pending** (queued
+  b5-base2 vs b5-rmap2 twins).
+- **Profile (MVS64_PCPROF host-PC sampler, in-fight, pre-CDT):** draw
+  video_render 7.8% (walk loop ~4.5%, fix scan ~2%), CROM lookup 8.1% (CDT
+  target), Z80 ~15% (z80_read 3.4% = rmap target), YM2610Update_stream 6.6%,
+  sound_gen_samples 6.4% (2.8% was the rms probe), dma_read 2.2% (synchronous
+  cart DMA), memset 2.0% (most likely rspq_switch_buffer zeroing each new 2KB
+  command buffer), m68k interpreter ~25-30%.
+
 ## 🔴 2026-08-30 evening — THE 17.9-MINUTE SOUND DEATH, SOLVED (cd0b72f)
 
 User's "sound eventually fails forever" (long HW sessions, all-green
