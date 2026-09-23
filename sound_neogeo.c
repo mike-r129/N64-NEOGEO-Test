@@ -657,6 +657,33 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 			}
 #endif
 			if (z80_wrote) spin_armed = 0;      // any write breaks the pure spin
+#ifndef MVS64_NOIDLESKIP
+			// Self-jump spin (JP $ / JR $): the back-branch detector below
+			// never sees it (pc == pc0, not <), so the boot jingle's DI park
+			// at JP $FFFD was single-stepped flat out — ~half of ALL Z80
+			// steps in a boot+fight run. Fast-forward it BIT-EXACTLY: each
+			// iteration is exactly {cyc += c, R += 1} (pc/mem_ptr already
+			// fixed points), and nothing can interrupt it before `next` when
+			// no NMI is pending and the maskable path can't fire (IFF1 clear,
+			// or no pending/level-held IRQ) — so k iterations land cyc on the
+			// same overshoot stepping would, with the same R.
+			if (cpu.pc == pc0 && !z80_wrote && !cpu.halted && !cpu.iff_delay &&
+			    !cpu.nmi_pending &&
+			    !(cpu.iff1 && (cpu.int_pending || ym_irq_level))) {
+				uint8_t op = z80_read(NULL, pc0);
+				unsigned c = op == 0xC3 ? 10 : op == 0x18 ? 12 : 0;
+				long rem = (long)(next - cpu.cyc);
+				if (c && rem > 0) {
+					unsigned long k = ((unsigned long)rem + c - 1) / c;
+					cpu.cyc += k * c;
+					cpu.r = (uint8_t)((cpu.r & 0x80) | ((cpu.r + k) & 0x7f));
+#ifdef SND_HEALTH
+					g_z80_skipcyc += k * c; g_z80_skips++;
+#endif
+					break;
+				}
+			}
+#endif
 			if (cpu.pc < pc0) {                 // backward branch = loop edge
 				if (cpu.pc == last_back) {      // repeated target = candidate spin
 					// NOTE: do not gate this behind a repeat threshold. Delaying
