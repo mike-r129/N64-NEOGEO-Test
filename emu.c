@@ -641,7 +641,8 @@ int main(int argc, char *argv[]) {
 			// top-16 hottest control-transfer targets.
 			uint64_t total = 0;
 			uint32_t reg_prom = 0, reg_ram = 0, reg_pbrom = 0, reg_bios = 0, reg_other = 0;
-			int top[16]; int ntop = 0;
+			enum { DYNH_N = 64 };   // wide list: cross-ref with [DYNTERM]
+			int top[DYNH_N]; int ntop = 0;
 			for (int i = 0; i < 65536; i++) {
 				uint32_t n = m64k_dynstat_cnt[i];
 				if (!n) continue;
@@ -654,8 +655,8 @@ int main(int argc, char *argv[]) {
 				else reg_other += n;
 				int j = ntop;
 				while (j > 0 && m64k_dynstat_cnt[top[j-1]] < n) j--;
-				if (j < 16) {
-					if (ntop < 16) ntop++;
+				if (j < DYNH_N) {
+					if (ntop < DYNH_N) ntop++;
 					for (int k = ntop - 1; k > j; k--) top[k] = top[k-1];
 					top[j] = i;
 				}
