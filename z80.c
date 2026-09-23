@@ -761,12 +761,43 @@ void z80_init(z80* const z) {
   z->int_data = 0;
 }
 
+// MVS64_Z80OPHIST (PC diagnostic): opcode/prefix/PC-page histogram of every
+// stepped instruction, dumped to stderr at exit.
+#ifdef MVS64_Z80OPHIST
+#include <stdlib.h>
+static unsigned long z80_oph[6][256];
+static void z80_oph_dump(void) {
+  static const char *pn[6] = {"", "CB", "ED", "DD", "FD", "PC"};
+  unsigned long tot = 0;
+  for (int i = 0; i < 256; i++) tot += z80_oph[0][i];
+  fprintf(stderr, "[OPH] total=%lu\n", tot);
+  for (int p = 0; p < 6; p++) {
+    for (int k = 0; k < (p ? 12 : 60); k++) {
+      unsigned long best = 0; int bi = -1;
+      for (int i = 0; i < 256; i++) if (z80_oph[p][i] > best) { best = z80_oph[p][i]; bi = i; }
+      if (bi < 0) break;
+      fprintf(stderr, "[OPH] %s%02X %lu %.2f%%\n", pn[p], bi, best, 100.0 * best / (tot ? tot : 1));
+      z80_oph[p][bi] = 0;
+    }
+  }
+}
+#endif
 // executes the next instruction in memory + handles interrupts
 void z80_step(z80* const z) {
   if (z->halted) {
     exec_opcode(z, 0x00);
   } else {
     const uint8_t opcode = nextb(z);
+#ifdef MVS64_Z80OPHIST
+    { static int reg; if (!reg) { reg = 1; atexit(z80_oph_dump); } }
+    z80_oph[0][opcode]++;
+    { uint8_t n = z->read_byte(z->userdata, z->pc);
+      if (opcode == 0xCB) z80_oph[1][n]++;
+      else if (opcode == 0xED) z80_oph[2][n]++;
+      else if (opcode == 0xDD) z80_oph[3][n]++;
+      else if (opcode == 0xFD) z80_oph[4][n]++; }
+    z80_oph[5][(z->pc - 1) >> 8 & 0xff]++;
+#endif
     exec_opcode(z, opcode);
   }
 
