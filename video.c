@@ -304,6 +304,15 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 static uint32_t p0_last_tnum, p0_last_pal, p0_run;
 #endif
 
+#ifdef N64
+// CROM direct-table knob (runtime twin; .data-pinned like mvs64_walk_fuse).
+#ifdef MVS64_CDT_OFF
+int mvs64_cdt_enable __attribute__((section(".data"))) = 0;
+#else
+int mvs64_cdt_enable __attribute__((section(".data"))) = 1;
+#endif
+#endif
+
 static inline void sprite_consume_begin(void) {
 #ifdef DRAW_PERF
 	p0_last_tnum = ~0u; p0_last_pal = ~0u; p0_run = 0;
@@ -338,6 +347,35 @@ static inline void sprite_consume_one(uint32_t w0, uint32_t w1) {
 
 #ifdef DRAW_PERF
 	perf_dr_recs++;
+#endif
+#ifdef N64
+	if (mvs64_cdt_enable) {
+		// Fused empty-test + resolve through the CROM direct table
+		// (roms.c crom_resolve): one sparse read per record. Same
+		// records, same order, same skip set => same draw stream.
+#ifdef DRAW_PERF
+		uint32_t _c0 = TICKS_READ();
+#endif
+		uint8_t *src = crom_resolve(tnum);
+#ifdef DRAW_PERF
+		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
+#endif
+		if (!src) {
+#ifdef DRAW_PERF
+			perf_dr_empty++;
+#endif
+			return;
+		}
+#ifdef DRAW_PERF
+		perf_dr_tiles++;
+		sprite_consume_p0(tnum, w0, w1);
+#endif
+		draw_sprite_src(src, (w0 >> 20) & 0xFF,
+		                w1 & 0xFFF, (w1 >> 12) & 0xFFF,
+		                ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
+		                w0 & (1 << 28), w0 & (1 << 29));
+		return;
+	}
 #endif
 	// Skip tiles known to decode to all-transparent
 	// pixels — the sprite-layer analogue of the fix

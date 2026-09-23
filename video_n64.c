@@ -224,6 +224,8 @@ static int fix_last_spritnum = 0;
 static int fix_last_palnum = -1;
 static int pal_slot_cache[16];
 
+static void draw_sprite_src(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy);
+
 static void draw_sprite(int spritenum, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
 #ifdef DRAW_PERF
 	// Fine split of the sprite pass (walk = spr - cache - rspq): the cache
@@ -236,7 +238,10 @@ static void draw_sprite(int spritenum, int palnum, int x0, int y0, int sw, int s
 	perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
 	perf_dr_tiles++;
 #endif
+	draw_sprite_src(src, palnum, x0, y0, sw, sh, flipx, flipy);
+}
 
+static void draw_sprite_src(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
 	if (RSP_SPRITES) {
 #ifdef DRAW_PERF
 		uint32_t _r0 = TICKS_READ();

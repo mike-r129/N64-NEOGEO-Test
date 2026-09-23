@@ -20,7 +20,20 @@ typedef struct {
 	                                // are reused after eviction, so any
 	                                // pointer memoized outside the cache is
 	                                // only valid while evict_gen is unchanged
+	int sprite_shift;               // log2(sprite_size): slot = offset >> shift
+	uint8_t *slot_tick;             // LRU tick per pixel slot (max_sprites):
+	                                // per SLOT, not per bucket, so a caller
+	                                // resolving through a direct table (no
+	                                // bucket probe) can still mark a hit
+	uint16_t *dt;                   // optional direct table (key -> slot+3),
+	                                // see roms.c crom_resolve: eviction
+	                                // demotes an entry >= 3 back to 2
 } SpriteCache;
+
+// Pixel slot index of a pointer returned by lookup/insert.
+static inline int sprite_cache_slot(const SpriteCache *c, const uint8_t *sprite) {
+	return (int)(sprite - c->sprites) >> c->sprite_shift;
+}
 
 void sprite_cache_init(SpriteCache *c, int sprite_size, int max_sprites);
 void sprite_cache_reset(SpriteCache *c);

@@ -185,6 +185,54 @@ uint8_t* crom_get_sprite(int spritenum) {
 	return pix;
 }
 
+// CROM direct table (CDT): one u16 per tile fusing the empty-tile fact and
+// the cache-resident pointer, so the per-record hot path is a single
+// sparse read instead of known-bitmap + empty-bitmap + hash-bucket probe
+// (+ a dirtying bucket tick write) — three independent dcache lines per
+// drawn record. Encoding:
+//   0 = unknown (never fetched)       1 = known empty (never drawn)
+//   2 = known non-empty, not resident >=3 = resident at pixel slot e-3
+// Invariant: e >= 3 => the tile is resident at that slot. It is set only
+// right after crom_get_sprite returned the slot, and sprite_cache_pop
+// demotes it to 2 in the same step that frees the slot (crom_cache.dt
+// hook); crom_set_bank clears the table with the cache. Current-tick
+// entries are never evicted (sprite_cache.c), so a resolved pointer is
+// valid for the rest of the frame — same lifetime as crom_get_sprite's.
+#define CDT_UNKNOWN 0
+#define CDT_EMPTY   1
+#define CDT_SOLID   2
+#define CDT_SLOT0   3
+static uint16_t *crom_dt;
+
+static uint8_t *crom_resolve_miss(unsigned sn, uint32_t e) {
+	uint8_t *pix = crom_get_sprite((int)sn);
+	if (e == CDT_UNKNOWN) {
+		uint32_t acc = 0;
+		for (int i=0; i<8*16; i+=4)
+			acc |= *(const uint32_t*)(pix + i);
+		if (acc == 0) {
+			crom_dt[sn] = CDT_EMPTY;
+			return NULL;
+		}
+	}
+	crom_dt[sn] = CDT_SLOT0 + sprite_cache_slot(&crom_cache, pix);
+	return pix;
+}
+
+uint8_t* crom_resolve(int spritenum) {
+	unsigned sn = (unsigned)spritenum & crom_mask;
+	if (sn >= crom_num_tiles) sn = crom_num_tiles-1;
+	uint32_t e = crom_dt[sn];
+	if (e >= CDT_SLOT0) {
+		e -= CDT_SLOT0;
+		crom_cache.slot_tick[e] = crom_cache.cur_tick;
+		return crom_cache.sprites + (e << 7);
+	}
+	if (e == CDT_EMPTY)
+		return NULL;
+	return crom_resolve_miss(sn, e);
+}
+
 void srom_set_bank(int bank) {
 	assert(bank == 0 || bank == 1);
 	unsigned len;
@@ -240,6 +288,10 @@ void crom_set_bank(int bank) {
 	// Tile numbers refer to the new bank now: relearn emptiness.
 	memset(crom_known, 0, sizeof(crom_known));
 	memset(crom_emptyb, 0, sizeof(crom_emptyb));
+	free(crom_dt);
+	crom_dt = calloc(crom_num_tiles, sizeof(uint16_t));
+	assertf(crom_dt, "CROM direct table: out of memory (%u tiles)", crom_num_tiles);
+	crom_cache.dt = crom_dt;
 
 	// Calculate mask based on next power of two
 	len /= 8*16;

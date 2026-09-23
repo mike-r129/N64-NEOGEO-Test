@@ -38,6 +38,10 @@ void sprite_cache_init(SpriteCache *c, int sprite_size, int max_sprites) {
 	// nothing and it also allows faster memory invalidations without writebacks.
 	c->sprites = memalign(16, sprite_size * max_sprites);
 	assertf(c->sprites, "memory allocation failed");
+	assertf((sprite_size & (sprite_size-1)) == 0, "sprite_size must be pow2");
+	c->sprite_shift = __builtin_ctz(sprite_size);
+	c->slot_tick = malloc(max_sprites);
+	assertf(c->slot_tick, "memory allocation failed");
 
 	c->free_sprite_indices = malloc(sizeof(uint16_t) * max_sprites);
 	assertf(c->free_sprite_indices, "memory allocation failed");
@@ -97,7 +101,7 @@ uint8_t* sprite_cache_lookup(SpriteCache *c, uint32_t key) {
 	while (1) {
 		SpriteCacheEntry *b = &c->buckets[bidx];
 		if (b->key == key && b->sprite) {
-			b->last_tick = c->cur_tick;
+			c->slot_tick[sprite_cache_slot(c, b->sprite)] = c->cur_tick;
 			return b->sprite;
 		}
 
@@ -132,6 +136,7 @@ uint8_t* sprite_cache_insert(SpriteCache *c, uint32_t key) {
 		.last_tick = c->cur_tick,
 	};
 	c->num_sprites++;
+	c->slot_tick[sprite_cache_slot(c, sprite)] = c->cur_tick;
 
 	int bidx = hash(key) & (c->num_buckets-1);
 	int dist = 0;
@@ -181,9 +186,12 @@ void sprite_cache_pop(SpriteCache *c) {
 	LOG("[CACHE] pop target %d => %d\n", c->num_sprites, target);
 	while (c->num_sprites > target && n < c->num_buckets) {
 		SpriteCacheEntry *b = &c->buckets[bidx];
-		if (b->sprite && (uint8_t)((c->cur_tick & 0xFF) - b->last_tick) > cutoff) {
+		if (b->sprite && (uint8_t)((c->cur_tick & 0xFF)
+		        - c->slot_tick[sprite_cache_slot(c, b->sprite)]) > cutoff) {
 			// Found an entry that is older than the cutoff, remove it
 			int sprite_idx = (b->sprite - c->sprites) / SPRITE_FREEIDX_SCALE;
+			if (c->dt && c->dt[b->key] >= 3)
+				c->dt[b->key] = 2;   // resident -> known non-empty
 			c->free_sprite_indices[c->max_sprites - c->num_sprites] = sprite_idx;
 			c->num_sprites--;
 			b->sprite = NULL;

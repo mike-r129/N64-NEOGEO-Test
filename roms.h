@@ -29,6 +29,11 @@ bool srom_tile_empty(int spritenum);
 // first fetch; reset by crom_set_bank.
 bool crom_tile_empty(int spritenum);
 
+// Fused empty-test + lookup through the per-tile direct table: NULL if the
+// tile is all-transparent (skip it), else the cached pixel pointer (valid
+// for the rest of the frame). One sparse table read on the hot path.
+uint8_t* crom_resolve(int spritenum);
+
 void srom_set_bank(int bank);  // 0 = fixed (BIOS), 1 = game
 
 void pbrom_cache_init(void);
