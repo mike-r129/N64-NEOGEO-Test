@@ -160,7 +160,7 @@ static void render_fix(void) {
 
 
 static inline void sprite_consume_begin(void);
-static inline void sprite_consume_one(uint32_t w0, uint32_t w1);
+static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1);
 
 // Walk early-out for non-wrapping sprites (see sprite_walk_produce).
 // Runtime twin knob pinned to .data; MVS64_CULLFAST_OFF builds the OFF twin.
@@ -189,6 +189,10 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 	sprwalk_overflow = 0;
 	if (!recs) sprite_consume_begin();
+	// Per-render CDT context, local so the walk keeps it in registers
+	// (its address never escapes the inlined consume path).
+	CromResolveCtx cx;
+	crom_resolve_ctx(&cx);
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -319,7 +323,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 							recs[nrec].w0 = w0;
 							recs[nrec].w1 = w1;
 						} else
-							sprite_consume_one(w0, w1);
+							sprite_consume_one(&cx, w0, w1);
 						nrec++;
 					} else {
 						sprwalk_overflow++;
@@ -390,7 +394,7 @@ static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
 
 // Consume one record: identical tail of the historical loop — empty-tile
 // skip, then draw_sprite (cache side effects unchanged).
-static inline void sprite_consume_one(uint32_t w0, uint32_t w1) {
+static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
 	uint32_t tnum = w0 & 0xFFFFF;
 
 #ifdef DRAW_PERF
@@ -404,7 +408,7 @@ static inline void sprite_consume_one(uint32_t w0, uint32_t w1) {
 #ifdef DRAW_PERF
 		uint32_t _c0 = TICKS_READ();
 #endif
-		uint8_t *src = crom_resolve(tnum);
+		uint8_t *src = cx->fast ? crom_resolve_fast(cx, tnum) : crom_resolve(tnum);
 #ifdef DRAW_PERF
 		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
 #endif
@@ -457,8 +461,10 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 	}
 #endif
 	sprite_consume_begin();
+	CromResolveCtx cx;
+	crom_resolve_ctx(&cx);
 	for (int i=0;i<nrec;i++)
-		sprite_consume_one(recs[i].w0, recs[i].w1);
+		sprite_consume_one(&cx, recs[i].w0, recs[i].w1);
 }
 
 #if defined(N64) && defined(MVS64_WALK_RSP)

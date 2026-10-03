@@ -56,9 +56,36 @@ static unsigned int crom_mask;
 static unsigned int crom_num_tiles;
 unsigned int srom_num_tiles;    // non-static: srom_tile_empty_fast (roms.h)
 
+// CDT resolver-context knobs (layout-identical twins: -DMVS64_CDTCTX_OFF
+// builds both OFF). mvs64_cdt_inline: the walk resolves through
+// crom_resolve_fast with a per-frame context held in registers instead of
+// the out-of-line crom_resolve re-reading six scattered globals per record
+// (the CDT hit path swung 932 vs 293 us/frame with heap/link layout alone:
+// those global lines alias the sparse crom_dt reads in the 8 KB dcache).
+// mvs64_cdt_unc: the sprite cache's per-slot LRU ticks are written through
+// the uncached alias - a fire-and-forget store instead of a write-allocate
+// that evicts a line per record.
+#ifdef MVS64_CDTCTX_OFF
+int mvs64_cdt_inline __attribute__((section(".data"))) = 0;
+int mvs64_cdt_unc    __attribute__((section(".data"))) = 0;
+#else
+int mvs64_cdt_inline __attribute__((section(".data"))) = 1;
+int mvs64_cdt_unc    __attribute__((section(".data"))) = 1;
+#endif
+
 static void rom_cache_init(void) {
 	sprite_cache_init(&srom_cache, 4*8, 256);
 	sprite_cache_init(&crom_cache, 8*16, 1280);
+	#ifdef N64
+	// Give the C-ROM slot ticks their own 16-byte lines (always, so both
+	// twins have the same heap), so the uncached alias never shares a line
+	// with cached data that a later writeback could clobber.
+	free(crom_cache.slot_tick);
+	uint8_t *st = memalign(16, (1280 + 15) & ~15);
+	assertf(st, "memory allocation failed");
+	data_cache_hit_writeback_invalidate(st, (1280 + 15) & ~15);
+	crom_cache.slot_tick = mvs64_cdt_unc ? (uint8_t *)UncachedAddr(st) : st;
+	#endif
 }
 
 // fread whose short-read is tolerated (EOF-bounded lookahead, cache fills
@@ -231,6 +258,24 @@ uint8_t* crom_resolve(int spritenum) {
 	if (e == CDT_EMPTY)
 		return NULL;
 	return crom_resolve_miss(sn, e);
+}
+
+// Snapshot of everything crom_resolve reads, valid for one render: none of
+// it changes mid-walk (a miss may evict and demote crom_dt ENTRIES, but the
+// pointers, mask, tile count and tick stay fixed until rom_next_frame /
+// crom_set_bank, which run outside the walk).
+void crom_resolve_ctx(CromResolveCtx *c) {
+	c->dt = crom_dt;
+	c->slot_tick = crom_cache.slot_tick;
+	c->sprites = crom_cache.sprites;
+	c->mask = crom_mask;
+	c->ntiles = crom_num_tiles;
+	c->tick = (uint8_t)crom_cache.cur_tick;
+	c->fast = mvs64_cdt_inline;
+}
+
+uint8_t *crom_resolve_slowpath(unsigned sn) {
+	return crom_resolve_miss(sn, crom_dt[sn]);
 }
 
 void srom_set_bank(int bank) {
