@@ -1,5 +1,39 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 2026-10-03 — HW SOAK PASSED; AUTO FRAMESKIP MEASURED: BAD TRADE (knob stays OFF)
+
+**Hardware:** the user ran the latest build all day (a full workday) on a
+real N64: still responsive, sound working, no crash. First long session
+since the highpri-wedge fix (f8fbf75). OSD K/R/W/D readings and the SD log
+not yet collected.
+
+**Auto frameskip (3473f18, 4b00f4d; `make ... FRAMESKIP=n`, default 0):**
+skips DRAWING up to n frames in a row while behind the VI clock; the 68k,
+Z80 and audio run every frame. Layout-identical twins (one .data byte),
+QUIET+SNDOSD+AUTOINPUT, 420s each in ares, 62 paired 300-guest-frame
+windows ([FSKIP] lines; fs-analyze.py in the session scratchpad):
+
+| Build | Fight game speed (median / min) | Fight drawn fps (median / min) |
+| --- | --- | --- |
+| FRAMESKIP=0 | 45.8 / 36.6 | 45.8 / 36.6 |
+| FRAMESKIP=1 | 49.2 / 41.1 | 35.5 / 24.7 |
+| FRAMESKIP=2 | 53.4 / 42.5 | 28.8 / 17.0 |
+
+0 crashes, 0 underruns, hpwedge=0 in all three. **Verdict: bad trade.** A
+skipped draw saves only ~6.7 ms; the rest of a fight frame (68k + Z80 +
+audio glue, ~15.1 ms) runs regardless. FRAMESKIP=1 buys +3.4 fps of game
+speed for -10 fps on screen; =2 buys +7.6 for -17. Kept as an opt-in knob.
+
+**What the fit says about the real budget (fight median):** frame ≈ 21.8 ms
+= logic ≈ 15.1 ms + draw issue ≈ 6.7 ms; full speed (59.19 Hz) needs
+≤ 16.9 ms, i.e. -4.9 ms (-23%). Logic alone already fits; the draw-issue
+path is the single largest, most tractable block (sprite walk ~1.4 ms, RSP
+wait ~1.2 ms, CROM lookups, rspq writes, fix layer). Next levers re-ranked
+for that: (1) larger lowpri rspq buffers (+ pointer-lifetime guard);
+(2) cheaper per-tile command issue / CDT hit path made layout-robust;
+(3) ADPCM async prefetch (~0.5 ms); (4) 68k dynarec coverage (~6.5 ms of
+68k, long road). Real-hardware fps still unmeasured.
+
 ## 🔴 2026-09-23 — HARDWARE RSP CRASH AFTER 30+ MIN = rspq HIGHPRI WEDGE (libdragon race), FIXED; CDT +1.2ms/frame
 
 **HEADLINE (ares, shipped config QUIET+SNDOSD, same AUTOINPUT script, 35
