@@ -740,7 +740,11 @@ void plat_endframe(void) {
 		}
 		row += fbcrc_disp->stride;
 	}
-	plat_log("[FBCRC] %lu %08lx\n", (unsigned long)fbcrc_frame++,
+	// Keyed by GUEST frame, so a frameskip build's drawn frames compare 1:1
+	// against the same frames of a baseline (fbcrc_frame counts draws).
+	extern int g_frame;
+	fbcrc_frame++;
+	plat_log("[FBCRC] %lu %08lx\n", (unsigned long)g_frame,
 	         (unsigned long)crc);
 	display_show(fbcrc_disp);
 #elif defined(MVS64_DPCOSD)
@@ -789,7 +793,8 @@ void plat_endframe(void) {
 	{
 		// Audio-health OSD: which layer of the sound pipeline died, readable
 		// on a real console with no cable (mirrors the [AIPUMP] telemetry).
-		//   F ff.f    emulated fps (wall clock, 60-frame window)
+		//   F dd.d gg.g  drawn fps, then game-speed (emulated) fps over a
+		//             60-drawn-frame window; equal unless frameskip is on
 		//   D wamh n  offload dead-latches (whole-pump, adpcm, fm, hatch)
 		//             + death count
 		//   K k R r W w  rspq lost-wakeup watchdog kicks + offload revives
@@ -799,11 +804,12 @@ void plat_endframe(void) {
 		// Healthy @11kHz: D 0000 0, K 0 R 0 W 0, S 0 0, L ~2n, C ~11025.
 		// Sound dead but C ~11025  -> delivery alive, generation muted/dead
 		// (look at D/S). C 0 -> the AI interrupt chain itself died.
+		extern int g_frame;
 		static uint32_t tick0, rd0, pad0;
-		static int accn;
-		static char l1[24], l2[24], l3[24], l4[24], l5[24];
+		static int accn, gf0;
+		static char l1[48], l2[24], l3[24], l4[24], l5[24];
 		if (accn == 0 && tick0 == 0) {   // bootstrap
-			tick0 = TICKS_READ(); rd0 = aring_rd; pad0 = aring_pad;
+			tick0 = TICKS_READ(); rd0 = aring_rd; pad0 = aring_pad; gf0 = g_frame;
 		}
 		if (++accn >= 60) {
 			uint32_t now = TICKS_READ();
@@ -811,6 +817,7 @@ void plat_endframe(void) {
 			uint32_t rd = aring_rd, pad = aring_pad;
 			if (dt) {
 				uint32_t f10  = (uint32_t)((uint64_t)TICKS_PER_SECOND * accn * 10 / dt);
+				uint32_t g10  = (uint32_t)((uint64_t)TICKS_PER_SECOND * (uint32_t)(g_frame - gf0) * 10 / dt);
 				uint32_t cons = (uint32_t)((uint64_t)(rd - rd0) * TICKS_PER_SECOND / dt);
 				uint32_t strv = (uint32_t)((uint64_t)(pad - pad0) * TICKS_PER_SECOND / dt);
 				uint32_t off  = YM2610_offload_flags();
@@ -819,7 +826,8 @@ void plat_endframe(void) {
 #else
 				uint32_t kicks = 0;
 #endif
-				sprintf(l1, "F %lu.%lu", (unsigned long)(f10/10), (unsigned long)(f10%10));
+				sprintf(l1, "F %lu.%lu %lu.%lu", (unsigned long)(f10/10), (unsigned long)(f10%10),
+				        (unsigned long)(g10/10), (unsigned long)(g10%10));
 				sprintf(l2, "D %u%u%u%u %lu", (unsigned)!!(off & 2), (unsigned)!!(off & 1),
 				        (unsigned)!!(off & 4), (unsigned)!!(off & 16),
 				        (unsigned long)ym_off_deaths);
@@ -830,7 +838,7 @@ void plat_endframe(void) {
 				sprintf(l5, "L %lu C %lu", (unsigned long)(aring_wr - aring_rd),
 				        (unsigned long)cons);
 			}
-			tick0 = now; rd0 = rd; pad0 = pad; accn = 0;
+			tick0 = now; rd0 = rd; pad0 = pad; accn = 0; gf0 = g_frame;
 		}
 		uint16_t *fb = (uint16_t *)UncachedAddr(fbcrc_disp->buffer);
 		int stride_px = fbcrc_disp->stride / 2;
