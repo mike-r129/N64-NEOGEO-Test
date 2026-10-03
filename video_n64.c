@@ -1,5 +1,6 @@
 
 #include <libdragon.h>
+#include <string.h>
 
 #define RSP_FIX_LAYER    1
 #define RSP_SPRITES      1
@@ -431,12 +432,23 @@ static void render_begin(void) {
 	// Reconvert the palette only when it changed since the last frame
 	// (writes via the asm/C MMIO handlers or a bank switch set the flag).
 	// PALETTE_RAM_EMU persists in RDRAM between frames otherwise.
+	//
+	// The RSP converts from a SNAPSHOT, not from the live PALETTE_RAM: the
+	// pal_convert commands can sit behind the previous pump's highpri audio
+	// burst while the 68k already runs the next frame and writes the live
+	// palette (dirty lines can reach RDRAM before the RSP DMAs them), which
+	// would show a palette one frame early on fades. Only the small default
+	// rspq buffer used to hide this, by forcing the CPU to wait. pal_snap is
+	// rewritten only here, after display_get proved the previous frame's
+	// commands complete (2 display buffers).
 	extern uint8_t mvs64_palette_dirty;
+	static uint16_t pal_snap[4096] __attribute__((aligned(16)));
 	if (mvs64_palette_dirty) {
 		mvs64_palette_dirty = 0;
-		data_cache_hit_writeback(PALETTE_RAM + PALETTE_RAM_BANK, 4096*2);
+		memcpy(pal_snap, PALETTE_RAM + PALETTE_RAM_BANK, sizeof(pal_snap));
+		data_cache_hit_writeback(pal_snap, sizeof(pal_snap));
 		for (int i=0; i<4096 / 0x400; i++) {
-			rsp_pal_convert(PALETTE_RAM + PALETTE_RAM_BANK + i*0x400, PALETTE_RAM_EMU + i*0x400);
+			rsp_pal_convert(pal_snap + i*0x400, PALETTE_RAM_EMU + i*0x400);
 		}
 	}
 
