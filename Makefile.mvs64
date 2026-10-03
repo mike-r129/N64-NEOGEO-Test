@@ -124,6 +124,13 @@ endif
 # 2026-08-09). Default ON since 2026-08-30: the user confirmed the sndfix
 # build survives real-hardware play sessions with no sound loss. Disable
 # with WP_REVIVE_OFF=1.
+ifdef FRAMESKIP
+# Auto frameskip: skip drawing up to $(FRAMESKIP) frames in a row when the
+# emulation is behind the VI clock, so game speed holds (emu_render, emu.c).
+# Default off (0): the game slows down instead.
+CFLAGS += -DMVS64_FRAMESKIP=$(FRAMESKIP)
+endif
+
 ifndef WP_REVIVE_OFF
 CFLAGS += -DMVS64_WP_REVIVE
 endif
