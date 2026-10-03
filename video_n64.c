@@ -14,12 +14,28 @@ static void rsp_fix_draw(uint8_t *src, int palnum, int x, int y) {
 	rspq_write(RSP_OVL_ID, 0x1, PhysicalAddr(src),
 		(palnum << 20) | (x << 10) | y);
 }
+// Flush the queue every N sprite commands (0 = never) so the RSP/RDP start
+// drawing while the CPU is still issuing the frame. rspq only hands commands
+// to the RSP on a flush; with libdragon's 2 KB lowpri buffers every buffer
+// switch flushed implicitly (~every 128 tiles), but with larger buffers
+// (MVS64_RSPQ_LOWPRI_WORDS) nothing flushed until render_end, serializing
+// CPU issue and RSP/RDP execution. Runtime twin knob pinned to .data.
+#ifndef MVS64_DRAW_FLUSH_EVERY
+#define MVS64_DRAW_FLUSH_EVERY 0
+#endif
+int mvs64_draw_flush_every __attribute__((section(".data"))) = MVS64_DRAW_FLUSH_EVERY;
+
 static void rsp_sprite_draw(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
+	static int since_flush;
 	assertf(sw <= 16 && sh <= 16, "sprite too large: %dx%d", sw, sh);
 	assertf(sw > 0 && sh > 0, "sprite too small: %dx%d", sw, sh);
 	rspq_write(RSP_OVL_ID, 0x2, PhysicalAddr(src),
 		(palnum << 24) | ((x0 & 0xFFF) << 12) | (y0 & 0xFFF),
 		(sw-1) | ((sh-1) << 4) | (flipx ? 0x100 : 0) | (flipy ? 0x200 : 0));
+	if (mvs64_draw_flush_every && ++since_flush >= mvs64_draw_flush_every) {
+		since_flush = 0;
+		rspq_flush();
+	}
 }
 static void rsp_pal_convert(uint16_t *src, uint16_t *dst) {
 	rspq_write(RSP_OVL_ID, 0x3, PhysicalAddr(src), PhysicalAddr(dst));
