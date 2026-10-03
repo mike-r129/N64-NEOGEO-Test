@@ -54,7 +54,7 @@ static FILE *vrom_file = NULL;
 
 static unsigned int crom_mask;
 static unsigned int crom_num_tiles;
-static unsigned int srom_num_tiles;
+unsigned int srom_num_tiles;    // non-static: srom_tile_empty_fast (roms.h)
 
 static void rom_cache_init(void) {
 	sprite_cache_init(&srom_cache, 4*8, 256);
@@ -79,8 +79,8 @@ static inline void fread_ok(void *dst, size_t sz, FILE *f) {
 // learn it on first sight, then skip empty tiles forever. Pixel-identical by
 // construction. Reset on srom_set_bank (tile numbers change meaning).
 #define SROM_MAX_TILES 8192
-static uint8_t srom_known[SROM_MAX_TILES/8];
-static uint8_t srom_empty[SROM_MAX_TILES/8];
+uint8_t srom_known[SROM_MAX_TILES/8];   // non-static: srom_tile_empty_fast
+uint8_t srom_empty[SROM_MAX_TILES/8];
 
 bool srom_tile_empty(int spritenum) {
 	if ((unsigned)spritenum >= srom_num_tiles) spritenum = srom_num_tiles-1;

@@ -24,6 +24,21 @@ uint8_t* srom_get_sprite(int spritenum);
 // Learns lazily on first sight of each tile; reset by srom_set_bank.
 bool srom_tile_empty(int spritenum);
 
+// Inline fast path for render_fix's per-cell test: answers from the learned
+// bitmaps without a call; only a not-yet-learned or out-of-range tile falls
+// back to srom_tile_empty (which learns it / applies its clamp). Same answer
+// as srom_tile_empty for every input.
+extern unsigned int srom_num_tiles;
+extern uint8_t srom_known[], srom_empty[];
+static inline bool srom_tile_empty_fast(int spritenum) {
+	if ((unsigned)spritenum < srom_num_tiles) {
+		int byte = spritenum >> 3, bit = 1 << (spritenum & 7);
+		if (srom_known[byte] & bit)
+			return (srom_empty[byte] & bit) != 0;
+	}
+	return srom_tile_empty(spritenum);
+}
+
 // Same fact for sprite (C-ROM) tiles: all index-0 pixels can never touch
 // the screen (alpha-compare kills them in every palette). Learns lazily on
 // first fetch; reset by crom_set_bank.

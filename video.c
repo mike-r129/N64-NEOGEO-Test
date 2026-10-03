@@ -115,8 +115,22 @@ static int sprwalk_rsp_ovfl;   // overflow count reported by the RSP walk
 #include "video_cpu.c"
 #endif
 
+// Fix-layer fast path (twin knob, MVS64_FIXFAST_OFF): the per-cell empty
+// test inlined (srom_tile_empty_fast) plus a 1-entry memo of the last blank
+// tile code — the map repeats the same blank codes, and ~950 of ~1120 cells
+// are blank in fights. Same draw decisions as the plain path. The memo is
+// per call: tile numbers only change meaning on srom_set_bank, which the 68k
+// does between renders.
+#ifdef MVS64_FIXFAST_OFF
+int mvs64_fix_fast __attribute__((section(".data"))) = 0;
+#else
+int mvs64_fix_fast __attribute__((section(".data"))) = 1;
+#endif
+
 static void render_fix(void) {
 	uint16_t *fix = VIDEO_RAM + 0x7000;
+	const int fast = mvs64_fix_fast;
+	int last_blank = -1;
 
 	render_begin_fix();
 
@@ -128,8 +142,15 @@ static void render_fix(void) {
 			// is full of nonzero "blank" codes, so without this we issue
 			// ~1120 draws/frame that can never touch the screen (see
 			// srom_tile_empty).
-			if (v && !srom_tile_empty(v & 0xFFF))
-				draw_sprite_fix(v & 0xFFF, (v >> 12) & 0xF, i*8, j*8);
+			if (!v) continue;
+			int t = v & 0xFFF;
+			if (fast) {
+				if (t == last_blank) continue;
+				if (srom_tile_empty_fast(t)) { last_blank = t; continue; }
+			} else if (srom_tile_empty(t)) {
+				continue;
+			}
+			draw_sprite_fix(t, (v >> 12) & 0xF, i*8, j*8);
 		}
 		fix += 2;
 	}
