@@ -87,6 +87,19 @@ extern uint32_t __rspq_wedge_recoveries __attribute__((weak));
 static inline uint32_t rspq_wedge_recoveries(void) {
     return &__rspq_wedge_recoveries ? __rspq_wedge_recoveries : 0;
 }
+// rspq lowpri command-buffer size, read by libdragon's rspq_init through the
+// vendored patch (patches/libdragon-rspq-lowpri-size.patch); an unpatched
+// toolchain ignores both and keeps upstream's 0x200 words. A fight frame
+// issues ~10 KB of video commands while the RSP is often busy with a highpri
+// audio burst, so with 2 x 2 KB the CPU blocks in rspq_next_buffer instead of
+// returning to 68k emulation. The allocation is fixed at the max so A/B
+// twins (MVS64_RSPQ_LOWPRI_WORDS) keep an identical heap; both pinned to
+// .data so the twins' binaries differ only in the initializer.
+#ifndef MVS64_RSPQ_LOWPRI_WORDS
+#define MVS64_RSPQ_LOWPRI_WORDS 0x200
+#endif
+int __rspq_lowpri_buffer_words __attribute__((section(".data"))) = MVS64_RSPQ_LOWPRI_WORDS;
+int __rspq_lowpri_alloc_words  __attribute__((section(".data"))) = 0x1000;
 // Consecutive pump passes that observed ISR silence-padding (the overload
 // governor input, see plat_audio_pump); file-scope for SNDOSD.
 static int underrun_streak;
