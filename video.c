@@ -162,6 +162,14 @@ static void render_fix(void) {
 static inline void sprite_consume_begin(void);
 static inline void sprite_consume_one(uint32_t w0, uint32_t w1);
 
+// Walk early-out for non-wrapping sprites (see sprite_walk_produce).
+// Runtime twin knob pinned to .data; MVS64_CULLFAST_OFF builds the OFF twin.
+#ifdef MVS64_CULLFAST_OFF
+int mvs64_walk_cullfast __attribute__((section(".data"))) = 0;
+#else
+int mvs64_walk_cullfast __attribute__((section(".data"))) = 1;
+#endif
+
 // Bit-exact reference walk: same SCB reads, same vshrink math, same culls,
 // same order as the historical direct-draw loop.
 // recs == NULL is the FUSED mode (default path): each record is consumed
@@ -219,6 +227,15 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 		int nt, y, maxy;
 		int halfy = sh < 256 ? sh : 256;
+		// Early-out (twin knob mvs64_walk_cullfast): when the sprite does not
+		// wrap (sy+sh <= 512), ssy+ssh <= 512 for every tile (ssh is clipped
+		// to sh), so a tile is visible iff ssy < 224. y never decreases in
+		// the top half, and the bottom half starts at y >= 241 (512 minus a
+		// top-half end <= 271) with sy >= -15, i.e. ssy >= 226: once a
+		// top-half tile reaches ssy >= 224 nothing later in this sprite can
+		// be visible. Skips the culled lower tiles of full-height strips
+		// (~437 culled iterations/frame in fights). Same records, same order.
+		const bool nowrap = mvs64_walk_cullfast && (sy + sh <= 512);
 
 		// Iterate on the two halves of the vertical sprite. This for loop
 		// is mainly useful to reuse the core drawing loop. The setup
@@ -276,6 +293,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 					// See if this tile is visible, given its Y coordinate and size
 					int ssy = sy + y;
+					if (nowrap && ssy >= 224) goto sprite_done;
 					if (ssy < 224 || (ssy+ssh) > 512) {
 						uint32_t tnum = tmap[nt*2+0];
 						uint32_t tc = tmap[nt*2+1];
@@ -318,6 +336,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 			if (!repeat_tiles && nt == 16) break;  // FIXME: draw overfill when not repeating
 		}
 	}
+	sprite_done: ;
 }
 
 	if (sprwalk_overflow)
