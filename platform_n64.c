@@ -96,7 +96,7 @@ static inline uint32_t rspq_wedge_recoveries(void) {
 // twins (MVS64_RSPQ_LOWPRI_WORDS) keep an identical heap; both pinned to
 // .data so the twins' binaries differ only in the initializer.
 #ifndef MVS64_RSPQ_LOWPRI_WORDS
-#define MVS64_RSPQ_LOWPRI_WORDS 0x200
+#define MVS64_RSPQ_LOWPRI_WORDS 0x1000
 #endif
 int __rspq_lowpri_buffer_words __attribute__((section(".data"))) = MVS64_RSPQ_LOWPRI_WORDS;
 int __rspq_lowpri_alloc_words  __attribute__((section(".data"))) = 0x1000;

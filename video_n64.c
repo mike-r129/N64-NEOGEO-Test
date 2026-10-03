@@ -21,7 +21,7 @@ static void rsp_fix_draw(uint8_t *src, int palnum, int x, int y) {
 // (MVS64_RSPQ_LOWPRI_WORDS) nothing flushed until render_end, serializing
 // CPU issue and RSP/RDP execution. Runtime twin knob pinned to .data.
 #ifndef MVS64_DRAW_FLUSH_EVERY
-#define MVS64_DRAW_FLUSH_EVERY 0
+#define MVS64_DRAW_FLUSH_EVERY 64
 #endif
 int mvs64_draw_flush_every __attribute__((section(".data"))) = MVS64_DRAW_FLUSH_EVERY;
 
