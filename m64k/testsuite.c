@@ -4,7 +4,7 @@
 #include "m64k.h"
 #include "tlb.h"
 
-m64k_t m64k;
+extern m64k_t m64k;   // allocated in m64k_asm.S
 uint8_t ram_pages[16][8192] __attribute__((aligned(8192)));
 uint32_t ram_address[16];
 
