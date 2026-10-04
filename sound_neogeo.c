@@ -31,9 +31,9 @@
 #define YM_CLOCK             8000000
 #define AUDIO_RATE           MVS64_AUDIO_RATE
 
-static z80 cpu;
+#define cpu      z80_hot.cpu    // (z80.h: one contiguous Z80 working set)
 static int  z80_active;                 // false when there is no m.rom
-static uint8_t z80_ram[0x800];          // 2KB work RAM at 0xF800-0xFFFF
+#define z80_ram  z80_hot.ram    // 2KB work RAM at 0xF800-0xFFFF
 static const uint8_t *z80_bank[4];      // window base pointers into M_ROM
 
 static uint8_t sound_code;              // 68k -> Z80 command latch
@@ -258,7 +258,7 @@ static inline void z80_service_level_irq(void) {
 // Z80 read page map (see z80.h rmap): one pre-biased host pointer per 256-byte
 // page, mirroring z80_read's decode exactly. Every window is page-aligned, so
 // the map is exact; it is rebuilt at reset and per window on bank switch.
-static uintptr_t z80_rmap[256];
+#define z80_rmap z80_hot.rmap
 static const uint8_t win_lo[4] = { 0x80, 0xC0, 0xE0, 0xF0 };   // window page ranges
 static const uint8_t win_hi[4] = { 0xC0, 0xE0, 0xF0, 0xF8 };
 static void rmap_fill(unsigned lo, unsigned hi, const uint8_t *base) {

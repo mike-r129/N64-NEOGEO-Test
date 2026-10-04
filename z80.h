@@ -46,6 +46,19 @@ struct z80 {
 #endif
 };
 
+// MVS64: the Z80 per-step working set in one contiguous, 16-byte aligned
+// block (~3.9 KB): the owner's CPU struct, the opcode cycle tables, the read
+// page map and the 2 KB work RAM (NeoGeo 0xF800-0xFFFF). Contiguous objects
+// smaller than the 8 KB direct-mapped dcache cannot evict each other, so no
+// relink can make the Z80 loop ping-pong between its own tables.
+struct z80_hot {
+  z80 cpu;
+  uint8_t cyc_00[256], cyc_ed[256], cyc_ddfd[256];
+  uintptr_t rmap[256];
+  uint8_t ram[0x800];
+};
+extern struct z80_hot z80_hot;
+
 void z80_init(z80* const z);
 void z80_step(z80* const z);
 void z80_debug_output(z80* const z);
