@@ -675,7 +675,11 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #ifdef MVS64_Z80HIST
 			z80_hist[cpu.pc >> 4]++;
 #endif
-			z80_step(&cpu);
+#ifdef MVS64_Z80STEP_CALL
+			z80_step(&cpu);                     // A/B: the out-of-line step
+#else
+			z80_step_inline(&cpu);
+#endif
 #ifdef SND_HEALTH
 			g_z80_steps++;
 #endif

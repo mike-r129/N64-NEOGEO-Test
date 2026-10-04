@@ -168,7 +168,9 @@ static inline bool parity(uint8_t val) {
   return (v & 1) == 0;
 }
 
-static void exec_opcode(z80* const z, uint8_t opcode);
+// exec_opcode is exported as z80_exec_opcode for z80_step_inline (z80.h).
+#define exec_opcode z80_exec_opcode
+void exec_opcode(z80* const z, uint8_t opcode);
 static void exec_opcode_cb(z80* const z, uint8_t opcode);
 static void exec_opcode_dcb(
     z80* const z, const uint8_t opcode, const uint16_t addr);
@@ -821,6 +823,12 @@ void z80_step(z80* const z) {
   // in-fight case (~97% of steps) skips the call entirely.
   if (z->iff_delay | (uint8_t)(z->nmi_pending | (z->int_pending & z->iff1)))
     process_interrupts(z);
+}
+
+// Out-of-line interrupt service for z80_step_inline: the NMI/IM0/IM2 push
+// paths stay cold instead of forcing a full register frame on every step.
+__attribute__((noinline)) void z80_process_interrupts(z80* const z) {
+  process_interrupts(z);
 }
 
 // outputs to stdout a debug trace of the emulator
