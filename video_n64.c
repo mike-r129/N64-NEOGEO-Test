@@ -260,7 +260,7 @@ static void draw_sprite(int spritenum, int palnum, int x0, int y0, int sw, int s
 
 static void draw_sprite_src(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
 	if (RSP_SPRITES) {
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 		uint32_t _r0 = TICKS_READ();
 		rsp_sprite_draw(src, palnum, x0, y0, sw, sh, flipx, flipy);
 		perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
