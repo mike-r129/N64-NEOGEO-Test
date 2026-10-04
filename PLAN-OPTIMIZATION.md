@@ -1,5 +1,44 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 2026-10-03 (later) — DRAW PATH: rspq buffers + three CPU cuts, +1.5..+2.9 fps in fights
+
+All on branch `frameskip`, each a layout-identical twin knob (one .data byte),
+QUIET+AUTOINPUT release config, 420 s ares runs, paired 300-guest-frame
+fight windows, one emulator at a time. 0 crashes / 0 underruns / hpwedge=0
+in every run.
+
+| Step (commit) | Fight fps, paired median | Faster windows | ms/frame | Pixel gate (DET+FBCRC) |
+| --- | --- | --- | --- | --- |
+| 16 KB rspq lowpri buffers + flush/64 (e71fc9a patch, 332b57a, d65f9b4, default 81afc69) | +1.09 | 40/56 | 0.54 | 9,651 identical |
+| Fix-layer fast path + walk early-out (3120b6f, 5189e1d) | +1.17 | 23/25 | 0.49 | 9,677 identical |
+| Per-render CDT context + uncached slot ticks (7b6dca2) | +0.61 | 40/57 | 0.26 | 9,491 identical |
+
+Cross-binary morning baseline -> now: fight median 46.0 -> 48.3 (paired
++1.45 median, +1.63 mean, 45/56 faster). Twin steps sum to ~+2.9 / 1.3 ms;
+the truth for any one binary is in between (layout-luck law).
+
+Laws/findings:
+- **rspq only hands commands to the RSP on a flush.** Bigger buffers alone
+  were SLOWER (SNDOSD config 45.6 -> 42.9 at 16 KB): with 2 KB buffers every
+  buffer switch flushed, with 16 KB nothing did until render_end, so CPU
+  issue and RSP/RDP execution serialized. Flush every 64 sprite commands.
+- **SNDOSD/DPCOSD/FBCRC builds drain the whole queue every frame**
+  (rdpq_detach_wait) — they cannot show queue-depth gains. Hardware-test
+  config with the change: +0.18 (no regression). Measure perf on QUIET.
+- **Pointer-lifetime audit (Fable advisor):** display_get (2 buffers) returns
+  only after the previous frame's RSP+RDP work is done, which fences every
+  cache-slot pointer. One real race: pal_convert read the LIVE PALETTE_RAM,
+  which the 68k rewrites for the next frame — hidden only by the tiny
+  buffers. Fixed with a per-frame snapshot (0341cc1). Invariant: exactly 2
+  display buffers, no cache inserts outside video_render.
+- libdragon now carries a 3rd vendored patch (lowpri size hook, BUILDING.md).
+
+Remaining draw ideas from the advisor, not done: 2-word cmd_sprite_draw
+carrying the slot index (~0.3 ms, ucode change, medium risk); palette
+convert per-2 KB dirty chunks (measure perf_dr_begin first); 64-bit
+zeroing in rspq_switch_buffer (~0.1-0.2 ms). Gap to full speed after this:
+~21.0 ms vs 16.9 ms target in a median fight frame.
+
 ## 📊 2026-10-03 — HW SOAK PASSED; AUTO FRAMESKIP MEASURED: BAD TRADE (knob stays OFF)
 
 **Hardware:** the user ran the latest build all day (a full workday) on a
