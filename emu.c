@@ -784,6 +784,28 @@ int main(int argc, char *argv[]) {
 			extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
 			extern uint32_t perf_snd_pub;
 			const uint32_t fb = TICKS_PER_SECOND / 60 / 10000;  // ticks per 0.01%
+			{
+				// Trap histogram by 64KB page and direction (hw_n64.S):
+				// zeroed at the fight-era frame 2400, dumped at 6600 as
+				// traps per frame x100.
+				extern uint32_t perf_trap_hist[512];
+				extern uint32_t perf_trap_ring[2048], perf_trap_ring_n;
+				if (g_frame == 2400) {
+					memset(perf_trap_hist, 0, sizeof(uint32_t) * 512);
+					perf_trap_ring_n = 0;
+				}
+				if (g_frame == 6600) {
+					for (uint32_t i = 0; i < perf_trap_ring_n; i++)
+						debugf("[TRAPS] epc=%08lx pc=%06lx\n",
+						       (unsigned long)perf_trap_ring[2*i],
+						       (unsigned long)(perf_trap_ring[2*i+1] & 0xFFFFFF));
+					for (int i = 0; i < 512; i++)
+						if (perf_trap_hist[i])
+							debugf("[TRAPH] %s page=%02x per_frame_x100=%lu\n",
+							       i >= 256 ? "W" : "R", i & 255,
+							       (unsigned long)(perf_trap_hist[i] * 100UL / 4200));
+				}
+			}
 			framef("[PERF] insns=%lu skips=%lu tlb=%lu slices=%lu dwait=%lu dissue=%lu dend=%lu pub=%lu\n",
 				(unsigned long)perf_m68k_insns,
 				(unsigned long)perf_idle_skips,
