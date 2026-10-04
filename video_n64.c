@@ -71,7 +71,7 @@ static void sprite_walk_kick_rsp(SprWalkRec *list, int maxrecs, uint8_t aa, bool
 static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
 	volatile uint32_t *utrailer =
 		(volatile uint32_t *)UncachedAddr((uint8_t *)list + maxrecs*8);
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 	uint32_t _w0 = TICKS_READ();
 #endif
 	uint32_t t0 = TICKS_READ();
@@ -86,7 +86,7 @@ static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
 			break;
 		}
 	}
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 	perf_dr_wwait += TICKS_DISTANCE(_w0, TICKS_READ());
 #endif
 	uint32_t nrec = utrailer[0], ovfl = utrailer[1];

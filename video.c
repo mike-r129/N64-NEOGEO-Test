@@ -78,6 +78,16 @@ static uint32_t perf_uniq_tab[2048] __attribute__((aligned(16)));
 static uint32_t perf_uniq_gen;
 #define DRAW_PERF 1
 #endif
+#if defined(N64) && (defined(MVS64_PERFCOUNT) || defined(MVS64_PERFOSD))
+// Coarse per-frame draw split, cheap enough for the PERFOSD hardware overlay
+// (one TICKS pair per section, per walk and per C-ROM miss; the per-record
+// DRAW_PERF timers stay PERFCOUNT-only). PERFOSD consumes and zeroes these
+// in plat_perf_frame; PERFCOUNT prints and zeroes them in [PERF2]/[PERF3].
+#ifndef MVS64_PERFCOUNT
+uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix, perf_dr_wwait, perf_dr_missticks;
+#endif
+#define DRAW_PERF_COARSE 1
+#endif
 
 // --- sprite walk: produce/consume split -----------------------------------
 // The SCB walk produces a flat list of visible-tile records; the consume
@@ -576,7 +586,7 @@ void video_render(void) {
 		sprite_walk_kick_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa_k, aa_en_k);
 	}
 #endif
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 	uint32_t t0 = TICKS_READ();
 	render_begin();
 	uint32_t t1 = TICKS_READ();
