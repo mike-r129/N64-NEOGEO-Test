@@ -200,7 +200,8 @@ void plat_init(int audiofreq, int fps) {
     // NOTE: there seems to be a bug in libdragon display library when ANTIALIAS_OFF
     // is used. Some RDP register is not configured correctly and the display is
     // corrupted on NTSC consoles.
-	display_init(RESOLUTION_320x240, DEPTH_16_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE);
+	extern int mvs64_display_buffers;   // 3 (see plat_detach_show), or 2
+	display_init(RESOLUTION_320x240, DEPTH_16_BPP, mvs64_display_buffers, GAMMA_NONE, ANTIALIAS_RESAMPLE);
     dfs_init(DFS_DEFAULT_LOCATION);
     rdpq_init();
     // rdpq_debug_start();
@@ -644,7 +645,7 @@ int g_screen_pitch;
 static surface_t *fbcrc_disp;
 #endif
 
-#if defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD)
+#if defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD) || defined(MVS64_PERFOSD)
 // PLAN-DRAW-RDP Phase 3 hardware instrument: ares/paraLLEl-RDP does not
 // model the DPC counters (they read 0 there), so the Phase 3 perf verdict
 // comes from a real console. This build draws the RDP numbers on screen:
@@ -654,7 +655,7 @@ static surface_t *fbcrc_disp;
 //   B bb     PIPE_BUSY as % of DP_CLOCK (RDP duty cycle)
 // Glyphs: 4x6 bitmap font drawn 2x through the uncached segment onto the
 // finished frame (detach_wait first), top-left corner.
-static const uint8_t dpcosd_font[23][6] = {
+static const uint8_t dpcosd_font[27][6] = {
 	{0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, // 0 1
 	{0x6,0x9,0x1,0x2,0x4,0xF}, {0xE,0x1,0x6,0x1,0x1,0xE}, // 2 3
 	{0x2,0x6,0xA,0xF,0x2,0x2}, {0xF,0x8,0xE,0x1,0x1,0xE}, // 4 5
@@ -668,6 +669,8 @@ static const uint8_t dpcosd_font[23][6] = {
 	{0xE,0x9,0x9,0xE,0xA,0x9}, {0x7,0x8,0x6,0x1,0x1,0xE}, // R S
 	{0x8,0x8,0x8,0x8,0x8,0xF}, {0x6,0x9,0x8,0x8,0x9,0x6}, // L C
 	{0x9,0x9,0x9,0xF,0xF,0x9},                            // W
+	{0x9,0xF,0xF,0x9,0x9,0x9}, {0x9,0x9,0x9,0x9,0x6,0x6}, // M V
+	{0x6,0x9,0x9,0xF,0x9,0x9}, {0x9,0x9,0x6,0x6,0x9,0x9}, // A X
 };
 static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s) {
 	for (; *s; s++, x += 10) {
@@ -685,6 +688,10 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 		else if (*s == 'L') g = 20;
 		else if (*s == 'C') g = 21;
 		else if (*s == 'W') g = 22;
+		else if (*s == 'M') g = 23;
+		else if (*s == 'V') g = 24;
+		else if (*s == 'A') g = 25;
+		else if (*s == 'X') g = 26;
 		else continue;
 		for (int r = 0; r < 6; r++) {
 			uint8_t bits = dpcosd_font[g][r];
@@ -698,8 +705,127 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 }
 #endif
 
+#ifdef MVS64_PERFOSD
+// Hardware perf overlay that does NOT stall the pipeline: unlike SNDOSD/
+// DPCOSD (detach_wait, then CPU-draw onto the finished frame, which
+// serializes CPU and RDP every frame), the text is rendered into a small
+// RGBA16 texture only when the numbers change (every 60 drawn frames) and
+// blitted each frame with one copy-mode rectangle queued at the end of the
+// frame's own RDP work. Two textures alternate, so the one being rewritten
+// was last read 60 frames ago. Per guest frame, averaged over the window:
+//   F dd.d gg.g   drawn fps, game-speed (emulated) fps
+//   M mm.m S ss.s 68k ms (incl. MMIO and Z80 catch-up in sound commands),
+//                 sound ms (Z80 + YM2610 pump)
+//   V vv.v W ww.w draw CPU ms (video_render issue + frame end, without the
+//                 wait), and ms spent in display_get waiting for a free
+//                 buffer (= the RSP/RDP still finishing older frames: the
+//                 frame is RDP-bound when W is large)
+//   A aa.a        whole guest frame ms (CPU wall time incl. all waits)
+//   X xx.x        A minus M+S+V+W: the part no other line accounts for
+//   P pp.p T tt.t RDP pipe-busy / TMEM-busy ms per drawn frame (DPC
+//                 counters; real hardware only, ares reads 0)
+#define POSD_W 160
+#define POSD_H 88
+static surface_t posd_surf[2];
+static int posd_cur = -1;
+static uint32_t posd_wait;          // ticks in display_get, current guest frame
+static uint32_t posd_acc_all, posd_acc_m68k, posd_acc_snd, posd_acc_draw, posd_acc_wait;
+static uint32_t posd_acc_n;
+// emu.c main loop, once per guest frame.
+void plat_perf_frame(uint32_t all, uint32_t m68k, uint32_t snd, uint32_t draw) {
+	posd_acc_all += all; posd_acc_m68k += m68k; posd_acc_snd += snd;
+	posd_acc_draw += draw; posd_acc_wait += posd_wait;
+	posd_wait = 0;
+	posd_acc_n++;
+}
+static uint32_t posd_ms10(uint32_t ticks, uint32_t n) {   // ms*10 per frame
+	return n ? (uint32_t)((uint64_t)ticks * 10000 / ((uint64_t)TICKS_PER_SECOND * n)) : 0;
+}
+static void posd_render(char lines[][32], int nlines) {
+	int nxt = posd_cur < 0 ? 0 : posd_cur ^ 1;
+	surface_t *s = &posd_surf[nxt];
+	if (!s->buffer) *s = surface_alloc(FMT_RGBA16, POSD_W, POSD_H);
+	{   // opaque black backdrop (RGBA5551 0x0001: alpha bit set) for legibility
+		uint16_t *px = (uint16_t *)s->buffer;
+		for (int i = 0; i < s->stride / 2 * POSD_H; i++) px[i] = 0x0001;
+	}
+	for (int i = 0; i < nlines; i++)
+		dpcosd_text((uint16_t *)s->buffer, s->stride / 2, 4, 4 + i * 14, lines[i]);
+	data_cache_hit_writeback(s->buffer, s->stride * POSD_H);
+	posd_cur = nxt;
+}
+#endif
+
+// Display buffering. With 2 buffers, display_get blocks until the buffer on
+// screen is released at the NEXT vblank, so at 35-45 fps the CPU idled ~7.5
+// ms per fight frame on hardware (PERFOSD W) - vsync quantization, not RDP
+// load (RDP busy ~10 ms/frame). A third buffer removes that wait.
+// Two buffers also fenced every frame: display_get could only return after
+// the previous frame's RSP+RDP work was done, which is what made it safe for
+// the next frame to reuse sprite-cache slots, the palette snapshot and
+// PALETTE_RAM_EMU. With 3 buffers that fence is explicit: each frame ends
+// with rdpq_detach_cb (show + count the frame done, under the DP interrupt)
+// and plat_beginframe waits for that count before video_render touches any
+// shared state. The CPU spends ~13 ms in the 68k/sound before it renders,
+// so the previous frame's ~10 ms of RDP work is normally long finished.
+// mvs64_display_buffers is a .data word: the 2-buffer twin is
+// -DMVS64_DISPLAY_BUFFERS=2 (uses the plain rdpq_detach_show path).
+#ifndef MVS64_DISPLAY_BUFFERS
+#define MVS64_DISPLAY_BUFFERS 3
+#endif
+int mvs64_display_buffers __attribute__((section(".data"))) = MVS64_DISPLAY_BUFFERS;
+static surface_t *cur_disp;
+static uint32_t frames_issued;
+static volatile uint32_t frames_done;
+static void frame_done_cb(void *arg) {   // DP interrupt: RDP finished the frame
+	display_show((surface_t *)arg);
+	frames_done++;
+}
+static void plat_detach_show(void) {
+	if (mvs64_display_buffers > 2) {
+		frames_issued++;
+		rdpq_detach_cb(frame_done_cb, cur_disp);
+	} else {
+		rdpq_detach_show();
+	}
+}
+
 void plat_beginframe(void) {
+#ifdef MVS64_PERFOSD
+    uint32_t posd_t0 = TICKS_READ();
+#endif
     surface_t *rdp_disp = display_get();
+    // Previous frame fence (see plat_detach_show): its RDP work, and so all
+    // of its RSP commands, must be done before this frame reuses cache slots
+    // and palette buffers. Trivially true in 2-buffer and draining builds.
+    while ((int32_t)(frames_issued - frames_done) > 0) {}
+#ifdef MVS64_PERFOSD
+    posd_wait += TICKS_DISTANCE(posd_t0, TICKS_READ());
+#endif
+#ifdef MVS64_FBCRC_PIPE
+    // Pixel gate for the pipelined (3-buffer) path: after the fence, the
+    // previous frame's buffer is final and not yet reused - hash it (same
+    // FNV-1a over 320x224 as MVS64_FBCRC, keyed by that frame's g_frame) and
+    // compare with a drained 2-buffer FBCRC baseline (both DET_AUDIO).
+    {
+        extern int g_frame;
+        static surface_t *prev_disp;
+        static int prev_key = -1;
+        if (prev_disp && prev_key >= 0) {
+            uint32_t crc = 0x811C9DC5u;
+            const uint8_t *row = (const uint8_t *)UncachedAddr(prev_disp->buffer);
+            for (int y = 0; y < 224; y++) {
+                const uint32_t *p = (const uint32_t *)row;
+                for (int x = 0; x < 320*2/4; x++) { crc ^= p[x]; crc *= 16777619u; }
+                row += prev_disp->stride;
+            }
+            plat_log("[FBCRC] %lu %08lx\n", (unsigned long)prev_key, (unsigned long)crc);
+        }
+        prev_disp = rdp_disp;
+        prev_key = g_frame;
+    }
+#endif
+    cur_disp = rdp_disp;
 
 	g_screen_ptr = rdp_disp->buffer;
 	g_screen_pitch = 320*2;
@@ -862,7 +988,69 @@ void plat_endframe(void) {
 		dpcosd_text(fb, stride_px, 8, 64, l5);
 	}
 	display_show(fbcrc_disp);
+#elif defined(MVS64_PERFOSD)
+	{
+		extern int g_frame;
+		static uint32_t tick0, pipe0, tmem0, acc_pipe, acc_tmem;
+		static int accn, gf0;
+		static char lines[6][32];
+		// DPC counters are 24-bit at 62.5 MHz (wrap every ~0.27 s):
+		// accumulate per-frame deltas. Read without draining, so a delta
+		// covers whatever the RDP finished since the last read.
+		uint32_t pipe = *(volatile uint32_t*)0xA4100018 & 0xFFFFFF;
+		uint32_t tmem = *(volatile uint32_t*)0xA410001C & 0xFFFFFF;
+		if (tick0 == 0) {   // bootstrap
+			tick0 = TICKS_READ(); gf0 = g_frame;
+		} else {
+			acc_pipe += (pipe - pipe0) & 0xFFFFFF;
+			acc_tmem += (tmem - tmem0) & 0xFFFFFF;
+		}
+		pipe0 = pipe; tmem0 = tmem;
+		if (++accn >= 60) {
+			uint32_t now = TICKS_READ();
+			uint32_t dt = TICKS_DISTANCE(tick0, now);
+			uint32_t n = posd_acc_n;
+			if (dt && n) {
+				uint32_t f10 = (uint32_t)((uint64_t)TICKS_PER_SECOND * accn * 10 / dt);
+				uint32_t g10 = (uint32_t)((uint64_t)TICKS_PER_SECOND * (uint32_t)(g_frame - gf0) * 10 / dt);
+				uint32_t m = posd_ms10(posd_acc_m68k, n), s = posd_ms10(posd_acc_snd, n);
+				uint32_t w = posd_ms10(posd_acc_wait, n);
+				uint32_t v = posd_ms10(posd_acc_draw - posd_acc_wait, n);
+				uint32_t a = posd_ms10(posd_acc_all, n);
+				// RDP clock 62.5 MHz = 62500 cycles/ms; per drawn frame
+				uint32_t p = (uint32_t)((uint64_t)acc_pipe * 10 / ((uint64_t)accn * 62500u));
+				uint32_t t = (uint32_t)((uint64_t)acc_tmem * 10 / ((uint64_t)accn * 62500u));
+				snprintf(lines[0], 32, "F %lu.%lu %lu.%lu", (unsigned long)(f10/10), (unsigned long)(f10%10),
+				         (unsigned long)(g10/10), (unsigned long)(g10%10));
+				snprintf(lines[1], 32, "M %lu.%lu S %lu.%lu", (unsigned long)(m/10), (unsigned long)(m%10),
+				         (unsigned long)(s/10), (unsigned long)(s%10));
+				snprintf(lines[2], 32, "V %lu.%lu W %lu.%lu", (unsigned long)(v/10), (unsigned long)(v%10),
+				         (unsigned long)(w/10), (unsigned long)(w%10));
+				// X = frame time not covered by M/S/V/W (events, input poll,
+				// interrupt handlers, anything else in the loop)
+				uint32_t mx = m + s + v + w, x = a > mx ? a - mx : 0;
+				snprintf(lines[3], 32, "A %lu.%lu", (unsigned long)(a/10), (unsigned long)(a%10));
+				snprintf(lines[4], 32, "X %lu.%lu", (unsigned long)(x/10), (unsigned long)(x%10));
+				snprintf(lines[5], 32, "P %lu.%lu T %lu.%lu", (unsigned long)(p/10), (unsigned long)(p%10),
+				         (unsigned long)(t/10), (unsigned long)(t%10));
+				posd_render(lines, 6);
+				plat_log("[PERFOSD] f=%d f10=%lu g10=%lu m=%lu s=%lu v=%lu w=%lu a=%lu x=%lu p=%lu t=%lu\n",
+				         g_frame, (unsigned long)f10, (unsigned long)g10, (unsigned long)m,
+				         (unsigned long)s, (unsigned long)v, (unsigned long)w, (unsigned long)a,
+				         (unsigned long)x, (unsigned long)p, (unsigned long)t);
+			}
+			tick0 = now; gf0 = g_frame; accn = 0;
+			acc_pipe = acc_tmem = 0;
+			posd_acc_all = posd_acc_m68k = posd_acc_snd = posd_acc_draw = posd_acc_wait = 0;
+			posd_acc_n = 0;
+		}
+		if (posd_cur >= 0) {
+			rdpq_set_mode_copy(true);
+			rdpq_tex_blit(&posd_surf[posd_cur], 8, 64, NULL);   // below the HUD
+		}
+	}
+	plat_detach_show();
 #else
-	rdpq_detach_show();
+	plat_detach_show();
 #endif
 }

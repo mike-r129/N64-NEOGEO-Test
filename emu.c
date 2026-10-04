@@ -631,6 +631,12 @@ int main(int argc, char *argv[]) {
 
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());
+		#ifdef MVS64_PERFOSD
+		{
+			extern void plat_perf_frame(uint32_t all, uint32_t m68k, uint32_t snd, uint32_t draw);
+			plat_perf_frame(emu_time, profile_m68k, profile_snd, render_time);
+		}
+		#endif
 
 		framef("[PROFILE] cpu:%.2f%% m68k:%.2f%% snd:%.2f%% io:%.2f%% draw:%.2f%% dma:%.2f%% PC:%06lx\n",
 			(float)emu_time * 100.f / (float)(TICKS_PER_SECOND / 60),
@@ -778,6 +784,28 @@ int main(int argc, char *argv[]) {
 			extern uint32_t perf_draw_wait, perf_draw_issue, perf_draw_end;
 			extern uint32_t perf_snd_pub;
 			const uint32_t fb = TICKS_PER_SECOND / 60 / 10000;  // ticks per 0.01%
+			{
+				// Trap histogram by 64KB page and direction (hw_n64.S):
+				// zeroed at the fight-era frame 2400, dumped at 6600 as
+				// traps per frame x100.
+				extern uint32_t perf_trap_hist[512];
+				extern uint32_t perf_trap_ring[2048], perf_trap_ring_n;
+				if (g_frame == 2400) {
+					memset(perf_trap_hist, 0, sizeof(uint32_t) * 512);
+					perf_trap_ring_n = 0;
+				}
+				if (g_frame == 6600) {
+					for (uint32_t i = 0; i < perf_trap_ring_n; i++)
+						debugf("[TRAPS] epc=%08lx pc=%06lx\n",
+						       (unsigned long)perf_trap_ring[2*i],
+						       (unsigned long)(perf_trap_ring[2*i+1] & 0xFFFFFF));
+					for (int i = 0; i < 512; i++)
+						if (perf_trap_hist[i])
+							debugf("[TRAPH] %s page=%02x per_frame_x100=%lu\n",
+							       i >= 256 ? "W" : "R", i & 255,
+							       (unsigned long)(perf_trap_hist[i] * 100UL / 4200));
+				}
+			}
 			framef("[PERF] insns=%lu skips=%lu tlb=%lu slices=%lu dwait=%lu dissue=%lu dend=%lu pub=%lu\n",
 				(unsigned long)perf_m68k_insns,
 				(unsigned long)perf_idle_skips,

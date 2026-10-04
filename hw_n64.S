@@ -40,6 +40,15 @@
 # Per-frame TLB-exception count (read+reset by emu.c's [PERF] print).
 	.globl perf_tlb_faults
 perf_tlb_faults: .long 0
+	.globl perf_trap_ring_n
+perf_trap_ring_n: .long 0
+	.section .bss
+	.balign 8
+	.globl perf_trap_hist
+perf_trap_hist: .space 512*4
+	.globl perf_trap_ring
+perf_trap_ring: .space 1024*8
+	.section .sdata
 #endif
 
 	.set noreorder
@@ -89,6 +98,49 @@ tlbcallhandler:
 	sd $1,   4*8(sp)   # at
 	sd $14, 17*8(sp)   # t6 (all stores by m64k are made with this register)
 	sd $31, 21*8(sp)   # ra (this allows backtracing to work corretly across TLB miss exceptions)
+#ifdef MVS64_PERFCOUNT
+	# Trap histogram (emu.c [TRAPH]): perf_trap_hist[rw*256 + (addr>>16)],
+	# rw = opcode bit 3 (stores). v0 parked in arg slot 0 (no call yet).
+	sd $2, 0(sp)
+	srl $1, k1, 14
+	andi $1, 0x3FC
+	srl $2, k0, 29
+	andi $2, 1
+	sll $2, 10
+	addu $1, $2
+	la $2, perf_trap_hist
+	addu $1, $2
+	lw $2, 0($1)
+	addiu $2, 1
+	sw $2, 0($1)
+	# Sample ring ([TRAPS]): the first 1024 LSPC-page (0x3Cxxxx) store traps
+	# after a reset, as (host EPC, m_pc) pairs - which interpreter path and
+	# which guest code still trap. v1 parked in arg slot 1.
+	srl $1, k1, 16
+	xori $1, $1, 0x3C
+	bnez $1, 9f
+	 nop
+	srl $1, k0, 29
+	andi $1, $1, 1
+	beqz $1, 9f
+	 nop
+	sd $3, 8(sp)
+	la $1, perf_trap_ring_n
+	lw $2, 0($1)
+	sltiu $3, $2, 1024
+	beqz $3, 8f
+	 addiu $3, $2, 1
+	sw $3, 0($1)
+	sll $2, $2, 3
+	la $1, perf_trap_ring
+	addu $1, $1, $2
+	mfc0 $2, C0_EPC
+	nop
+	sw $2, 0($1)
+	sw t5, 4($1)
+8:	ld $3, 8(sp)
+9:	ld $2, 0(sp)
+#endif
 	.set at            # we can use assembly macros now to simplify our job
 
 	# Check whether the opcode is SWL or SWR. These are used by m64k to
