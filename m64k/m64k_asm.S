@@ -66,6 +66,18 @@ m64k_idle_pagemask:
 #else
     .long 0x30008001
 #endif
+#ifdef M64K_PORTSTORE
+# port_store_check base: the mapped (sign-extended by lw) LSPC port address.
+# OFF twin = 1: mapped pointers are even and >= 0xFF000000, so nothing
+# matches and every port store traps as before (layout-identical).
+    .globl m64k_port_base
+m64k_port_base:
+#ifdef MVS64_PORTSTORE_OFF
+    .long 1
+#else
+    .long 0xFF3C0000
+#endif
+#endif
 #ifdef MVS64_PERFCOUNT
 # Per-frame diagnostic counters (read+reset by emu.c's [PERF] print):
 # executed 68k instructions and idle-skip fires. Diagnostic builds only —
@@ -390,6 +402,23 @@ opshiftsmem:
         .error "sh_m68k: register used to store into m68k memory must be 'result'"
     .endif
     sh result, 0(\address)
+.endm
+
+# "port_store_check" (game builds, M64K_PORTSTORE): placed right before the
+# sh_m68k of the hottest MOVE.w-to-memory fast paths, after their cycle
+# charge and flag update. A mapped address equal to the LSPC VRAM address /
+# data / modulo port (0x3C0000/2/4) branches to m64k_port_store, which
+# performs the hw_n64.S asm_lspc_vram_*_w update inline instead of taking
+# the TLB trap (~100 cycles each, ~1k per fight frame). Every other address,
+# the 0x3C0006+ registers and the mirrors included, stores (and traps) as
+# before. t1/t2 are dead at every use site. m64k_port_base: see .sdata.
+.macro port_store_check
+#ifdef M64K_PORTSTORE
+    lw t1, %gprel(m64k_port_base)(gp)
+    xor t1, eaptr, t1
+    sltiu t2, t1, 6
+    bnez t2, m64k_port_store
+#endif
 .endm
 
 .macro sb_m68k reg, address
@@ -2922,6 +2951,7 @@ movew_f_dst_an:                        # move.w Dn,(An)  (8 cycles)
     move flag_zc, result
     sll flag_nv, result, 16
     use_cycles 8
+    port_store_check
     sh_m68k result, eaptr
     dispatch_next
 
@@ -2957,6 +2987,7 @@ movew_f_dst_d16:                       # move.w Dn,(d16,An)  (12 cycles)
     move flag_zc, result
     sll flag_nv, result, 16
     use_cycles 12
+    port_store_check
     sh_m68k result, eaptr
     dispatch_next
 
@@ -2986,6 +3017,7 @@ movew_fsrc_other:
     move flag_zc, result
     sll flag_nv, result, 16
     use_cycles 12
+    port_store_check
     sh_m68k result, eaptr
     dispatch_next
 
@@ -3023,8 +3055,43 @@ movew_fsrc_anp:
     move flag_zc, result
     sll flag_nv, result, 16
     use_cycles 4
+    port_store_check
     sh_m68k result, eaptr
     dispatch_next
+#ifdef M64K_PORTSTORE
+# port_store_check target: t1 = port offset (0 address, 2 data, 4 modulo),
+# result = the value the trapping sh would have stored (hw_n64.S `value`).
+# Same updates, in the same order, as asm_lspc_vram_{data,addr,modulo}_w.
+m64k_port_store:
+    xori t2, t1, 2
+    bnez t2, 1f
+    lhu t1, %gprel(reg_vram_addr)(gp)  # ---- data port (hottest) ----
+    lw t2, %gprel(reg_vram_bank)(gp)
+    addu t2, t1
+    addu t2, t1
+    sh result, 0(t2)
+    lhu t2, %gprel(reg_vram_mod)(gp)
+    addu t1, t2
+    lhu t2, %gprel(reg_vram_mask)(gp)
+    and t1, t2
+    sh t1, %gprel(reg_vram_addr)(gp)
+    dispatch_next
+1:  bnez t1, 4f                        # ---- address port ----
+    andi t2, result, 0x8000
+    bnez t2, 2f
+    la t2, VIDEO_RAM
+    li t1, 0x7FFF
+    j 3f
+2:  la t2, VIDEO_RAM + 0x8000*2
+    li t1, 0x7FF
+3:  sw t2, %gprel(reg_vram_bank)(gp)
+    sh t1, %gprel(reg_vram_mask)(gp)
+    and t1, result
+    sh t1, %gprel(reg_vram_addr)(gp)
+    dispatch_next
+4:  sh result, %gprel(reg_vram_mod)(gp)  # ---- modulo port ----
+    dispatch_next
+#endif
 movew_fanp_dn:                         # ---- move.w (An)+,Dn  (8 cycles) ----
     andi t1, opcode, 7
     sll t1, 2

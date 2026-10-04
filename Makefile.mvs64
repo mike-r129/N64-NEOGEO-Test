@@ -33,6 +33,14 @@ CFLAGS += -DM64K_BLOCKOPS
 ASFLAGS += -DM64K_BLOCKOPS
 N64_ASFLAGS += -DM64K_BLOCKOPS
 endif
+# Inline LSPC VRAM-port stores in the hot MOVE.w fast paths (m64k_asm.S
+# port_store_check): the 0x3C0000/2/4 writes skip the TLB trap. Game builds
+# only (references lspc.c's reg_vram_* and VIDEO_RAM). PORTSTORE_OFF=1
+# compiles it out; -DMVS64_PORTSTORE_OFF is the layout-identical twin.
+ifndef PORTSTORE_OFF
+ASFLAGS += -DM64K_PORTSTORE
+N64_ASFLAGS += -DM64K_PORTSTORE
+endif
 # m64k inline fast paths for the profile-dominant opcode forms (Bcc condition
 # dispatch, hot MOVE.b/.w forms, TST.b/.w (d16,An)) — testsuite-covered (the
 # standalone m64k testsuite build enables the same define). Disable with
