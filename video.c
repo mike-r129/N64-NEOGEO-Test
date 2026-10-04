@@ -90,6 +90,9 @@ static uint32_t perf_uniq_gen;
 uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix, perf_dr_wwait, perf_dr_missticks;
 uint32_t perf_dr_cache, perf_dr_rspq, perf_dr_tiles;
 #endif
+// Drawn tiles by RDP path (the ucode modal test, rsp_video.S): G = COPY
+// mode (full 16x16, no flip, no x-clip), H = would be COPY but flipped.
+uint32_t perf_dr_copyt, perf_dr_flipt;
 #define DRAW_PERF_COARSE 1
 #endif
 
@@ -451,6 +454,15 @@ void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int 
 		}
 #ifdef DRAW_PERF_COARSE
 		perf_dr_tiles++;
+		{   // same predicate as the ucode's modal test (cmd_sprite_draw)
+			int x = ((int32_t)(w1 << 20)) >> 20, y = ((int32_t)(w1 << 8)) >> 20;
+			if (x >= 512-16) x -= 512;
+			if (y >= 512-16) y -= 512;
+			if ((w1 >> 24) == 0xFF && x >= 0 && x <= 304 && y >= -15 && y <= 223) {
+				if (w0 & (3u << 28)) perf_dr_flipt++;
+				else perf_dr_copyt++;
+			}
+		}
 #endif
 #ifdef DRAW_PERF
 		sprite_consume_p0(tnum, w0, w1);

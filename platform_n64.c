@@ -655,7 +655,7 @@ static surface_t *fbcrc_disp;
 //   B bb     PIPE_BUSY as % of DP_CLOCK (RDP duty cycle)
 // Glyphs: 4x6 bitmap font drawn 2x through the uncached segment onto the
 // finished frame (detach_wait first), top-left corner.
-static const uint8_t dpcosd_font[30][6] = {
+static const uint8_t dpcosd_font[32][6] = {
 	{0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, // 0 1
 	{0x6,0x9,0x1,0x2,0x4,0xF}, {0xE,0x1,0x6,0x1,0x1,0xE}, // 2 3
 	{0x2,0x6,0xA,0xF,0x2,0x2}, {0xF,0x8,0xE,0x1,0x1,0xE}, // 4 5
@@ -672,7 +672,8 @@ static const uint8_t dpcosd_font[30][6] = {
 	{0x9,0xF,0xF,0x9,0x9,0x9}, {0x9,0x9,0x9,0x9,0x6,0x6}, // M V
 	{0x6,0x9,0x9,0xF,0x9,0x9}, {0x9,0x9,0x6,0x6,0x9,0x9}, // A X
 	{0xF,0x8,0xE,0x8,0x8,0xF}, {0x9,0xD,0xD,0xB,0xB,0x9}, // E N
-	{0x6,0x9,0x9,0x9,0xA,0x5},                            // Q
+	{0x6,0x9,0x9,0x9,0xA,0x5}, {0x6,0x9,0x8,0xB,0x9,0x7}, // Q G
+	{0x9,0x9,0xF,0x9,0x9,0x9},                            // H
 };
 static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s) {
 	for (; *s; s++, x += 10) {
@@ -697,6 +698,8 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 		else if (*s == 'E') g = 27;
 		else if (*s == 'N') g = 28;
 		else if (*s == 'Q') g = 29;
+		else if (*s == 'G') g = 30;
+		else if (*s == 'H') g = 31;
 		else continue;
 		for (int r = 0; r < 6; r++) {
 			uint8_t bits = dpcosd_font[g][r];
@@ -733,12 +736,15 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 //                 command issue (incl. flushes); the walk is R - Q - E
 //   C cc.c N nnn  inside Q: C-ROM tile-cache miss reads from the cart;
 //                 sprite tiles drawn per frame
+//   G ggg H hhh   drawn tiles per frame in RDP COPY mode, and tiles that
+//                 would be COPY but are flipped (the rest of N is 1-cycle:
+//                 shrunk, x-clipped or flipped partial tiles)
 //   A aa.a X xx.x whole guest frame ms (CPU wall time incl. all waits), and
 //                 A minus M+S+V+W: the part no other line accounts for
 //   P pp.p T tt.t RDP pipe-busy / TMEM-busy ms per drawn frame (DPC
 //                 counters; real hardware only, ares reads 0)
 #define POSD_W 160
-#define POSD_H 132
+#define POSD_H 146
 static surface_t posd_surf[2];
 static int posd_cur = -1;
 static uint32_t posd_wait;          // ticks in display_get, current guest frame
@@ -747,18 +753,19 @@ static uint32_t posd_acc_n;
 // Draw split (video.c DRAW_PERF_COARSE): render_begin, sprites (incl. the
 // RSP walk wait and C-ROM miss reads), fix layer.
 static uint32_t posd_acc_beg, posd_acc_spr, posd_acc_fix, posd_acc_walk, posd_acc_miss;
-static uint32_t posd_acc_look, posd_acc_emit, posd_acc_tiles;
+static uint32_t posd_acc_look, posd_acc_emit, posd_acc_tiles, posd_acc_copyt, posd_acc_flipt;
 // emu.c main loop, once per guest frame.
 void plat_perf_frame(uint32_t all, uint32_t m68k, uint32_t snd, uint32_t draw) {
 	extern uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix, perf_dr_wwait, perf_dr_missticks;
-	extern uint32_t perf_dr_cache, perf_dr_rspq, perf_dr_tiles;
+	extern uint32_t perf_dr_cache, perf_dr_rspq, perf_dr_tiles, perf_dr_copyt, perf_dr_flipt;
 	posd_acc_all += all; posd_acc_m68k += m68k; posd_acc_snd += snd;
 	posd_acc_draw += draw; posd_acc_wait += posd_wait;
 	posd_acc_beg += perf_dr_begin; posd_acc_spr += perf_dr_sprites; posd_acc_fix += perf_dr_fix;
 	posd_acc_walk += perf_dr_wwait; posd_acc_miss += perf_dr_missticks;
 	posd_acc_look += perf_dr_cache; posd_acc_emit += perf_dr_rspq; posd_acc_tiles += perf_dr_tiles;
+	posd_acc_copyt += perf_dr_copyt; posd_acc_flipt += perf_dr_flipt;
 	perf_dr_begin = perf_dr_sprites = perf_dr_fix = perf_dr_wwait = perf_dr_missticks = 0;
-	perf_dr_cache = perf_dr_rspq = perf_dr_tiles = 0;
+	perf_dr_cache = perf_dr_rspq = perf_dr_tiles = perf_dr_copyt = perf_dr_flipt = 0;
 	posd_wait = 0;
 	posd_acc_n++;
 }
@@ -1017,7 +1024,7 @@ void plat_endframe(void) {
 		extern int g_frame;
 		static uint32_t tick0, pipe0, tmem0, acc_pipe, acc_tmem;
 		static int accn, gf0;
-		static char lines[9][32];
+		static char lines[10][32];
 		// DPC counters are 24-bit at 62.5 MHz (wrap every ~0.27 s):
 		// accumulate per-frame deltas. Read without draining, so a delta
 		// covers whatever the RDP finished since the last read.
@@ -1062,10 +1069,11 @@ void plat_endframe(void) {
 				uint32_t q = posd_ms10(posd_acc_look, n), e = posd_ms10(posd_acc_emit, n);
 				snprintf(lines[5], 32, "Q %lu.%lu E %lu.%lu", POSD_MS(q), POSD_MS(e));
 				snprintf(lines[6], 32, "C %lu.%lu N %lu", POSD_MS(c), (unsigned long)(posd_acc_tiles / n));
-				snprintf(lines[7], 32, "A %lu.%lu X %lu.%lu", POSD_MS(a), POSD_MS(x));
-				snprintf(lines[8], 32, "P %lu.%lu T %lu.%lu", POSD_MS(p), POSD_MS(t));
+				snprintf(lines[7], 32, "G %lu H %lu", (unsigned long)(posd_acc_copyt / n), (unsigned long)(posd_acc_flipt / n));
+				snprintf(lines[8], 32, "A %lu.%lu X %lu.%lu", POSD_MS(a), POSD_MS(x));
+				snprintf(lines[9], 32, "P %lu.%lu T %lu.%lu", POSD_MS(p), POSD_MS(t));
 				#undef POSD_MS
-				posd_render(lines, 9);
+				posd_render(lines, 10);
 				static bool mem_logged;
 				if (!mem_logged) {   // RDRAM left above the heap (sizes the caches)
 					extern void *sbrk(intptr_t);
@@ -1074,19 +1082,20 @@ void plat_endframe(void) {
 					         (int)((char *)0x80000000 + get_memory_size() - top));
 					mem_logged = true;
 				}
-				plat_log("[PERFOSD] f=%d f10=%lu g10=%lu m=%lu s=%lu v=%lu w=%lu a=%lu x=%lu p=%lu t=%lu b=%lu r=%lu l=%lu k=%lu c=%lu q=%lu e=%lu n=%lu\n",
+				plat_log("[PERFOSD] f=%d f10=%lu g10=%lu m=%lu s=%lu v=%lu w=%lu a=%lu x=%lu p=%lu t=%lu b=%lu r=%lu l=%lu k=%lu c=%lu q=%lu e=%lu n=%lu g=%lu h=%lu\n",
 				         g_frame, (unsigned long)f10, (unsigned long)g10, (unsigned long)m,
 				         (unsigned long)s, (unsigned long)v, (unsigned long)w, (unsigned long)a,
 				         (unsigned long)x, (unsigned long)p, (unsigned long)t,
 				         (unsigned long)b, (unsigned long)r, (unsigned long)l,
 				         (unsigned long)k, (unsigned long)c, (unsigned long)q,
-				         (unsigned long)e, (unsigned long)(posd_acc_tiles / n));
+				         (unsigned long)e, (unsigned long)(posd_acc_tiles / n),
+				         (unsigned long)(posd_acc_copyt / n), (unsigned long)(posd_acc_flipt / n));
 			}
 			tick0 = now; gf0 = g_frame; accn = 0;
 			acc_pipe = acc_tmem = 0;
 			posd_acc_all = posd_acc_m68k = posd_acc_snd = posd_acc_draw = posd_acc_wait = 0;
 			posd_acc_beg = posd_acc_spr = posd_acc_fix = posd_acc_walk = posd_acc_miss = 0;
-			posd_acc_look = posd_acc_emit = posd_acc_tiles = 0;
+			posd_acc_look = posd_acc_emit = posd_acc_tiles = posd_acc_copyt = posd_acc_flipt = 0;
 			posd_acc_n = 0;
 		}
 		if (posd_cur >= 0) {
