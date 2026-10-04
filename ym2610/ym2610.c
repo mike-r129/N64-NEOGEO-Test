@@ -3261,15 +3261,63 @@ static int rspwp_dead2;   /* tentative; defined with the WP section below */
 /* Stage the source bytes one channel will consume this chunk: the bytes at
  * the even addresses in [now_addr, now_addr+nib-1], i.e. byte addresses
  * starting at (now_addr+1)>>1. Returns the byte count. */
+/* mvs64_stage_bulk: copy each run that lies inside the resident image or the
+ * current window with one memcpy instead of a per-byte fetch. The first byte
+ * of every run still goes through ym2610_vrom_fetch, so window refills happen
+ * at exactly the same addresses as the per-byte loop. -DMVS64_STAGEBULK_OFF
+ * builds the OFF twin; -DMVS64_STAGE_VERIFY checks every staged run against
+ * a direct vrom_read ([STAGEV] counts). */
+#ifdef MVS64_STAGEBULK_OFF
+int mvs64_stage_bulk __attribute__((section(".data"))) = 0;
+#else
+int mvs64_stage_bulk __attribute__((section(".data"))) = 1;
+#endif
+#ifdef MVS64_STAGE_VERIFY
+void vrom_read(uint32_t offset, uint8_t *buf, int len);
+unsigned long stagev_runs, stagev_bad;
+#endif
 static u32 rspa_stage(int win, u32 now_addr, u32 nib, u8 *dst,
 		const u8 *resident, u32 size) {
 	u32 a0b = (now_addr + 1) >> 1;
 	u32 cnt = nib ? ((now_addr + nib + 1) >> 1) - a0b : 0;
 	u32 k;
-	for (k = 0; k < cnt; k++) {
-		u32 a = a0b + k;
-		dst[k] = (a < size) ? (resident ? resident[a]
-		                                : ym2610_vrom_fetch(win, a)) : 0;
+	if (mvs64_stage_bulk) {
+		k = 0;
+		while (k < cnt) {
+			u32 a = a0b + k, n;
+			if (a >= size) { dst[k++] = 0; continue; }
+			if (resident) {
+				n = size - a;
+				if (n > cnt - k) n = cnt - k;
+				memcpy(dst + k, resident + a, n);
+			} else {
+				struct ym2610_vwin *w = &ym2610_vwin[win];
+				dst[k] = ym2610_vrom_fetch(win, a);  /* refills on a miss */
+				if (w->valid && w->base == (a & ~(u32)(YM2610_VWIN_SIZE - 1))) {
+					n = w->base + YM2610_VWIN_SIZE - a;
+					if (n > size - a) n = size - a;
+					if (n > cnt - k) n = cnt - k;
+					memcpy(dst + k, w->buf + (a - w->base), n);
+				} else {
+					n = 1;   /* fetch_slow had nothing to load */
+				}
+#ifdef MVS64_STAGE_VERIFY
+				{
+					static u8 vbuf[YM2610_VWIN_SIZE];
+					vrom_read(a, vbuf, (int)n);
+					stagev_runs++;
+					if (memcmp(vbuf, dst + k, n)) stagev_bad++;
+				}
+#endif
+			}
+			k += n;
+		}
+	} else {
+		for (k = 0; k < cnt; k++) {
+			u32 a = a0b + k;
+			dst[k] = (a < size) ? (resident ? resident[a]
+			                                : ym2610_vrom_fetch(win, a)) : 0;
+		}
 	}
 	if (cnt)
 		data_cache_hit_writeback(dst, (cnt + 15) & ~(u32)15);

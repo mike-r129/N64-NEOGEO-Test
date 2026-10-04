@@ -822,6 +822,12 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 				(unsigned long)(g_prof_gen / (TICKS_PER_SECOND / 1000)),
 				g_cmd_lost, ym_timer_on[0], ym_timer_on[1],
 				g_irq_redeliver, g_nmi_precap, g_nmi_postcap);
+#ifdef MVS64_STAGE_VERIFY
+			{
+				extern unsigned long stagev_runs, stagev_bad;
+				plat_log("[STAGEV] runs=%lu bad=%lu\n", stagev_runs, stagev_bad);
+			}
+#endif
 #ifdef MVS64_Z80WARM
 			// ticks are COUNT (cpu/2): host cyc/step = 2*ticks/steps
 			plat_log("[Z80WARM] seg=%lu cold=%lu/%lu warm=%lu/%lu cyc/step cold=%lu warm=%lu\n",
