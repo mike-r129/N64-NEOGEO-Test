@@ -1066,6 +1066,14 @@ void plat_endframe(void) {
 				snprintf(lines[8], 32, "P %lu.%lu T %lu.%lu", POSD_MS(p), POSD_MS(t));
 				#undef POSD_MS
 				posd_render(lines, 9);
+				static bool mem_logged;
+				if (!mem_logged) {   // RDRAM left above the heap (sizes the caches)
+					extern void *sbrk(intptr_t);
+					char *top = (char *)sbrk(0);
+					plat_log("[PERFOSD-MEM] ram=%d heaptop=%p free=%d\n", get_memory_size(), top,
+					         (int)((char *)0x80000000 + get_memory_size() - top));
+					mem_logged = true;
+				}
 				plat_log("[PERFOSD] f=%d f10=%lu g10=%lu m=%lu s=%lu v=%lu w=%lu a=%lu x=%lu p=%lu t=%lu b=%lu r=%lu l=%lu k=%lu c=%lu q=%lu e=%lu n=%lu\n",
 				         g_frame, (unsigned long)f10, (unsigned long)g10, (unsigned long)m,
 				         (unsigned long)s, (unsigned long)v, (unsigned long)w, (unsigned long)a,
