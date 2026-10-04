@@ -654,7 +654,7 @@ static surface_t *fbcrc_disp;
 //   B bb     PIPE_BUSY as % of DP_CLOCK (RDP duty cycle)
 // Glyphs: 4x6 bitmap font drawn 2x through the uncached segment onto the
 // finished frame (detach_wait first), top-left corner.
-static const uint8_t dpcosd_font[26][6] = {
+static const uint8_t dpcosd_font[27][6] = {
 	{0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, // 0 1
 	{0x6,0x9,0x1,0x2,0x4,0xF}, {0xE,0x1,0x6,0x1,0x1,0xE}, // 2 3
 	{0x2,0x6,0xA,0xF,0x2,0x2}, {0xF,0x8,0xE,0x1,0x1,0xE}, // 4 5
@@ -669,7 +669,7 @@ static const uint8_t dpcosd_font[26][6] = {
 	{0x8,0x8,0x8,0x8,0x8,0xF}, {0x6,0x9,0x8,0x8,0x9,0x6}, // L C
 	{0x9,0x9,0x9,0xF,0xF,0x9},                            // W
 	{0x9,0xF,0xF,0x9,0x9,0x9}, {0x9,0x9,0x9,0x9,0x6,0x6}, // M V
-	{0x6,0x9,0x9,0xF,0x9,0x9},                            // A
+	{0x6,0x9,0x9,0xF,0x9,0x9}, {0x9,0x9,0x6,0x6,0x9,0x9}, // A X
 };
 static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s) {
 	for (; *s; s++, x += 10) {
@@ -690,6 +690,7 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 		else if (*s == 'M') g = 23;
 		else if (*s == 'V') g = 24;
 		else if (*s == 'A') g = 25;
+		else if (*s == 'X') g = 26;
 		else continue;
 		for (int r = 0; r < 6; r++) {
 			uint8_t bits = dpcosd_font[g][r];
@@ -719,10 +720,11 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 //                 buffer (= the RSP/RDP still finishing older frames: the
 //                 frame is RDP-bound when W is large)
 //   A aa.a        whole guest frame ms (CPU wall time incl. all waits)
+//   X xx.x        A minus M+S+V+W: the part no other line accounts for
 //   P pp.p T tt.t RDP pipe-busy / TMEM-busy ms per drawn frame (DPC
 //                 counters; real hardware only, ares reads 0)
 #define POSD_W 160
-#define POSD_H 72
+#define POSD_H 88
 static surface_t posd_surf[2];
 static int posd_cur = -1;
 static uint32_t posd_wait;          // ticks in display_get, current guest frame
@@ -742,9 +744,12 @@ static void posd_render(char lines[][32], int nlines) {
 	int nxt = posd_cur < 0 ? 0 : posd_cur ^ 1;
 	surface_t *s = &posd_surf[nxt];
 	if (!s->buffer) *s = surface_alloc(FMT_RGBA16, POSD_W, POSD_H);
-	memset(s->buffer, 0, s->stride * POSD_H);   // alpha bit 0 = transparent
+	{   // opaque black backdrop (RGBA5551 0x0001: alpha bit set) for legibility
+		uint16_t *px = (uint16_t *)s->buffer;
+		for (int i = 0; i < s->stride / 2 * POSD_H; i++) px[i] = 0x0001;
+	}
 	for (int i = 0; i < nlines; i++)
-		dpcosd_text((uint16_t *)s->buffer, s->stride / 2, 0, i * 14, lines[i]);
+		dpcosd_text((uint16_t *)s->buffer, s->stride / 2, 4, 4 + i * 14, lines[i]);
 	data_cache_hit_writeback(s->buffer, s->stride * POSD_H);
 	posd_cur = nxt;
 }
@@ -925,7 +930,7 @@ void plat_endframe(void) {
 		extern int g_frame;
 		static uint32_t tick0, pipe0, tmem0, acc_pipe, acc_tmem;
 		static int accn, gf0;
-		static char lines[5][32];
+		static char lines[6][32];
 		// DPC counters are 24-bit at 62.5 MHz (wrap every ~0.27 s):
 		// accumulate per-frame deltas. Read without draining, so a delta
 		// covers whatever the RDP finished since the last read.
@@ -958,14 +963,18 @@ void plat_endframe(void) {
 				         (unsigned long)(s/10), (unsigned long)(s%10));
 				snprintf(lines[2], 32, "V %lu.%lu W %lu.%lu", (unsigned long)(v/10), (unsigned long)(v%10),
 				         (unsigned long)(w/10), (unsigned long)(w%10));
+				// X = frame time not covered by M/S/V/W (events, input poll,
+				// interrupt handlers, anything else in the loop)
+				uint32_t mx = m + s + v + w, x = a > mx ? a - mx : 0;
 				snprintf(lines[3], 32, "A %lu.%lu", (unsigned long)(a/10), (unsigned long)(a%10));
-				snprintf(lines[4], 32, "P %lu.%lu T %lu.%lu", (unsigned long)(p/10), (unsigned long)(p%10),
+				snprintf(lines[4], 32, "X %lu.%lu", (unsigned long)(x/10), (unsigned long)(x%10));
+				snprintf(lines[5], 32, "P %lu.%lu T %lu.%lu", (unsigned long)(p/10), (unsigned long)(p%10),
 				         (unsigned long)(t/10), (unsigned long)(t%10));
-				posd_render(lines, 5);
-				plat_log("[PERFOSD] f=%d f10=%lu g10=%lu m=%lu s=%lu v=%lu w=%lu a=%lu p=%lu t=%lu\n",
+				posd_render(lines, 6);
+				plat_log("[PERFOSD] f=%d f10=%lu g10=%lu m=%lu s=%lu v=%lu w=%lu a=%lu x=%lu p=%lu t=%lu\n",
 				         g_frame, (unsigned long)f10, (unsigned long)g10, (unsigned long)m,
 				         (unsigned long)s, (unsigned long)v, (unsigned long)w, (unsigned long)a,
-				         (unsigned long)p, (unsigned long)t);
+				         (unsigned long)x, (unsigned long)p, (unsigned long)t);
 			}
 			tick0 = now; gf0 = g_frame; accn = 0;
 			acc_pipe = acc_tmem = 0;
@@ -974,7 +983,7 @@ void plat_endframe(void) {
 		}
 		if (posd_cur >= 0) {
 			rdpq_set_mode_copy(true);
-			rdpq_tex_blit(&posd_surf[posd_cur], 8, 8, NULL);
+			rdpq_tex_blit(&posd_surf[posd_cur], 8, 64, NULL);   // below the HUD
 		}
 	}
 	rdpq_detach_show();
