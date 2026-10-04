@@ -174,7 +174,20 @@ static void render_fix(void) {
 
 
 static inline void sprite_consume_begin(void);
-static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1);
+// Forced inline: as a call (GCC kept it out of line) every drawn tile paid
+// ~35 instructions of spills/reloads and prologue, and re-read the CDT
+// context and the knobs from memory. Callers read the knobs once into
+// locals and pass them in (cdt = mvs64_cdt_enable, two = mvs64_spr2w).
+static inline __attribute__((always_inline))
+void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two);
+#ifdef N64
+extern int mvs64_cdt_enable;
+#define WALK_KNOB_CDT mvs64_cdt_enable
+#define WALK_KNOB_2W  mvs64_spr2w
+#else
+#define WALK_KNOB_CDT 0
+#define WALK_KNOB_2W  0
+#endif
 
 // Walk early-out for non-wrapping sprites (see sprite_walk_produce).
 // Runtime twin knob pinned to .data; MVS64_CULLFAST_OFF builds the OFF twin.
@@ -203,10 +216,13 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 	sprwalk_overflow = 0;
 	if (!recs) sprite_consume_begin();
-	// Per-render CDT context, local so the walk keeps it in registers
-	// (its address never escapes the inlined consume path).
-	CromResolveCtx cx;
-	crom_resolve_ctx(&cx);
+	// Per-render CDT context, local so the walk keeps it in registers: the
+	// copy's address never escapes the inlined consume path (cx0's does,
+	// into crom_resolve_ctx, which made GCC reload it after every store).
+	CromResolveCtx cx0;
+	crom_resolve_ctx(&cx0);
+	const CromResolveCtx cx = cx0;
+	const int k_cdt = WALK_KNOB_CDT, k_2w = WALK_KNOB_2W;
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -337,7 +353,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 							recs[nrec].w0 = w0;
 							recs[nrec].w1 = w1;
 						} else
-							sprite_consume_one(&cx, w0, w1);
+							sprite_consume_one(&cx, w0, w1, k_cdt, k_2w);
 						nrec++;
 					} else {
 						sprwalk_overflow++;
@@ -408,14 +424,15 @@ static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
 
 // Consume one record: identical tail of the historical loop — empty-tile
 // skip, then draw_sprite (cache side effects unchanged).
-static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
+static inline __attribute__((always_inline))
+void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two) {
 	uint32_t tnum = w0 & 0xFFFFF;
 
 #ifdef DRAW_PERF
 	perf_dr_recs++;
 #endif
 #ifdef N64
-	if (mvs64_cdt_enable) {
+	if (cdt) {
 		// Fused empty-test + resolve through the CROM direct table
 		// (roms.c crom_resolve): one sparse read per record. Same
 		// records, same order, same skip set => same draw stream.
@@ -438,7 +455,7 @@ static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uin
 #ifdef DRAW_PERF
 		sprite_consume_p0(tnum, w0, w1);
 #endif
-		if (mvs64_spr2w) {
+		if (two) {
 #ifdef DRAW_PERF_COARSE
 			uint32_t _r0 = TICKS_READ();
 #endif
@@ -487,10 +504,12 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 	}
 #endif
 	sprite_consume_begin();
-	CromResolveCtx cx;
-	crom_resolve_ctx(&cx);
+	CromResolveCtx cx0;
+	crom_resolve_ctx(&cx0);
+	const CromResolveCtx cx = cx0;
+	const int k_cdt = WALK_KNOB_CDT, k_2w = WALK_KNOB_2W;
 	for (int i=0;i<nrec;i++)
-		sprite_consume_one(&cx, recs[i].w0, recs[i].w1);
+		sprite_consume_one(&cx, recs[i].w0, recs[i].w1, k_cdt, k_2w);
 }
 
 #if defined(N64) && defined(MVS64_WALK_RSP)
