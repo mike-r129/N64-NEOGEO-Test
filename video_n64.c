@@ -1,5 +1,6 @@
 
 #include <libdragon.h>
+#include <string.h>
 
 #define RSP_FIX_LAYER    1
 #define RSP_SPRITES      1
@@ -13,12 +14,28 @@ static void rsp_fix_draw(uint8_t *src, int palnum, int x, int y) {
 	rspq_write(RSP_OVL_ID, 0x1, PhysicalAddr(src),
 		(palnum << 20) | (x << 10) | y);
 }
+// Flush the queue every N sprite commands (0 = never) so the RSP/RDP start
+// drawing while the CPU is still issuing the frame. rspq only hands commands
+// to the RSP on a flush; with libdragon's 2 KB lowpri buffers every buffer
+// switch flushed implicitly (~every 128 tiles), but with larger buffers
+// (MVS64_RSPQ_LOWPRI_WORDS) nothing flushed until render_end, serializing
+// CPU issue and RSP/RDP execution. Runtime twin knob pinned to .data.
+#ifndef MVS64_DRAW_FLUSH_EVERY
+#define MVS64_DRAW_FLUSH_EVERY 64
+#endif
+int mvs64_draw_flush_every __attribute__((section(".data"))) = MVS64_DRAW_FLUSH_EVERY;
+
 static void rsp_sprite_draw(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
+	static int since_flush;
 	assertf(sw <= 16 && sh <= 16, "sprite too large: %dx%d", sw, sh);
 	assertf(sw > 0 && sh > 0, "sprite too small: %dx%d", sw, sh);
 	rspq_write(RSP_OVL_ID, 0x2, PhysicalAddr(src),
 		(palnum << 24) | ((x0 & 0xFFF) << 12) | (y0 & 0xFFF),
 		(sw-1) | ((sh-1) << 4) | (flipx ? 0x100 : 0) | (flipy ? 0x200 : 0));
+	if (mvs64_draw_flush_every && ++since_flush >= mvs64_draw_flush_every) {
+		since_flush = 0;
+		rspq_flush();
+	}
 }
 static void rsp_pal_convert(uint16_t *src, uint16_t *dst) {
 	rspq_write(RSP_OVL_ID, 0x3, PhysicalAddr(src), PhysicalAddr(dst));
@@ -431,12 +448,23 @@ static void render_begin(void) {
 	// Reconvert the palette only when it changed since the last frame
 	// (writes via the asm/C MMIO handlers or a bank switch set the flag).
 	// PALETTE_RAM_EMU persists in RDRAM between frames otherwise.
+	//
+	// The RSP converts from a SNAPSHOT, not from the live PALETTE_RAM: the
+	// pal_convert commands can sit behind the previous pump's highpri audio
+	// burst while the 68k already runs the next frame and writes the live
+	// palette (dirty lines can reach RDRAM before the RSP DMAs them), which
+	// would show a palette one frame early on fades. Only the small default
+	// rspq buffer used to hide this, by forcing the CPU to wait. pal_snap is
+	// rewritten only here, after display_get proved the previous frame's
+	// commands complete (2 display buffers).
 	extern uint8_t mvs64_palette_dirty;
+	static uint16_t pal_snap[4096] __attribute__((aligned(16)));
 	if (mvs64_palette_dirty) {
 		mvs64_palette_dirty = 0;
-		data_cache_hit_writeback(PALETTE_RAM + PALETTE_RAM_BANK, 4096*2);
+		memcpy(pal_snap, PALETTE_RAM + PALETTE_RAM_BANK, sizeof(pal_snap));
+		data_cache_hit_writeback(pal_snap, sizeof(pal_snap));
 		for (int i=0; i<4096 / 0x400; i++) {
-			rsp_pal_convert(PALETTE_RAM + PALETTE_RAM_BANK + i*0x400, PALETTE_RAM_EMU + i*0x400);
+			rsp_pal_convert(pal_snap + i*0x400, PALETTE_RAM_EMU + i*0x400);
 		}
 	}
 

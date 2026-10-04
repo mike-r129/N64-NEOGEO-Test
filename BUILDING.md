@@ -25,6 +25,9 @@ cd ..
 # explicit target file.
 patch src/rspq/rspq.c < <repo>/patches/libdragon-rspq-closed-loop-flush.patch
 patch -p1 < <repo>/patches/libdragon-rspq-highpri-wedge.patch
+# Lets the ROM size the lowpri command buffers (weak hooks; behaviour is
+# upstream's unless the app defines them, as platform_n64.c does).
+patch -p1 < <repo>/patches/libdragon-rspq-lowpri-size.patch
 ./build.sh                                                   # builds + installs libdragon
 ```
 

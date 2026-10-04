@@ -4,7 +4,9 @@
 // Frameskipping mode:
 //   0 - never frameskip, game might slowdown
 //   1 - 30 FPS mode (draw one frame every two)
-//   2 - auto mode. Game will frameskip as much as necessary to keep up with 60 FPS
+// Auto frameskip on N64 is a separate runtime knob: make ... FRAMESKIP=n
+// (-DMVS64_FRAMESKIP=n) skips drawing up to n frames in a row when behind
+// the VI clock; see emu_render() in emu.c.
 #define CONFIG_FRAMESKIP_MODE            0
 
 #include <stdint.h>

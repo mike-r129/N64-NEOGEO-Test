@@ -115,8 +115,22 @@ static int sprwalk_rsp_ovfl;   // overflow count reported by the RSP walk
 #include "video_cpu.c"
 #endif
 
+// Fix-layer fast path (twin knob, MVS64_FIXFAST_OFF): the per-cell empty
+// test inlined (srom_tile_empty_fast) plus a 1-entry memo of the last blank
+// tile code — the map repeats the same blank codes, and ~950 of ~1120 cells
+// are blank in fights. Same draw decisions as the plain path. The memo is
+// per call: tile numbers only change meaning on srom_set_bank, which the 68k
+// does between renders.
+#ifdef MVS64_FIXFAST_OFF
+int mvs64_fix_fast __attribute__((section(".data"))) = 0;
+#else
+int mvs64_fix_fast __attribute__((section(".data"))) = 1;
+#endif
+
 static void render_fix(void) {
 	uint16_t *fix = VIDEO_RAM + 0x7000;
+	const int fast = mvs64_fix_fast;
+	int last_blank = -1;
 
 	render_begin_fix();
 
@@ -128,8 +142,15 @@ static void render_fix(void) {
 			// is full of nonzero "blank" codes, so without this we issue
 			// ~1120 draws/frame that can never touch the screen (see
 			// srom_tile_empty).
-			if (v && !srom_tile_empty(v & 0xFFF))
-				draw_sprite_fix(v & 0xFFF, (v >> 12) & 0xF, i*8, j*8);
+			if (!v) continue;
+			int t = v & 0xFFF;
+			if (fast) {
+				if (t == last_blank) continue;
+				if (srom_tile_empty_fast(t)) { last_blank = t; continue; }
+			} else if (srom_tile_empty(t)) {
+				continue;
+			}
+			draw_sprite_fix(t, (v >> 12) & 0xF, i*8, j*8);
 		}
 		fix += 2;
 	}
@@ -139,7 +160,15 @@ static void render_fix(void) {
 
 
 static inline void sprite_consume_begin(void);
-static inline void sprite_consume_one(uint32_t w0, uint32_t w1);
+static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1);
+
+// Walk early-out for non-wrapping sprites (see sprite_walk_produce).
+// Runtime twin knob pinned to .data; MVS64_CULLFAST_OFF builds the OFF twin.
+#ifdef MVS64_CULLFAST_OFF
+int mvs64_walk_cullfast __attribute__((section(".data"))) = 0;
+#else
+int mvs64_walk_cullfast __attribute__((section(".data"))) = 1;
+#endif
 
 // Bit-exact reference walk: same SCB reads, same vshrink math, same culls,
 // same order as the historical direct-draw loop.
@@ -160,6 +189,10 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 	sprwalk_overflow = 0;
 	if (!recs) sprite_consume_begin();
+	// Per-render CDT context, local so the walk keeps it in registers
+	// (its address never escapes the inlined consume path).
+	CromResolveCtx cx;
+	crom_resolve_ctx(&cx);
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -198,6 +231,15 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 		int nt, y, maxy;
 		int halfy = sh < 256 ? sh : 256;
+		// Early-out (twin knob mvs64_walk_cullfast): when the sprite does not
+		// wrap (sy+sh <= 512), ssy+ssh <= 512 for every tile (ssh is clipped
+		// to sh), so a tile is visible iff ssy < 224. y never decreases in
+		// the top half, and the bottom half starts at y >= 241 (512 minus a
+		// top-half end <= 271) with sy >= -15, i.e. ssy >= 226: once a
+		// top-half tile reaches ssy >= 224 nothing later in this sprite can
+		// be visible. Skips the culled lower tiles of full-height strips
+		// (~437 culled iterations/frame in fights). Same records, same order.
+		const bool nowrap = mvs64_walk_cullfast && (sy + sh <= 512);
 
 		// Iterate on the two halves of the vertical sprite. This for loop
 		// is mainly useful to reuse the core drawing loop. The setup
@@ -255,6 +297,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 					// See if this tile is visible, given its Y coordinate and size
 					int ssy = sy + y;
+					if (nowrap && ssy >= 224) goto sprite_done;
 					if (ssy < 224 || (ssy+ssh) > 512) {
 						uint32_t tnum = tmap[nt*2+0];
 						uint32_t tc = tmap[nt*2+1];
@@ -280,7 +323,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 							recs[nrec].w0 = w0;
 							recs[nrec].w1 = w1;
 						} else
-							sprite_consume_one(w0, w1);
+							sprite_consume_one(&cx, w0, w1);
 						nrec++;
 					} else {
 						sprwalk_overflow++;
@@ -297,6 +340,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 			if (!repeat_tiles && nt == 16) break;  // FIXME: draw overfill when not repeating
 		}
 	}
+	sprite_done: ;
 }
 
 	if (sprwalk_overflow)
@@ -350,7 +394,7 @@ static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
 
 // Consume one record: identical tail of the historical loop — empty-tile
 // skip, then draw_sprite (cache side effects unchanged).
-static inline void sprite_consume_one(uint32_t w0, uint32_t w1) {
+static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
 	uint32_t tnum = w0 & 0xFFFFF;
 
 #ifdef DRAW_PERF
@@ -364,7 +408,7 @@ static inline void sprite_consume_one(uint32_t w0, uint32_t w1) {
 #ifdef DRAW_PERF
 		uint32_t _c0 = TICKS_READ();
 #endif
-		uint8_t *src = crom_resolve(tnum);
+		uint8_t *src = cx->fast ? crom_resolve_fast(cx, tnum) : crom_resolve(tnum);
 #ifdef DRAW_PERF
 		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
 #endif
@@ -417,8 +461,10 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 	}
 #endif
 	sprite_consume_begin();
+	CromResolveCtx cx;
+	crom_resolve_ctx(&cx);
 	for (int i=0;i<nrec;i++)
-		sprite_consume_one(recs[i].w0, recs[i].w1);
+		sprite_consume_one(&cx, recs[i].w0, recs[i].w1);
 }
 
 #if defined(N64) && defined(MVS64_WALK_RSP)

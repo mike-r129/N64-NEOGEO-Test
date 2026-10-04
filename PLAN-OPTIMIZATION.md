@@ -1,5 +1,112 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 2026-10-03 (later) — DRAW PATH: rspq buffers + three CPU cuts, +1.5..+2.9 fps in fights
+
+All on branch `frameskip`, each a layout-identical twin knob (one .data byte),
+QUIET+AUTOINPUT release config, 420 s ares runs, paired 300-guest-frame
+fight windows, one emulator at a time. 0 crashes / 0 underruns / hpwedge=0
+in every run.
+
+| Step (commit) | Fight fps, paired median | Faster windows | ms/frame | Pixel gate (DET+FBCRC) |
+| --- | --- | --- | --- | --- |
+| 16 KB rspq lowpri buffers + flush/64 (e71fc9a patch, 332b57a, d65f9b4, default 81afc69) | +1.09 | 40/56 | 0.54 | 9,651 identical |
+| Fix-layer fast path + walk early-out (3120b6f, 5189e1d) | +1.17 | 23/25 | 0.49 | 9,677 identical |
+| Per-render CDT context + uncached slot ticks (7b6dca2) | +0.61 | 40/57 | 0.26 | 9,491 identical |
+
+Cross-binary morning baseline -> now: fight median 46.0 -> 48.3 (paired
++1.45 median, +1.63 mean, 45/56 faster). Twin steps sum to ~+2.9 / 1.3 ms;
+the truth for any one binary is in between (layout-luck law).
+
+Laws/findings:
+- **rspq only hands commands to the RSP on a flush.** Bigger buffers alone
+  were SLOWER (SNDOSD config 45.6 -> 42.9 at 16 KB): with 2 KB buffers every
+  buffer switch flushed, with 16 KB nothing did until render_end, so CPU
+  issue and RSP/RDP execution serialized. Flush every 64 sprite commands.
+- **SNDOSD/DPCOSD/FBCRC builds drain the whole queue every frame**
+  (rdpq_detach_wait) — they cannot show queue-depth gains. Hardware-test
+  config with the change: +0.18 (no regression). Measure perf on QUIET.
+- **Pointer-lifetime audit (Fable advisor):** display_get (2 buffers) returns
+  only after the previous frame's RSP+RDP work is done, which fences every
+  cache-slot pointer. One real race: pal_convert read the LIVE PALETTE_RAM,
+  which the 68k rewrites for the next frame — hidden only by the tiny
+  buffers. Fixed with a per-frame snapshot (0341cc1). Invariant: exactly 2
+  display buffers, no cache inserts outside video_render.
+- libdragon now carries a 3rd vendored patch (lowpri size hook, BUILDING.md).
+
+Gap to full speed after this: ~20.5-21.0 ms vs the 16.9 ms target in a
+median fight frame. Focus moves to the 68k (~6.5 ms) and Z80 (~3.7 ms).
+
+### 🗂️ DRAW-PATH BACKLOG (parked 2026-10-03, not started; estimates unverified)
+Ranked by expected ms per unit of risk. Each should land as a layout-
+identical twin knob and pass the DET+FBCRC pixel gate.
+1. **2-word cmd_sprite_draw carrying the slot index (~0.3 ms CPU, medium
+   risk, ucode change).** Today sprite_consume_one unpacks w0/w1 into 8
+   args and rsp_sprite_draw repacks 3 words (~25 instr) + 3 uncached
+   stores per record. Slots are sprites + e<<7 from a 16 B-aligned base,
+   so send the slot (11 bits) instead of the address: word0 arg =
+   ((w0>>20)&0x3FF) | (e<<10) (pal bits 0-7, flips 8-9 = the ucode's a2
+   flip layout), word1 = w1 verbatim. Ucode (rsp_video.S): cmd size 8,
+   pixel base added to cmd_sprite_begin, palette from andi a0,0xFF, x/y
+   shift swap, sw/sh from srl a1,24, address = base + slot<<7, modal
+   (COPY-mode) test rebuilt from sw|sh|flips. Saves ~15k instr + 622
+   uncached stores + 2.5 KB of memset per frame. MVS64_SPRBATCH's
+   batch_synth_args must be updated or declared broken. Twin: keep cmd
+   0x2, add 0x7, CPU chooses by .data knob (OFF twin pays an RSP shim -
+   judge by CPU time, not fps).
+2. **Palette convert per-2 KB dirty chunk (0..0.5 ms, low risk, measure
+   first).** render_begin snapshots/writes back/converts all 8 KB whenever
+   any palette word changed. Track dirty per 0x400-entry chunk in
+   video_palette_w (and the asm palette write path) and copy/convert only
+   those. Only worth it if fights dirty the palette often: read
+   perf_dr_begin in a PERFCOUNT build first.
+3. **64-bit zeroing in rspq_switch_buffer (~0.1-0.2 ms, libdragon patch).**
+   Every command byte is zeroed once through uncached memory (memset ~2%
+   of fight time). If newlib memset uses 32-bit stores there, an sd loop
+   halves the uncached transactions. Vendored-patch change, not knob-able.
+4. **Hoist rspq_cur_pointer/sentinel into locals across the walk** (part of
+   the CDT-context idea, not done): store back before rspq_flush /
+   rspq_next_buffer / the miss path. Small; risky only if a path is missed.
+5. **SROM direct table for drawn fix cells** (~0.05 ms, 16 KB table) -
+   rejected for now (table pollution > gain).
+Rejected by data: last-tnum memo, crom front cache, sprite batching,
+RSP walk, triple display buffering (perf_draw_wait 0.2%), partial
+high-water buffer zeroing, LRU tick inside the CDT entry, uncached crom_dt
+reads, auto frameskip (bad visual trade).
+
+## 📊 2026-10-03 — HW SOAK PASSED; AUTO FRAMESKIP MEASURED: BAD TRADE (knob stays OFF)
+
+**Hardware:** the user ran the latest build all day (a full workday) on a
+real N64: still responsive, sound working, no crash. First long session
+since the highpri-wedge fix (f8fbf75). OSD K/R/W/D readings and the SD log
+not yet collected.
+
+**Auto frameskip (3473f18, 4b00f4d; `make ... FRAMESKIP=n`, default 0):**
+skips DRAWING up to n frames in a row while behind the VI clock; the 68k,
+Z80 and audio run every frame. Layout-identical twins (one .data byte),
+QUIET+SNDOSD+AUTOINPUT, 420s each in ares, 62 paired 300-guest-frame
+windows ([FSKIP] lines; fs-analyze.py in the session scratchpad):
+
+| Build | Fight game speed (median / min) | Fight drawn fps (median / min) |
+| --- | --- | --- |
+| FRAMESKIP=0 | 45.8 / 36.6 | 45.8 / 36.6 |
+| FRAMESKIP=1 | 49.2 / 41.1 | 35.5 / 24.7 |
+| FRAMESKIP=2 | 53.4 / 42.5 | 28.8 / 17.0 |
+
+0 crashes, 0 underruns, hpwedge=0 in all three. **Verdict: bad trade.** A
+skipped draw saves only ~6.7 ms; the rest of a fight frame (68k + Z80 +
+audio glue, ~15.1 ms) runs regardless. FRAMESKIP=1 buys +3.4 fps of game
+speed for -10 fps on screen; =2 buys +7.6 for -17. Kept as an opt-in knob.
+
+**What the fit says about the real budget (fight median):** frame ≈ 21.8 ms
+= logic ≈ 15.1 ms + draw issue ≈ 6.7 ms; full speed (59.19 Hz) needs
+≤ 16.9 ms, i.e. -4.9 ms (-23%). Logic alone already fits; the draw-issue
+path is the single largest, most tractable block (sprite walk ~1.4 ms, RSP
+wait ~1.2 ms, CROM lookups, rspq writes, fix layer). Next levers re-ranked
+for that: (1) larger lowpri rspq buffers (+ pointer-lifetime guard);
+(2) cheaper per-tile command issue / CDT hit path made layout-robust;
+(3) ADPCM async prefetch (~0.5 ms); (4) 68k dynarec coverage (~6.5 ms of
+68k, long road). Real-hardware fps still unmeasured.
+
 ## 🔴 2026-09-23 — HARDWARE RSP CRASH AFTER 30+ MIN = rspq HIGHPRI WEDGE (libdragon race), FIXED; CDT +1.2ms/frame
 
 **HEADLINE (ares, shipped config QUIET+SNDOSD, same AUTOINPUT script, 35
