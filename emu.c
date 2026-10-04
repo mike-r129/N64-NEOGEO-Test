@@ -631,6 +631,12 @@ int main(int argc, char *argv[]) {
 
 		#ifdef N64
 		uint32_t emu_time = TICKS_DISTANCE(t0, TICKS_READ());
+		#ifdef MVS64_PERFOSD
+		{
+			extern void plat_perf_frame(uint32_t all, uint32_t m68k, uint32_t snd, uint32_t draw);
+			plat_perf_frame(emu_time, profile_m68k, profile_snd, render_time);
+		}
+		#endif
 
 		framef("[PROFILE] cpu:%.2f%% m68k:%.2f%% snd:%.2f%% io:%.2f%% draw:%.2f%% dma:%.2f%% PC:%06lx\n",
 			(float)emu_time * 100.f / (float)(TICKS_PER_SECOND / 60),
