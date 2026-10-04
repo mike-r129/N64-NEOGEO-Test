@@ -1,5 +1,36 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 2026-10-04 — ROUND 3 (branch perf-round3): HARDWARE-GUIDED, TRIPLE BUFFERING
+
+New hardware instrument MVS64_PERFOSD (1874703, 076ea2c): non-stalling
+overlay (text texture blitted in-frame; SNDOSD/DPCOSD drain the RDP every
+frame and read low). First hardware fight reading: F 37.4, M 7.5, S 6.1,
+V 4.7, **W 7.5**, A 26.2, X 0.4, P 10.2, T 0.9 (ms/frame). Hardware fights
+are **CPU-bound, not RDP-bound** (RDP busy 10 of 26 ms); W was vsync
+quantization with 2 display buffers.
+
+| Step (commit) | Evidence | Gate |
+| --- | --- | --- |
+| Triple buffering + explicit prev-frame RDP fence (2bc4363, twin MVS64_DISPLAY_BUFFERS=2) | ares twin +3.65 fps, 60/62, 1.29 ms; hardware expected ~W 7.5 -> ~1 | DET FBCRC_PIPE vs drained FBCRC: 12,127 frames pixel-identical |
+| Z80 per-step working set in one contiguous block (cbd0d3d) | fixes a link-layout cliff: 5.49 -> 2.53 us/step (2.80 before) | PC WAV byte-identical |
+| MOVE.w #imm,(d16,An) fast path (2011f85, twin MVS64_IMMD16_OFF) | +0.14 fps, 39/62 | DET TRCRC twin identical 11,964 f |
+| ADPCM staging in runs (8487722, twin MVS64_STAGEBULK_OFF) | +0.15 fps, 31/55; genms -3.5% | STAGE_VERIFY 183k runs 0 bad |
+| PERFCOUNT trap histogram + LSPC trap sampler (df3b548) | diagnostic | - |
+
+INVARIANT CHANGED: the display is now 3 buffers; the pointer-lifetime fence
+is the frames_done wait in plat_beginframe, NOT display_get. Anything that
+reuses per-frame RDP/RSP inputs must happen after that wait.
+
+LAWS:
+- **dcache layout cliffs are real and silent**: cyc_00 landing on z80_rmap's
+  sets doubled Z80 time (~5 fps) from an unrelated .data edit. Hot per-step
+  tables belong in one contiguous block (z80_hot in .rodata.* next to the
+  jump tables). Check with dcsets/z80layout scripts when Z80 us/step jumps.
+- Measured flat and dropped: 64-bit rspq buffer clear (libdragon patch
+  reverted, still 3 patches), direct PI DMA for tile misses (dmat 2.08 ->
+  2.03%: the transfer is the cost), palette dirty chunks (5 palette writes
+  per fight frame), 68k read fast paths (~20 trapped reads per frame).
+
 ## 📊 2026-10-03 (night) — 68K/Z80 SESSION: +2.55 fps in fights (paired), ~1 ms/frame
 
 Branch `frameskip`. Same release config and method as the draw session below
