@@ -8,6 +8,10 @@
 #define SAFE_MODE           1
 
 
+# Trap-time accounting for the [PROFILE] io% column. ~10 instructions (two
+# COUNT reads + two RMW stores) on every MMIO trap, ~1k traps per fight frame,
+# so it is compiled in only for PERFCOUNT builds; elsewhere io% reads 0.
+#ifdef MVS64_PERFCOUNT
 .macro PROFILE_START
 	mfc0 k0, C0_COUNT
 	lw k1, profile_hw_io
@@ -23,6 +27,13 @@
 	la k0, profile_hw_io
 	sw k1, 0(k0)
 .endm
+#else
+.macro PROFILE_START
+.endm
+
+.macro PROFILE_END
+.endm
+#endif
 
 	.section .sdata
 #ifdef MVS64_PERFCOUNT
