@@ -33,11 +33,45 @@ Laws/findings:
   display buffers, no cache inserts outside video_render.
 - libdragon now carries a 3rd vendored patch (lowpri size hook, BUILDING.md).
 
-Remaining draw ideas from the advisor, not done: 2-word cmd_sprite_draw
-carrying the slot index (~0.3 ms, ucode change, medium risk); palette
-convert per-2 KB dirty chunks (measure perf_dr_begin first); 64-bit
-zeroing in rspq_switch_buffer (~0.1-0.2 ms). Gap to full speed after this:
-~21.0 ms vs 16.9 ms target in a median fight frame.
+Gap to full speed after this: ~20.5-21.0 ms vs the 16.9 ms target in a
+median fight frame. Focus moves to the 68k (~6.5 ms) and Z80 (~3.7 ms).
+
+### 🗂️ DRAW-PATH BACKLOG (parked 2026-10-03, not started; estimates unverified)
+Ranked by expected ms per unit of risk. Each should land as a layout-
+identical twin knob and pass the DET+FBCRC pixel gate.
+1. **2-word cmd_sprite_draw carrying the slot index (~0.3 ms CPU, medium
+   risk, ucode change).** Today sprite_consume_one unpacks w0/w1 into 8
+   args and rsp_sprite_draw repacks 3 words (~25 instr) + 3 uncached
+   stores per record. Slots are sprites + e<<7 from a 16 B-aligned base,
+   so send the slot (11 bits) instead of the address: word0 arg =
+   ((w0>>20)&0x3FF) | (e<<10) (pal bits 0-7, flips 8-9 = the ucode's a2
+   flip layout), word1 = w1 verbatim. Ucode (rsp_video.S): cmd size 8,
+   pixel base added to cmd_sprite_begin, palette from andi a0,0xFF, x/y
+   shift swap, sw/sh from srl a1,24, address = base + slot<<7, modal
+   (COPY-mode) test rebuilt from sw|sh|flips. Saves ~15k instr + 622
+   uncached stores + 2.5 KB of memset per frame. MVS64_SPRBATCH's
+   batch_synth_args must be updated or declared broken. Twin: keep cmd
+   0x2, add 0x7, CPU chooses by .data knob (OFF twin pays an RSP shim -
+   judge by CPU time, not fps).
+2. **Palette convert per-2 KB dirty chunk (0..0.5 ms, low risk, measure
+   first).** render_begin snapshots/writes back/converts all 8 KB whenever
+   any palette word changed. Track dirty per 0x400-entry chunk in
+   video_palette_w (and the asm palette write path) and copy/convert only
+   those. Only worth it if fights dirty the palette often: read
+   perf_dr_begin in a PERFCOUNT build first.
+3. **64-bit zeroing in rspq_switch_buffer (~0.1-0.2 ms, libdragon patch).**
+   Every command byte is zeroed once through uncached memory (memset ~2%
+   of fight time). If newlib memset uses 32-bit stores there, an sd loop
+   halves the uncached transactions. Vendored-patch change, not knob-able.
+4. **Hoist rspq_cur_pointer/sentinel into locals across the walk** (part of
+   the CDT-context idea, not done): store back before rspq_flush /
+   rspq_next_buffer / the miss path. Small; risky only if a path is missed.
+5. **SROM direct table for drawn fix cells** (~0.05 ms, 16 KB table) -
+   rejected for now (table pollution > gain).
+Rejected by data: last-tnum memo, crom front cache, sprite batching,
+RSP walk, triple display buffering (perf_draw_wait 0.2%), partial
+high-water buffer zeroing, LRU tick inside the CDT entry, uncached crom_dt
+reads, auto frameskip (bad visual trade).
 
 ## 📊 2026-10-03 — HW SOAK PASSED; AUTO FRAMESKIP MEASURED: BAD TRADE (knob stays OFF)
 
