@@ -66,6 +66,15 @@ m64k_idle_pagemask:
 #else
     .long 0x30008001
 #endif
+# movew_imm_d16 fast path switch (MOVE.w #imm,(d16,An)); 0 = generic path.
+# A .data word so the -DMVS64_IMMD16_OFF twin is layout-identical.
+    .globl m64k_fp_imm_d16
+m64k_fp_imm_d16:
+#ifdef MVS64_IMMD16_OFF
+    .long 0
+#else
+    .long 1
+#endif
 #ifdef M64K_PORTSTORE
 # port_store_check base: the mapped (sign-extended by lw) LSPC port address.
 # OFF twin = 1: mapped pointers are even and >= 0xFF000000, so nothing
@@ -3003,7 +3012,9 @@ movew_fsrc_other:
     bnez t1, movew_slow
     srl t1, opcode, 6
     andi t1, 7
-    xori t1, 2                         # only ->(An) is fast for #imm
+    xori t2, t1, 5                     # #imm -> (d16,An)?
+    beqz t2, movew_imm_d16
+    xori t1, 2                         # else only ->(An) is fast for #imm
     bnez t1, movew_slow
     srl t1, opcode, 7                  # ---- move.w #imm,(An)  (12 cycles) ----
     andi t1, 0x7<<2
@@ -3017,6 +3028,31 @@ movew_fsrc_other:
     move flag_zc, result
     sll flag_nv, result, 16
     use_cycles 12
+    port_store_check
+    sh_m68k result, eaptr
+    dispatch_next
+
+movew_imm_d16:                         # ---- move.w #imm,(d16,An)  (16 cycles) ----
+    # samsho2 drives the LSPC modulo/data ports this way in its sprite loops
+    # (move.w #$40,($2,A4) / #1,($2,A4)): ~200 port traps per fight frame.
+    # Extension words in decode order: immediate, then d16. The address is
+    # parity-checked before m_pc moves, so a bail re-executes generically.
+    lw t2, %gprel(m64k_fp_imm_d16)(gp)
+    beqz t2, movew_slow                # OFF twin: the generic path
+    srl t1, opcode, 7
+    andi t1, 0x7<<2
+    add t1, ctx
+    lw eaptr32, M64K_OFF_AREGS(t1)
+    lh t2, 2(m_pc)                     # d16 (second extension word)
+    addu eaptr32, t2
+    check_addr_bail eaptr32, movew_slow
+    lhu t0, 0(m_pc)                    # immediate word (code stream, cannot fault)
+    addiu m_pc, 4
+    map_m68k eaptr, eaptr32
+    move result, t0
+    move flag_zc, result
+    sll flag_nv, result, 16
+    use_cycles 16
     port_store_check
     sh_m68k result, eaptr
     dispatch_next
