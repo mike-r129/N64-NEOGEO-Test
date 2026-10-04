@@ -41,6 +41,17 @@
 .endm
 
      .section .sdata
+#ifndef M64K_SDATA_SETOFS
+#define M64K_SDATA_SETOFS 0x8C0
+#endif
+# Pin this object's .sdata (context + dispatch tables, per-instruction hot)
+# to fixed dcache sets: 8KB-aligned, then offset to set 140. Otherwise it
+# moves with every .data change before it (e.g. PERFOSD vs release builds
+# put it on different sets). Set 140..194 overlaps only the tail of the Z80
+# work RAM in z80_hot, which z80_anchor.c pins at 0x1CF0; this pairing
+# measured fast (p24a). Costs < 10KB of .sdata padding.
+    .balign 8192
+    .space M64K_SDATA_SETOFS
 #ifdef M64K_SDATA_PAD
 # Layout steering (2026-08-07): the per-insn PERFCOUNT counter bump and the
 # per-insn m64k ctx accesses must not share a dcache set (8KB direct-mapped;
