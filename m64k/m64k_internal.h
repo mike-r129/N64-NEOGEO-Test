@@ -26,6 +26,8 @@
 #define M64K_OFF_CHECK_INTERRUPTS  (M64K_OFF_NMI_PENDING + 1 * 1)
 #define M64K_OFF_SLICE_BREAK       (M64K_OFF_CHECK_INTERRUPTS + 1 * 1)
 #define M64K_OFF_FORCED_REMAINING  (M64K_OFF_SLICE_BREAK + 1 * 1)
+// sizeof(m64k_t): the context is allocated in m64k_asm.S (see there).
+#define M64K_CTX_SIZE         144
 
 // Dynarec (M64K_DYNREC, PLAN-OPTIMIZATION.md blueprint). Shared between the
 // C side (arena/table storage in m64k.c), the interpreter probe sites
@@ -45,6 +47,7 @@ _Static_assert(offsetof(m64k_t, ts_start) == M64K_OFF_TS_START, "ts_start offset
 _Static_assert(offsetof(m64k_t, check_interrupts) == M64K_OFF_CHECK_INTERRUPTS, "check_interrupts offset is wrong");
 _Static_assert(offsetof(m64k_t, slice_break) == M64K_OFF_SLICE_BREAK, "slice_break offset is wrong");
 _Static_assert(offsetof(m64k_t, forced_remaining) == M64K_OFF_FORCED_REMAINING, "forced_remaining offset is wrong");
+_Static_assert(sizeof(m64k_t) == M64K_CTX_SIZE, "M64K_CTX_SIZE is wrong");
 #endif
 
 #endif

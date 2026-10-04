@@ -25,15 +25,55 @@ static void rsp_fix_draw(uint8_t *src, int palnum, int x, int y) {
 #endif
 int mvs64_draw_flush_every __attribute__((section(".data"))) = MVS64_DRAW_FLUSH_EVERY;
 
+static int draw_since_flush;
 static void rsp_sprite_draw(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
-	static int since_flush;
 	assertf(sw <= 16 && sh <= 16, "sprite too large: %dx%d", sw, sh);
 	assertf(sw > 0 && sh > 0, "sprite too small: %dx%d", sw, sh);
 	rspq_write(RSP_OVL_ID, 0x2, PhysicalAddr(src),
 		(palnum << 24) | ((x0 & 0xFFF) << 12) | (y0 & 0xFFF),
 		(sw-1) | ((sh-1) << 4) | (flipx ? 0x100 : 0) | (flipy ? 0x200 : 0));
-	if (mvs64_draw_flush_every && ++since_flush >= mvs64_draw_flush_every) {
-		since_flush = 0;
+	if (mvs64_draw_flush_every && ++draw_since_flush >= mvs64_draw_flush_every) {
+		draw_since_flush = 0;
+		rspq_flush();
+	}
+}
+// 2-word sprite command (cmd_sprite_draw2): the C-ROM pixel slot instead
+// of its address, plus the walk record fields as they are. w0's bits
+// 20..29 are already pal | flipx<<8 | flipy<<9, and w1 goes verbatim; the
+// RSP rebuilds cmd_sprite_draw's three words. One uncached store less per
+// tile and no unpack/repack. Runtime twin knob pinned to .data; the OFF
+// twin (-DMVS64_SPR2W_OFF) issues the 3-word cmd_sprite_draw.
+#ifdef MVS64_SPR2W_OFF
+int mvs64_spr2w __attribute__((section(".data"))) = 0;
+#else
+int mvs64_spr2w __attribute__((section(".data"))) = 1;
+#endif
+// Each 2-word command goes out as ONE uncached 64-bit store when the queue
+// pointer is 8-byte aligned: on hardware every uncached store is its own
+// RDRAM transaction (PERFOSD E was ~1 us/tile on a real console vs ~0.4 in
+// ares). Same bytes and the same order guarantee as rspq_write (the header
+// word can never be visible without its argument). render_begin_sprites
+// pads the queue to 8 bytes with cmd_nop; a misaligned pointer still takes
+// the two-store path. Runtime twin knob (.data; OFF twin -DMVS64_SPR64_OFF).
+#ifdef MVS64_SPR64_OFF
+int mvs64_spr64 __attribute__((section(".data"))) = 0;
+#else
+int mvs64_spr64 __attribute__((section(".data"))) = 1;
+#endif
+static inline void rsp_sprite_draw2(uint32_t slot, uint32_t w0, uint32_t w1) {
+	uint32_t word0 = (RSP_OVL_ID + (0x7 << 24)) | (slot << 10) | ((w0 >> 20) & 0x3FF);
+	volatile uint32_t *p = rspq_cur_pointer;
+	if (mvs64_spr64 && !((uint32_t)p & 7)) {
+		*(volatile uint64_t *)p = ((uint64_t)word0 << 32) | w1;
+	} else {
+		p[1] = w1;
+		p[0] = word0;
+	}
+	rspq_cur_pointer = p + 2;
+	if (__builtin_expect(rspq_cur_pointer > rspq_cur_sentinel, 0))
+		rspq_next_buffer();
+	if (mvs64_draw_flush_every && ++draw_since_flush >= mvs64_draw_flush_every) {
+		draw_since_flush = 0;
 		rspq_flush();
 	}
 }
@@ -41,7 +81,9 @@ static void rsp_pal_convert(uint16_t *src, uint16_t *dst) {
 	rspq_write(RSP_OVL_ID, 0x3, PhysicalAddr(src), PhysicalAddr(dst));
 }
 static void rsp_sprite_begin(uint16_t *palette_ram) {
-	rspq_write(RSP_OVL_ID, 0x4, PhysicalAddr(palette_ram));
+	CromResolveCtx cx;
+	crom_resolve_ctx(&cx);
+	rspq_write(RSP_OVL_ID, 0x4, PhysicalAddr(palette_ram), PhysicalAddr(cx.sprites));
 }
 
 // Produce the visible-tile record list on the RSP (cmd_sprite_walk), split
@@ -71,7 +113,7 @@ static void sprite_walk_kick_rsp(SprWalkRec *list, int maxrecs, uint8_t aa, bool
 static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
 	volatile uint32_t *utrailer =
 		(volatile uint32_t *)UncachedAddr((uint8_t *)list + maxrecs*8);
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 	uint32_t _w0 = TICKS_READ();
 #endif
 	uint32_t t0 = TICKS_READ();
@@ -86,7 +128,7 @@ static int sprite_walk_collect_rsp(SprWalkRec *list, int maxrecs) {
 			break;
 		}
 	}
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 	perf_dr_wwait += TICKS_DISTANCE(_w0, TICKS_READ());
 #endif
 	uint32_t nrec = utrailer[0], ovfl = utrailer[1];
@@ -260,7 +302,7 @@ static void draw_sprite(int spritenum, int palnum, int x0, int y0, int sw, int s
 
 static void draw_sprite_src(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
 	if (RSP_SPRITES) {
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 		uint32_t _r0 = TICKS_READ();
 		rsp_sprite_draw(src, palnum, x0, y0, sw, sh, flipx, flipy);
 		perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
@@ -364,6 +406,10 @@ static void render_begin_sprites(void) {
 			rdpq_mode_tlut(TLUT_RGBA16);
 			rdpq_mode_alphacompare(1);
 		rdpq_mode_end();
+		// 8-byte align the queue for the 64-bit sprite command stores
+		// (sprite commands are 8 bytes, buffers start aligned).
+		if (mvs64_spr64 && ((uint32_t)rspq_cur_pointer & 7))
+			rspq_write(RSP_OVL_ID, 0x8);
 		return;
 	}
 

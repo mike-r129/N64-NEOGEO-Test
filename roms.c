@@ -76,17 +76,35 @@ int mvs64_cdt_inline __attribute__((section(".data"))) = 1;
 int mvs64_cdt_unc    __attribute__((section(".data"))) = 1;
 #endif
 
+// C-ROM tile cache size in 128-byte slots. Fights draw 600-1000+ tiles per
+// frame and 1280 slots (160KB) thrashed: in ares, 4000 slots cut the miss
+// reads (PERFOSD C) 0.41 -> 0.07 ms/frame and draw CPU (V) by 0.6 ms.
+// 4096 slots = 512KB, used when the Expansion Pak is present (~3MB of heap
+// free there); a 4MB console keeps 1280. The 2-word sprite command carries
+// a 14-bit slot index and sprite_cache.c keeps free slots as u16 offsets
+// in 8-byte units, so <= 4096.
+#ifndef MVS64_CROM_SLOTS
+#define MVS64_CROM_SLOTS 4096
+#endif
+#define CROM_SLOTS_4MB 1280
+_Static_assert(MVS64_CROM_SLOTS <= 4096, "slot offsets must fit sprite_cache.c u16");
+
 static void rom_cache_init(void) {
+	#ifdef N64
+	int slots = get_memory_size() > 4*1024*1024 ? MVS64_CROM_SLOTS : CROM_SLOTS_4MB;
+	#else
+	int slots = MVS64_CROM_SLOTS;
+	#endif
 	sprite_cache_init(&srom_cache, 4*8, 256);
-	sprite_cache_init(&crom_cache, 8*16, 1280);
+	sprite_cache_init(&crom_cache, 8*16, slots);
 	#ifdef N64
 	// Give the C-ROM slot ticks their own 16-byte lines (always, so both
 	// twins have the same heap), so the uncached alias never shares a line
 	// with cached data that a later writeback could clobber.
 	free(crom_cache.slot_tick);
-	uint8_t *st = memalign(16, (1280 + 15) & ~15);
+	uint8_t *st = memalign(16, (slots + 15) & ~15);
 	assertf(st, "memory allocation failed");
-	data_cache_hit_writeback_invalidate(st, (1280 + 15) & ~15);
+	data_cache_hit_writeback_invalidate(st, (slots + 15) & ~15);
 	crom_cache.slot_tick = mvs64_cdt_unc ? (uint8_t *)UncachedAddr(st) : st;
 	#endif
 }
@@ -192,15 +210,20 @@ uint8_t* crom_get_sprite(int spritenum) {
 		// PLAN-DRAW-RDP Phase 0: per-frame miss count + DMA ticks
 		// ([PERF3], emu.c) — sizes the unique-tile floor Phase 1
 		// compresses the cache bucket toward.
-		extern uint32_t perf_dr_miss, perf_dr_missticks;
+		extern uint32_t perf_dr_miss;
 		perf_dr_miss++;
+	}
+	#endif
+	#if defined(MVS64_PERFCOUNT) || defined(MVS64_PERFOSD)
+	{
+		extern uint32_t perf_dr_missticks;   // also the PERFOSD C line
 		perf_dr_missticks -= TICKS_READ();
 	}
 	#endif
 	dfs_seek(crom_file, spritenum*8*16, SEEK_SET);
 	dfs_read(pix, 1, 8*16, crom_file);
 	data_cache_hit_writeback_invalidate(pix, 8*16);  // FIXME: should not be required
-	#ifdef MVS64_PERFCOUNT
+	#if defined(MVS64_PERFCOUNT) || defined(MVS64_PERFOSD)
 	{
 		extern uint32_t perf_dr_missticks;
 		perf_dr_missticks += TICKS_READ();

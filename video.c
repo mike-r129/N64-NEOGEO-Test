@@ -78,6 +78,23 @@ static uint32_t perf_uniq_tab[2048] __attribute__((aligned(16)));
 static uint32_t perf_uniq_gen;
 #define DRAW_PERF 1
 #endif
+#if defined(N64) && (defined(MVS64_PERFCOUNT) || defined(MVS64_PERFOSD))
+// Coarse per-frame draw split, cheap enough for the PERFOSD hardware overlay
+// (one TICKS pair per section, per walk and per C-ROM miss; the per-record
+// DRAW_PERF timers stay PERFCOUNT-only). PERFOSD consumes and zeroes these
+// in plat_perf_frame; PERFCOUNT prints and zeroes them in [PERF2]/[PERF3].
+// Inside the sprite pass, per drawn record: C-ROM lookup ticks (Q, incl.
+// misses), RSP command issue ticks (E, incl. flushes and buffer switches)
+// and the drawn-tile count (N); the walk itself is R minus Q and E.
+#ifndef MVS64_PERFCOUNT
+uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix, perf_dr_wwait, perf_dr_missticks;
+uint32_t perf_dr_cache, perf_dr_rspq, perf_dr_tiles;
+#endif
+// Drawn tiles by RDP path (the ucode modal test, rsp_video.S): G = COPY
+// mode (full 16x16, no flip, no x-clip), H = would be COPY but flipped.
+uint32_t perf_dr_copyt, perf_dr_flipt;
+#define DRAW_PERF_COARSE 1
+#endif
 
 // --- sprite walk: produce/consume split -----------------------------------
 // The SCB walk produces a flat list of visible-tile records; the consume
@@ -160,7 +177,20 @@ static void render_fix(void) {
 
 
 static inline void sprite_consume_begin(void);
-static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1);
+// Forced inline: as a call (GCC kept it out of line) every drawn tile paid
+// ~35 instructions of spills/reloads and prologue, and re-read the CDT
+// context and the knobs from memory. Callers read the knobs once into
+// locals and pass them in (cdt = mvs64_cdt_enable, two = mvs64_spr2w).
+static inline __attribute__((always_inline))
+void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two);
+#ifdef N64
+extern int mvs64_cdt_enable;
+#define WALK_KNOB_CDT mvs64_cdt_enable
+#define WALK_KNOB_2W  mvs64_spr2w
+#else
+#define WALK_KNOB_CDT 0
+#define WALK_KNOB_2W  0
+#endif
 
 // Walk early-out for non-wrapping sprites (see sprite_walk_produce).
 // Runtime twin knob pinned to .data; MVS64_CULLFAST_OFF builds the OFF twin.
@@ -189,10 +219,13 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 	sprwalk_overflow = 0;
 	if (!recs) sprite_consume_begin();
-	// Per-render CDT context, local so the walk keeps it in registers
-	// (its address never escapes the inlined consume path).
-	CromResolveCtx cx;
-	crom_resolve_ctx(&cx);
+	// Per-render CDT context, local so the walk keeps it in registers: the
+	// copy's address never escapes the inlined consume path (cx0's does,
+	// into crom_resolve_ctx, which made GCC reload it after every store).
+	CromResolveCtx cx0;
+	crom_resolve_ctx(&cx0);
+	const CromResolveCtx cx = cx0;
+	const int k_cdt = WALK_KNOB_CDT, k_2w = WALK_KNOB_2W;
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -323,7 +356,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 							recs[nrec].w0 = w0;
 							recs[nrec].w1 = w1;
 						} else
-							sprite_consume_one(&cx, w0, w1);
+							sprite_consume_one(&cx, w0, w1, k_cdt, k_2w);
 						nrec++;
 					} else {
 						sprwalk_overflow++;
@@ -394,22 +427,23 @@ static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
 
 // Consume one record: identical tail of the historical loop — empty-tile
 // skip, then draw_sprite (cache side effects unchanged).
-static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
+static inline __attribute__((always_inline))
+void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two) {
 	uint32_t tnum = w0 & 0xFFFFF;
 
 #ifdef DRAW_PERF
 	perf_dr_recs++;
 #endif
 #ifdef N64
-	if (mvs64_cdt_enable) {
+	if (cdt) {
 		// Fused empty-test + resolve through the CROM direct table
 		// (roms.c crom_resolve): one sparse read per record. Same
 		// records, same order, same skip set => same draw stream.
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 		uint32_t _c0 = TICKS_READ();
 #endif
 		uint8_t *src = cx->fast ? crom_resolve_fast(cx, tnum) : crom_resolve(tnum);
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
 #endif
 		if (!src) {
@@ -418,10 +452,31 @@ static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uin
 #endif
 			return;
 		}
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 		perf_dr_tiles++;
+		{   // same predicate as the ucode's modal test (cmd_sprite_draw)
+			int x = ((int32_t)(w1 << 20)) >> 20, y = ((int32_t)(w1 << 8)) >> 20;
+			if (x >= 512-16) x -= 512;
+			if (y >= 512-16) y -= 512;
+			if ((w1 >> 24) == 0xFF && x >= 0 && x <= 304 && y >= -15 && y <= 223) {
+				if (w0 & (3u << 28)) perf_dr_flipt++;
+				else perf_dr_copyt++;
+			}
+		}
+#endif
+#ifdef DRAW_PERF
 		sprite_consume_p0(tnum, w0, w1);
 #endif
+		if (two) {
+#ifdef DRAW_PERF_COARSE
+			uint32_t _r0 = TICKS_READ();
+#endif
+			rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1);
+#ifdef DRAW_PERF_COARSE
+			perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
+#endif
+			return;
+		}
 		draw_sprite_src(src, (w0 >> 20) & 0xFF,
 		                w1 & 0xFFF, (w1 >> 12) & 0xFFF,
 		                ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
@@ -461,10 +516,12 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 	}
 #endif
 	sprite_consume_begin();
-	CromResolveCtx cx;
-	crom_resolve_ctx(&cx);
+	CromResolveCtx cx0;
+	crom_resolve_ctx(&cx0);
+	const CromResolveCtx cx = cx0;
+	const int k_cdt = WALK_KNOB_CDT, k_2w = WALK_KNOB_2W;
 	for (int i=0;i<nrec;i++)
-		sprite_consume_one(&cx, recs[i].w0, recs[i].w1);
+		sprite_consume_one(&cx, recs[i].w0, recs[i].w1, k_cdt, k_2w);
 }
 
 #if defined(N64) && defined(MVS64_WALK_RSP)
@@ -576,7 +633,7 @@ void video_render(void) {
 		sprite_walk_kick_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa_k, aa_en_k);
 	}
 #endif
-#ifdef DRAW_PERF
+#ifdef DRAW_PERF_COARSE
 	uint32_t t0 = TICKS_READ();
 	render_begin();
 	uint32_t t1 = TICKS_READ();

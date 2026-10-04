@@ -1,5 +1,39 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 2026-10-04 (later) — ROUND 4 (branch perf-round4): SPRITE PATH + THE 68K LAYOUT CLIFF
+
+Hardware heavy fights went from 36.7 fps (N 1018 tiles: M 11.0, S 6.1,
+V 8.6, R 4.8, Q 1.7, C 1.1, E 1.0, P 17.4, W 1.0) to 41.9 fps (N 785:
+M 9.8, S 5.7, V 5.4, R 3.1, Q 0.5, C 0.3, E 0.7, P 16.9, W 2.4); the user
+reports the final build "felt higher fps at most times".
+
+| Step (commit) | Evidence | Gate |
+| --- | --- | --- |
+| PERFOSD split of V and R: B/L, R/K, Q/E, C/N, G/H (a572246, 808668f, 93f8772) | diagnostic | - |
+| 2-word sprite command, slot + walk word (7820a9e, twin MVS64_SPR2W_OFF) | ares E 0.56 -> 0.22 ms | DET FBCRC 14,320 f |
+| Force-inline sprite_consume_one into the walk (8e949ce) | call overhead was 3.5% of in-fight samples; R 2.77 -> 1.98 | FBCRC 4,689 f |
+| m64k context allocated in the core's .sdata (af33807) | removes a 3.2 ms M cliff (see law); pad sweep M within +0.5 | FBCRC 13,903 f, testsuite 125/126 |
+| One uncached sd per sprite command (31967a1, twin MVS64_SPR64_OFF) | ares flat; hardware E/N 0.89 vs 0.95 us (rounding) - kept, neutral | FBCRC 13,895 f |
+| 4096-slot C-ROM cache with >4MB RAM (5f6c36a) | ares C 0.42 -> 0.07, V -0.64 ms, +1.2 fps; hardware C 1.1 -> 0.3 | FBCRC 13,895 f |
+
+LAWS:
+- **The m64k ctx vs .sdata dispatch-table collision was a live 3 ms
+  lottery** in every build since the tables moved to .sdata: m64k (fixed
+  .bss) and optable/ea_table/rmw_table (.sdata, shifts with any .rodata
+  edit) on the same dcache sets ran the 68k ~40% slower. The ctx is now
+  .space'd in m64k_asm.S's .sdata block. Check layout sensitivity with
+  -DMVS64_LAYOUT_PAD=<bytes> (shifts .rodata onward) before trusting a
+  cross-binary M delta; residual sensitivity is ~0.5 ms (pad 3200).
+- **ares underprices hardware costs in the sprite path:** E per tile ~0.4
+  us in ares vs ~0.9 on hardware, C-ROM misses ~3x. Per-tile timers on
+  the PERFOSD overlay are the instrument; fps twins in ares miss them.
+- **Hardware heavy scenes now see the RDP:** P ~17 ms with W up to 2.4.
+  G/H say ~80% of tiles already draw in COPY mode and flipped full tiles
+  are only 1-8%, so pre-flipping is not the lever; the RDP time per tile
+  (~25 us at P 17 / N 700) is far above fill cost - unexplained.
+- Fix-layer/begin are small (L ~1.0, B ~0-0.4 ms); the walk itself (R-Q-E)
+  is ~2 ms on hardware.
+
 ## 📊 2026-10-04 — ROUND 3 (branch perf-round3): HARDWARE-GUIDED, TRIPLE BUFFERING
 
 New hardware instrument MVS64_PERFOSD (1874703, 076ea2c): non-stalling

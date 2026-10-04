@@ -50,6 +50,17 @@
 # after ANY build used for fps numbers; steer with -DM64K_SDATA_PAD=<bytes>.
     .space M64K_SDATA_PAD
 #endif
+# The CPU context (m64k_t; emu.c/testsuite.c only declare it). It is read
+# and written on every dispatched instruction, like the dispatch tables in
+# this object's .sdata (optable, ea_table, rmw_table, opcctable, ...). As a
+# C .bss global it sat at a fixed address while .sdata moves with every
+# .rodata/.data edit, and whenever the two landed on the same dcache sets
+# the 68k ran ~40% slower (2026-10-04: M 7.9 -> 11.1 ms/frame in ares from
+# an unrelated RSP ucode change). Here, all of it is one contiguous block
+# well under 8KB, so it can never collide with itself.
+    .globl m64k
+    .balign 16
+m64k:         .space M64K_CTX_SIZE
 # .globl: dynrec.c bakes &pc_diff into absolute-target enders (JMP/JSR
 # (xxx).l recompute it; delta exits preserve it).
     .globl pc_diff
