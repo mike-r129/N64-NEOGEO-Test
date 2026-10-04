@@ -60,7 +60,9 @@ static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
   z->write_byte(z->userdata, addr, val);
 }
 
-static inline uint16_t rw(z80* const z, uint16_t addr) {
+// always_inline: two rmap loads; GCC otherwise outlines it (rw.isra), which
+// would put a call and a register frame back into the exec_opcode leaf.
+static inline __attribute__((always_inline)) uint16_t rw(z80* const z, uint16_t addr) {
 #ifndef Z80_RMAP_OFF
   return (rb(z, (uint16_t)(addr + 1)) << 8) | rb(z, addr);
 #else
@@ -88,7 +90,7 @@ static inline uint8_t nextb(z80* const z) {
   return rb(z, z->pc++);
 }
 
-static inline uint16_t nextw(z80* const z) {
+static inline __attribute__((always_inline)) uint16_t nextw(z80* const z) {  // (see rw)
   z->pc += 2;
   return rw(z, z->pc - 2);
 }
@@ -158,16 +160,19 @@ static inline bool carry(int bit_no, uint16_t a, uint16_t b, bool cy) {
 }
 
 // returns the parity of byte: 0 if number of 1 bits in `val` is odd, else 1
+// (xor-fold: bit 0 ends up as the xor of all 8 bits; GCC kept the old
+// counting loop as an 8-iteration loop on N64, ~45 instructions per call)
 static inline bool parity(uint8_t val) {
-  uint8_t nb_one_bits = 0;
-  for (int i = 0; i < 8; i++) {
-    nb_one_bits += ((val >> i) & 1);
-  }
-
-  return (nb_one_bits & 1) == 0;
+  unsigned v = val;
+  v ^= v >> 4;
+  v ^= v >> 2;
+  v ^= v >> 1;
+  return (v & 1) == 0;
 }
 
-static void exec_opcode(z80* const z, uint8_t opcode);
+// exec_opcode is exported as z80_exec_opcode for z80_step_inline (z80.h).
+#define exec_opcode z80_exec_opcode
+void exec_opcode(z80* const z, uint8_t opcode);
 static void exec_opcode_cb(z80* const z, uint8_t opcode);
 static void exec_opcode_dcb(
     z80* const z, const uint8_t opcode, const uint16_t addr);
@@ -822,6 +827,12 @@ void z80_step(z80* const z) {
     process_interrupts(z);
 }
 
+// Out-of-line interrupt service for z80_step_inline: the NMI/IM0/IM2 push
+// paths stay cold instead of forcing a full register frame on every step.
+__attribute__((noinline)) void z80_process_interrupts(z80* const z) {
+  process_interrupts(z);
+}
+
 // outputs to stdout a debug trace of the emulator
 void z80_debug_output(z80* const z) {
   printf("PC: %04X, AF: %04X, BC: %04X, DE: %04X, HL: %04X, SP: %04X, "
@@ -845,6 +856,14 @@ void z80_gen_int(z80* const z, uint8_t data) {
 }
 
 // executes a non-prefixed opcode
+// Opcodes are split by whether their body can call out of z80.c (write_byte /
+// port callbacks, push/call/rst, daa, prefixes): exec_opcode keeps only the
+// pure ones (register moves, reads through rmap, ALU, jumps, ret/pop), so GCC
+// compiles it as a frameless leaf; everything else tail-calls
+// exec_opcode_slow. Bodies are unchanged and the cycle/R prologue runs once,
+// here, for every opcode.
+static void exec_opcode_slow(z80* const z, uint8_t opcode);
+
 void exec_opcode(z80* const z, uint8_t opcode) {
   z->cyc += cyc_00[opcode];
   inc_r(z);
@@ -913,15 +932,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0x5E: z->e = rb(z, get_hl(z)); break; // ld e,(hl)
   case 0x66: z->h = rb(z, get_hl(z)); break; // ld h,(hl)
   case 0x6E: z->l = rb(z, get_hl(z)); break; // ld l,(hl)
-
-  case 0x77: wb(z, get_hl(z), z->a); break; // ld (hl),a
-  case 0x70: wb(z, get_hl(z), z->b); break; // ld (hl),b
-  case 0x71: wb(z, get_hl(z), z->c); break; // ld (hl),c
-  case 0x72: wb(z, get_hl(z), z->d); break; // ld (hl),d
-  case 0x73: wb(z, get_hl(z), z->e); break; // ld (hl),e
-  case 0x74: wb(z, get_hl(z), z->h); break; // ld (hl),h
-  case 0x75: wb(z, get_hl(z), z->l); break; // ld (hl),l
-
   case 0x3E: z->a = nextb(z); break; // ld a,*
   case 0x06: z->b = nextb(z); break; // ld b,*
   case 0x0E: z->c = nextb(z); break; // ld c,*
@@ -929,7 +939,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0x1E: z->e = nextb(z); break; // ld e,*
   case 0x26: z->h = nextb(z); break; // ld h,*
   case 0x2E: z->l = nextb(z); break; // ld l,*
-  case 0x36: wb(z, get_hl(z), nextb(z)); break; // ld (hl),*
 
   case 0x0A:
     z->a = rb(z, get_bc(z));
@@ -945,22 +954,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
     z->mem_ptr = addr + 1;
   } break; // ld a,(**)
 
-  case 0x02:
-    wb(z, get_bc(z), z->a);
-    z->mem_ptr = (z->a << 8) | ((get_bc(z) + 1) & 0xFF);
-    break; // ld (bc),a
-
-  case 0x12:
-    wb(z, get_de(z), z->a);
-    z->mem_ptr = (z->a << 8) | ((get_de(z) + 1) & 0xFF);
-    break; // ld (de),a
-
-  case 0x32: {
-    const uint16_t addr = nextw(z);
-    wb(z, addr, z->a);
-    z->mem_ptr = (z->a << 8) | ((addr + 1) & 0xFF);
-  } break; // ld (**),a
-
   case 0x01: set_bc(z, nextw(z)); break; // ld bc,**
   case 0x11: set_de(z, nextw(z)); break; // ld de,**
   case 0x21: set_hl(z, nextw(z)); break; // ld hl,**
@@ -972,11 +965,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
     z->mem_ptr = addr + 1;
   } break; // ld hl,(**)
 
-  case 0x22: {
-    const uint16_t addr = nextw(z);
-    ww(z, addr, get_hl(z));
-    z->mem_ptr = addr + 1;
-  } break; // ld (**),hl
 
   case 0xF9: z->sp = get_hl(z); break; // ld sp,hl
 
@@ -986,52 +974,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
     set_hl(z, de);
   } break; // ex de,hl
 
-  case 0xE3: {
-    const uint16_t val = rw(z, z->sp);
-    ww(z, z->sp, get_hl(z));
-    set_hl(z, val);
-    z->mem_ptr = val;
-  } break; // ex (sp),hl
-
-  case 0x87: z->a = addb(z, z->a, z->a, 0); break; // add a,a
-  case 0x80: z->a = addb(z, z->a, z->b, 0); break; // add a,b
-  case 0x81: z->a = addb(z, z->a, z->c, 0); break; // add a,c
-  case 0x82: z->a = addb(z, z->a, z->d, 0); break; // add a,d
-  case 0x83: z->a = addb(z, z->a, z->e, 0); break; // add a,e
-  case 0x84: z->a = addb(z, z->a, z->h, 0); break; // add a,h
-  case 0x85: z->a = addb(z, z->a, z->l, 0); break; // add a,l
-  case 0x86: z->a = addb(z, z->a, rb(z, get_hl(z)), 0); break; // add a,(hl)
-  case 0xC6: z->a = addb(z, z->a, nextb(z), 0); break; // add a,*
-
-  case 0x8F: z->a = addb(z, z->a, z->a, z->cf); break; // adc a,a
-  case 0x88: z->a = addb(z, z->a, z->b, z->cf); break; // adc a,b
-  case 0x89: z->a = addb(z, z->a, z->c, z->cf); break; // adc a,c
-  case 0x8A: z->a = addb(z, z->a, z->d, z->cf); break; // adc a,d
-  case 0x8B: z->a = addb(z, z->a, z->e, z->cf); break; // adc a,e
-  case 0x8C: z->a = addb(z, z->a, z->h, z->cf); break; // adc a,h
-  case 0x8D: z->a = addb(z, z->a, z->l, z->cf); break; // adc a,l
-  case 0x8E: z->a = addb(z, z->a, rb(z, get_hl(z)), z->cf); break; // adc a,(hl)
-  case 0xCE: z->a = addb(z, z->a, nextb(z), z->cf); break; // adc a,*
-
-  case 0x97: z->a = subb(z, z->a, z->a, 0); break; // sub a,a
-  case 0x90: z->a = subb(z, z->a, z->b, 0); break; // sub a,b
-  case 0x91: z->a = subb(z, z->a, z->c, 0); break; // sub a,c
-  case 0x92: z->a = subb(z, z->a, z->d, 0); break; // sub a,d
-  case 0x93: z->a = subb(z, z->a, z->e, 0); break; // sub a,e
-  case 0x94: z->a = subb(z, z->a, z->h, 0); break; // sub a,h
-  case 0x95: z->a = subb(z, z->a, z->l, 0); break; // sub a,l
-  case 0x96: z->a = subb(z, z->a, rb(z, get_hl(z)), 0); break; // sub a,(hl)
-  case 0xD6: z->a = subb(z, z->a, nextb(z), 0); break; // sub a,*
-
-  case 0x9F: z->a = subb(z, z->a, z->a, z->cf); break; // sbc a,a
-  case 0x98: z->a = subb(z, z->a, z->b, z->cf); break; // sbc a,b
-  case 0x99: z->a = subb(z, z->a, z->c, z->cf); break; // sbc a,c
-  case 0x9A: z->a = subb(z, z->a, z->d, z->cf); break; // sbc a,d
-  case 0x9B: z->a = subb(z, z->a, z->e, z->cf); break; // sbc a,e
-  case 0x9C: z->a = subb(z, z->a, z->h, z->cf); break; // sbc a,h
-  case 0x9D: z->a = subb(z, z->a, z->l, z->cf); break; // sbc a,l
-  case 0x9E: z->a = subb(z, z->a, rb(z, get_hl(z)), z->cf); break; // sbc a,(hl)
-  case 0xDE: z->a = subb(z, z->a, nextb(z), z->cf); break; // sbc a,*
 
   case 0x09: addhl(z, get_bc(z)); break; // add hl,bc
   case 0x19: addhl(z, get_de(z)); break; // add hl,de
@@ -1053,10 +995,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0x1C: z->e = inc(z, z->e); break; // inc e
   case 0x24: z->h = inc(z, z->h); break; // inc h
   case 0x2C: z->l = inc(z, z->l); break; // inc l
-  case 0x34: {
-    uint8_t result = inc(z, rb(z, get_hl(z)));
-    wb(z, get_hl(z), result);
-  } break; // inc (hl)
 
   case 0x3D: z->a = dec(z, z->a); break; // dec a
   case 0x05: z->b = dec(z, z->b); break; // dec b
@@ -1065,10 +1003,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0x1D: z->e = dec(z, z->e); break; // dec e
   case 0x25: z->h = dec(z, z->h); break; // dec h
   case 0x2D: z->l = dec(z, z->l); break; // dec l
-  case 0x35: {
-    uint8_t result = dec(z, rb(z, get_hl(z)));
-    wb(z, get_hl(z), result);
-  } break; // dec (hl)
 
   case 0x03: set_bc(z, get_bc(z) + 1); break; // inc bc
   case 0x13: set_de(z, get_de(z) + 1); break; // inc de
@@ -1080,7 +1014,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0x2B: set_hl(z, get_hl(z) - 1); break; // dec hl
   case 0x3B: z->sp = z->sp - 1; break; // dec sp
 
-  case 0x27: daa(z); break; // daa
 
   case 0x2F:
     z->a = ~z->a;
@@ -1202,16 +1135,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0x38: cond_jr(z, z->cf == 1); break; // jr c, *
 
   case 0xE9: z->pc = get_hl(z); break; // jp (hl)
-  case 0xCD: call(z, nextw(z)); break; // call
-
-  case 0xC4: cond_call(z, z->zf == 0); break; // cnz
-  case 0xCC: cond_call(z, z->zf == 1); break; // cz
-  case 0xD4: cond_call(z, z->cf == 0); break; // cnc
-  case 0xDC: cond_call(z, z->cf == 1); break; // cc
-  case 0xE4: cond_call(z, z->pf == 0); break; // cpo
-  case 0xEC: cond_call(z, z->pf == 1); break; // cpe
-  case 0xF4: cond_call(z, z->sf == 0); break; // cp
-  case 0xFC: cond_call(z, z->sf == 1); break; // cm
 
   case 0xC9: ret(z); break; // ret
   case 0xC0: cond_ret(z, z->zf == 0); break; // ret nz
@@ -1223,19 +1146,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
   case 0xF0: cond_ret(z, z->sf == 0); break; // ret p
   case 0xF8: cond_ret(z, z->sf == 1); break; // ret m
 
-  case 0xC7: call(z, 0x00); break; // rst 0
-  case 0xCF: call(z, 0x08); break; // rst 1
-  case 0xD7: call(z, 0x10); break; // rst 2
-  case 0xDF: call(z, 0x18); break; // rst 3
-  case 0xE7: call(z, 0x20); break; // rst 4
-  case 0xEF: call(z, 0x28); break; // rst 5
-  case 0xF7: call(z, 0x30); break; // rst 6
-  case 0xFF: call(z, 0x38); break; // rst 7
-
-  case 0xC5: pushw(z, get_bc(z)); break; // push bc
-  case 0xD5: pushw(z, get_de(z)); break; // push de
-  case 0xE5: pushw(z, get_hl(z)); break; // push hl
-  case 0xF5: pushw(z, (z->a << 8) | get_f(z)); break; // push af
 
   case 0xC1: set_bc(z, popw(z)); break; // pop bc
   case 0xD1: set_de(z, popw(z)); break; // pop de
@@ -1246,18 +1156,6 @@ void exec_opcode(z80* const z, uint8_t opcode) {
     set_f(z, val & 0xFF);
   } break; // pop af
 
-  case 0xDB: {
-    const uint8_t port = nextb(z);
-    const uint8_t a = z->a;
-    z->a = z->port_in(z, (a << 8) | port);  // MVS64: full 16-bit port (high=A)
-    z->mem_ptr = (a << 8) | (z->a + 1);
-  } break; // in a,(n)
-
-  case 0xD3: {
-    const uint8_t port = nextb(z);
-    z->port_out(z, (z->a << 8) | port, z->a);  // MVS64: full 16-bit port (high=A)
-    z->mem_ptr = (port + 1) | (z->a << 8);
-  } break; // out (n), a
 
   case 0x08: {
     uint8_t a = z->a;
@@ -1287,10 +1185,141 @@ void exec_opcode(z80* const z, uint8_t opcode) {
     z->l_ = l;
   } break; // exx
 
-  case 0xCB: exec_opcode_cb(z, nextb(z)); break;
-  case 0xED: exec_opcode_ed(z, nextb(z)); break;
-  case 0xDD: exec_opcode_ddfd(z, nextb(z), &z->ix); break;
-  case 0xFD: exec_opcode_ddfd(z, nextb(z), &z->iy); break;
+
+  case 0xCB: exec_opcode_cb(z, nextb(z)); return;
+  case 0xED: exec_opcode_ed(z, nextb(z)); return;
+  case 0xDD: exec_opcode_ddfd(z, nextb(z), &z->ix); return;
+  case 0xFD: exec_opcode_ddfd(z, nextb(z), &z->iy); return;
+
+  default: exec_opcode_slow(z, opcode); return;
+  }
+}
+
+// exec_opcode's callout cases (the cycle/R prologue already ran there).
+__attribute__((noinline))
+static void exec_opcode_slow(z80* const z, uint8_t opcode) {
+  switch (opcode) {
+
+  case 0x77: wb(z, get_hl(z), z->a); break; // ld (hl),a
+  case 0x70: wb(z, get_hl(z), z->b); break; // ld (hl),b
+  case 0x71: wb(z, get_hl(z), z->c); break; // ld (hl),c
+  case 0x72: wb(z, get_hl(z), z->d); break; // ld (hl),d
+  case 0x73: wb(z, get_hl(z), z->e); break; // ld (hl),e
+  case 0x74: wb(z, get_hl(z), z->h); break; // ld (hl),h
+  case 0x75: wb(z, get_hl(z), z->l); break; // ld (hl),l
+
+  case 0x36: wb(z, get_hl(z), nextb(z)); break; // ld (hl),*
+  case 0x02:
+    wb(z, get_bc(z), z->a);
+    z->mem_ptr = (z->a << 8) | ((get_bc(z) + 1) & 0xFF);
+    break; // ld (bc),a
+
+  case 0x12:
+    wb(z, get_de(z), z->a);
+    z->mem_ptr = (z->a << 8) | ((get_de(z) + 1) & 0xFF);
+    break; // ld (de),a
+
+  case 0x32: {
+    const uint16_t addr = nextw(z);
+    wb(z, addr, z->a);
+    z->mem_ptr = (z->a << 8) | ((addr + 1) & 0xFF);
+  } break; // ld (**),a
+
+  case 0x22: {
+    const uint16_t addr = nextw(z);
+    ww(z, addr, get_hl(z));
+    z->mem_ptr = addr + 1;
+  } break; // ld (**),hl
+  case 0xE3: {
+    const uint16_t val = rw(z, z->sp);
+    ww(z, z->sp, get_hl(z));
+    set_hl(z, val);
+    z->mem_ptr = val;
+  } break; // ex (sp),hl
+
+  case 0x87: z->a = addb(z, z->a, z->a, 0); break; // add a,a
+  case 0x80: z->a = addb(z, z->a, z->b, 0); break; // add a,b
+  case 0x81: z->a = addb(z, z->a, z->c, 0); break; // add a,c
+  case 0x82: z->a = addb(z, z->a, z->d, 0); break; // add a,d
+  case 0x83: z->a = addb(z, z->a, z->e, 0); break; // add a,e
+  case 0x84: z->a = addb(z, z->a, z->h, 0); break; // add a,h
+  case 0x85: z->a = addb(z, z->a, z->l, 0); break; // add a,l
+  case 0x86: z->a = addb(z, z->a, rb(z, get_hl(z)), 0); break; // add a,(hl)
+  case 0xC6: z->a = addb(z, z->a, nextb(z), 0); break; // add a,*
+
+  case 0x8F: z->a = addb(z, z->a, z->a, z->cf); break; // adc a,a
+  case 0x88: z->a = addb(z, z->a, z->b, z->cf); break; // adc a,b
+  case 0x89: z->a = addb(z, z->a, z->c, z->cf); break; // adc a,c
+  case 0x8A: z->a = addb(z, z->a, z->d, z->cf); break; // adc a,d
+  case 0x8B: z->a = addb(z, z->a, z->e, z->cf); break; // adc a,e
+  case 0x8C: z->a = addb(z, z->a, z->h, z->cf); break; // adc a,h
+  case 0x8D: z->a = addb(z, z->a, z->l, z->cf); break; // adc a,l
+  case 0x8E: z->a = addb(z, z->a, rb(z, get_hl(z)), z->cf); break; // adc a,(hl)
+  case 0xCE: z->a = addb(z, z->a, nextb(z), z->cf); break; // adc a,*
+
+  case 0x97: z->a = subb(z, z->a, z->a, 0); break; // sub a,a
+  case 0x90: z->a = subb(z, z->a, z->b, 0); break; // sub a,b
+  case 0x91: z->a = subb(z, z->a, z->c, 0); break; // sub a,c
+  case 0x92: z->a = subb(z, z->a, z->d, 0); break; // sub a,d
+  case 0x93: z->a = subb(z, z->a, z->e, 0); break; // sub a,e
+  case 0x94: z->a = subb(z, z->a, z->h, 0); break; // sub a,h
+  case 0x95: z->a = subb(z, z->a, z->l, 0); break; // sub a,l
+  case 0x96: z->a = subb(z, z->a, rb(z, get_hl(z)), 0); break; // sub a,(hl)
+  case 0xD6: z->a = subb(z, z->a, nextb(z), 0); break; // sub a,*
+
+  case 0x9F: z->a = subb(z, z->a, z->a, z->cf); break; // sbc a,a
+  case 0x98: z->a = subb(z, z->a, z->b, z->cf); break; // sbc a,b
+  case 0x99: z->a = subb(z, z->a, z->c, z->cf); break; // sbc a,c
+  case 0x9A: z->a = subb(z, z->a, z->d, z->cf); break; // sbc a,d
+  case 0x9B: z->a = subb(z, z->a, z->e, z->cf); break; // sbc a,e
+  case 0x9C: z->a = subb(z, z->a, z->h, z->cf); break; // sbc a,h
+  case 0x9D: z->a = subb(z, z->a, z->l, z->cf); break; // sbc a,l
+  case 0x9E: z->a = subb(z, z->a, rb(z, get_hl(z)), z->cf); break; // sbc a,(hl)
+  case 0xDE: z->a = subb(z, z->a, nextb(z), z->cf); break; // sbc a,*
+  case 0x34: {
+    uint8_t result = inc(z, rb(z, get_hl(z)));
+    wb(z, get_hl(z), result);
+  } break; // inc (hl)
+  case 0x35: {
+    uint8_t result = dec(z, rb(z, get_hl(z)));
+    wb(z, get_hl(z), result);
+  } break; // dec (hl)
+  case 0x27: daa(z); break; // daa
+  case 0xCD: call(z, nextw(z)); break; // call
+
+  case 0xC4: cond_call(z, z->zf == 0); break; // cnz
+  case 0xCC: cond_call(z, z->zf == 1); break; // cz
+  case 0xD4: cond_call(z, z->cf == 0); break; // cnc
+  case 0xDC: cond_call(z, z->cf == 1); break; // cc
+  case 0xE4: cond_call(z, z->pf == 0); break; // cpo
+  case 0xEC: cond_call(z, z->pf == 1); break; // cpe
+  case 0xF4: cond_call(z, z->sf == 0); break; // cp
+  case 0xFC: cond_call(z, z->sf == 1); break; // cm
+  case 0xC7: call(z, 0x00); break; // rst 0
+  case 0xCF: call(z, 0x08); break; // rst 1
+  case 0xD7: call(z, 0x10); break; // rst 2
+  case 0xDF: call(z, 0x18); break; // rst 3
+  case 0xE7: call(z, 0x20); break; // rst 4
+  case 0xEF: call(z, 0x28); break; // rst 5
+  case 0xF7: call(z, 0x30); break; // rst 6
+  case 0xFF: call(z, 0x38); break; // rst 7
+
+  case 0xC5: pushw(z, get_bc(z)); break; // push bc
+  case 0xD5: pushw(z, get_de(z)); break; // push de
+  case 0xE5: pushw(z, get_hl(z)); break; // push hl
+  case 0xF5: pushw(z, (z->a << 8) | get_f(z)); break; // push af
+  case 0xDB: {
+    const uint8_t port = nextb(z);
+    const uint8_t a = z->a;
+    z->a = z->port_in(z, (a << 8) | port);  // MVS64: full 16-bit port (high=A)
+    z->mem_ptr = (a << 8) | (z->a + 1);
+  } break; // in a,(n)
+
+  case 0xD3: {
+    const uint8_t port = nextb(z);
+    z->port_out(z, (z->a << 8) | port, z->a);  // MVS64: full 16-bit port (high=A)
+    z->mem_ptr = (port + 1) | (z->a << 8);
+  } break; // out (n), a
 
   default: fprintf(stderr, "unknown opcode %02X\n", opcode); break;
   }

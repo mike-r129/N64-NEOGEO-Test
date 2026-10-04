@@ -1,5 +1,58 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 📊 2026-10-03 (night) — 68K/Z80 SESSION: +2.55 fps in fights (paired), ~1 ms/frame
+
+Branch `frameskip`. Same release config and method as the draw session below
+(QUIET+AUTOINPUT, 420 s ares runs, paired 300-guest-frame fight windows, one
+emulator at a time). Planned from a fresh in-fight PC profile (pcprof7) and
+two Fable advisor reviews (68k, Z80).
+
+| Step (commit) | Evidence | Gate |
+| --- | --- | --- |
+| Trap-path PROFILE_START/END only in PERFCOUNT builds (cb3dd0f) | with the next row: +1.03 fps paired vs morning HEAD | pure deletion (k0/k1 + diagnostic global) |
+| jmp_exec idle-skip page prefilter (09f81dc, twin MVS64_IDLEFILTER_OFF) | twin +0.47 fps, 43/56 faster, 0.20 ms | DET TRCRC twin identical 9045 f |
+| Z80 parity xor-fold, inline step, frameless exec_opcode leaf (76fac28, f413dea, a9d2fc5) | 2.96 -> 2.80 us/Z80 step; +0.99 fps cross-binary | PC WAV byte-identical (3600 f) |
+| Inline LSPC VRAM-port stores in hot MOVE.w paths (40c5a1a, twin MVS64_PORTSTORE_OFF) | tlb traps 1147 -> 461 per fight frame; twin +0.70 fps, 48/61 faster, 0.30 ms | DET TRCRC twin identical 9045 f |
+
+Cumulative vs the session's starting HEAD: **+2.55 fps median (+2.41 mean),
+53/57 fight windows faster, 0.98 ms/frame**; fight median 48.4 -> 51.8.
+TRCRC all-changes vs old HEAD: identical over 10,165 frames (past 377/3153).
+
+Findings:
+- **The PC sampler cannot see the asm trap path** (it never clears EXL; the
+  timer sample lands after eret on the instruction after the faulting sh).
+  ~6% of samples on movew_f_dst_* / movew_fsrc_* were really MMIO-trap cost.
+- **TRCRC pairs must run on a quiet host.** A DET pair whose new-side run
+  overlapped heavy WSL builds forked at f=3153 (and ran 20% fewer frames);
+  the quiet rerun of the same code matched over 9-10k frames.
+- **dma_read (2.7% of samples) split** via new PERFCOUNT [PERF3] vrom=/vromt=
+  (85fae5b): C-ROM tile misses 9.6/frame = 2.00% of a 60 Hz frame (~0.33 ms,
+  in video_render); ADPCM V-ROM window refills 0.48/frame = 1.25% (~0.21 ms).
+- WSL `/tmp` does not survive between wsl.exe invocations — keep staging
+  copies in the Windows scratchpad.
+
+Gap to full speed now: ~19.5-20 ms vs 16.9 ms in a median fight frame.
+
+### 🗂️ 68K/Z80 BACKLOG (from the advisors; estimates unverified)
+1. **Z80 register-resident run loop** (cyc/R/PC/rmap in registers inside a
+   core-side run_until; flush cyc before every callout - YM timers/busy read
+   cpu.cyc). ~0.1 ms, medium.
+2. **ADPCM window prefetch** (async PI DMA into a second per-voice buffer at
+   the top of sound_gen_samples, fetch_slow waits on a matching tag). Bit-
+   exact (ROM immutable). Ceiling ~0.2 ms (vromt 1.25%). Check the live
+   decoder path under MVS64_RSPADPCM first.
+3. **Z80 spin-snapshot via 4 ld + masks** (sound_neogeo.c z80_snap, N64 only,
+   same field set). ~0.03-0.06 ms. And g_z80_steps local counter (SND_HEALTH
+   builds only, ~0.03 ms).
+4. **Remaining 68k traps (~460/frame):** histogram them by address class
+   (PERFCOUNT counters at mvs64_asm_io_write + the C path) before extending
+   port_store_check to more MOVE forms or the palette (0x400000+) writes.
+5. **68k asm read fast paths** (0x320000 sound reply, input ports) ~0.1 ms.
+6. **Dynarec coverage** stays a multi-session bet (~0.3-0.6 ms at 40%
+   residency; work list = DYNTERM/DYNREF in dyn-stat2.txt). Keep OFF.
+7. YM/Z80 rescheduling (journal YM writes, synthesize per segment): 0.2-0.3
+   ms but must catch synthesis up at every status read; high complexity.
+
 ## 📊 2026-10-03 (later) — DRAW PATH: rspq buffers + three CPU cuts, +1.5..+2.9 fps in fights
 
 All on branch `frameskip`, each a layout-identical twin knob (one .data byte),

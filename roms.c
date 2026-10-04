@@ -32,6 +32,9 @@ unsigned int v_rom_size;
 // Address to trigger idle-skipping
 unsigned int rom_pc_idle_skip = 0;
 extern uint32_t profile_dma_load;
+#ifdef MVS64_PERFCOUNT
+uint32_t perf_vrom_reads, perf_vrom_ticks;   // ADPCM V-ROM refills ([PERF3])
+#endif
 
 static SpriteCache srom_cache;
 static SpriteCache crom_cache;
@@ -629,9 +632,16 @@ void vrom_read(uint32_t offset, uint8_t *buf, int len) {
 	#ifdef N64
 	if (vrom_file < 0) { memset(buf, 0, len); return; }
 	profile_dma_load -= TICKS_READ();
+	#ifdef MVS64_PERFCOUNT
+	perf_vrom_reads++;                 // [PERF3] vrom=/vromt= (ADPCM refills)
+	perf_vrom_ticks -= TICKS_READ();
+	#endif
 	dfs_seek(vrom_file, offset, SEEK_SET);
 	dfs_read(buf, 1, len, vrom_file);
 	data_cache_hit_writeback_invalidate(buf, len);  // FIXME: should not be required
+	#ifdef MVS64_PERFCOUNT
+	perf_vrom_ticks += TICKS_READ();
+	#endif
 	profile_dma_load += TICKS_READ();
 	#else
 	if (!vrom_file) { memset(buf, 0, len); return; }
