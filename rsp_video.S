@@ -11,13 +11,14 @@
 		RSPQ_DefineCommand cmd_fix_draw, 8     # 0x1
         RSPQ_DefineCommand cmd_sprite_draw, 12 # 0x2
         RSPQ_DefineCommand cmd_pal_convert, 8  # 0x3
-        RSPQ_DefineCommand cmd_sprite_begin, 4 # 0x4
+        RSPQ_DefineCommand cmd_sprite_begin, 8 # 0x4
         RSPQ_DefineCommand cmd_sprite_walk, 12 # 0x5
 #ifdef MVS64_BATCHDBG
         RSPQ_DefineCommand cmd_sprite_batch, 16 # 0x6 (+a3: journal ring)
 #else
         RSPQ_DefineCommand cmd_sprite_batch, 12 # 0x6
 #endif
+        RSPQ_DefineCommand cmd_sprite_draw2, 8 # 0x7
 	RSPQ_EndOverlayHeader
 
 RSPQ_BeginSavedState
@@ -25,6 +26,7 @@ RSPQ_BeginSavedState
 PALETTE_CACHE: .half -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 LAST_PALETTE:  .long 0
 RDRAM_PALETTE: .long 0
+SPR_PIXBASE:   .long 0        # C-ROM pixel slots phys base (cmd_sprite_draw2)
 # Phase 3 rotation state (PLAN-DRAW-RDP §7): must live in the SAVED state
 # block — overlay .data/.bss reset on every overlay swap (the audio ucode
 # swaps in mid-frame constantly), and this state persists record-to-record
@@ -442,9 +444,11 @@ SCALE_FACTORS:
     # cmd_sprite_begin - begin drawing sprites
     #
     # a0: Palette RAM in RDRAM
+    # a1: C-ROM pixel slots base in RDRAM (for cmd_sprite_draw2)
     ################################
     .func cmd_sprite_begin
 cmd_sprite_begin:
+    sw a1, %lo(SPR_PIXBASE)
     # Initialize palette cache entries to -1
     li t0, 0xFFFF
     mtc2 t0, $v01.e0
@@ -460,6 +464,52 @@ cmd_sprite_begin:
 
     jr ra
     sw a0, %lo(RDRAM_PALETTE)
+    .endfunc
+
+    ######################################################
+    # cmd_sprite_draw2 - draw a sprite, 2-word form
+    #
+    # a0: bit 0 .. 7: palette
+    #     bit 8:      flip x
+    #     bit 9:      flip y
+    #     bit 10..20: C-ROM pixel slot (128 bytes each, from SPR_PIXBASE)
+    # a1: the walk record's w1 verbatim: x[0..11] y[12..23] sw-1[24..27]
+    #     sh-1[28..31]
+    #
+    # Rebuilds exactly the a0/a1/a2 the CPU packs for cmd_sprite_draw and
+    # runs that body: same draw stream, one word less per record and no
+    # unpack/repack on the CPU.
+    ######################################################
+    .func cmd_sprite_draw2
+cmd_sprite_draw2:
+    # a2 = (sw-1)|((sh-1)<<4) | flips<<8
+    srl a2, a1, 24
+    andi t0, a0, 0x300
+    or a2, t0
+    # t1 = pal<<24 | x<<12 | y
+    andi t0, a0, 0xFF
+    sll t1, t0, 24
+    andi t0, a1, 0xFFF
+    sll t0, 12
+    or t1, t0
+    srl t0, a1, 12
+    andi t0, 0xFFF
+    or t1, t0
+    # a0 = pixel base + slot*128, with the top byte cmd_sprite_draw would
+    # see (overlay id nibble | command 2): it lands in the SetTexImage
+    # address word, so the RDP stream stays byte-identical.
+    srl t0, a0, 10
+    andi t0, 0x7FF
+    sll t0, 7
+    lw t2, %lo(SPR_PIXBASE)
+    add t0, t2
+    lui t2, 0xF000
+    and t2, a0
+    or t0, t2
+    lui t2, 0x0200
+    or a0, t0, t2
+    j cmd_sprite_draw
+    move a1, t1
     .endfunc
 
 

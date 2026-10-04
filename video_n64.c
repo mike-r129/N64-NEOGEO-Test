@@ -25,15 +25,33 @@ static void rsp_fix_draw(uint8_t *src, int palnum, int x, int y) {
 #endif
 int mvs64_draw_flush_every __attribute__((section(".data"))) = MVS64_DRAW_FLUSH_EVERY;
 
+static int draw_since_flush;
 static void rsp_sprite_draw(uint8_t *src, int palnum, int x0, int y0, int sw, int sh, bool flipx, bool flipy) {
-	static int since_flush;
 	assertf(sw <= 16 && sh <= 16, "sprite too large: %dx%d", sw, sh);
 	assertf(sw > 0 && sh > 0, "sprite too small: %dx%d", sw, sh);
 	rspq_write(RSP_OVL_ID, 0x2, PhysicalAddr(src),
 		(palnum << 24) | ((x0 & 0xFFF) << 12) | (y0 & 0xFFF),
 		(sw-1) | ((sh-1) << 4) | (flipx ? 0x100 : 0) | (flipy ? 0x200 : 0));
-	if (mvs64_draw_flush_every && ++since_flush >= mvs64_draw_flush_every) {
-		since_flush = 0;
+	if (mvs64_draw_flush_every && ++draw_since_flush >= mvs64_draw_flush_every) {
+		draw_since_flush = 0;
+		rspq_flush();
+	}
+}
+// 2-word sprite command (cmd_sprite_draw2): the C-ROM pixel slot instead
+// of its address, plus the walk record fields as they are. w0's bits
+// 20..29 are already pal | flipx<<8 | flipy<<9, and w1 goes verbatim; the
+// RSP rebuilds cmd_sprite_draw's three words. One uncached store less per
+// tile and no unpack/repack. Runtime twin knob pinned to .data; the OFF
+// twin (-DMVS64_SPR2W_OFF) issues the 3-word cmd_sprite_draw.
+#ifdef MVS64_SPR2W_OFF
+int mvs64_spr2w __attribute__((section(".data"))) = 0;
+#else
+int mvs64_spr2w __attribute__((section(".data"))) = 1;
+#endif
+static inline void rsp_sprite_draw2(uint32_t slot, uint32_t w0, uint32_t w1) {
+	rspq_write(RSP_OVL_ID, 0x7, (slot << 10) | ((w0 >> 20) & 0x3FF), w1);
+	if (mvs64_draw_flush_every && ++draw_since_flush >= mvs64_draw_flush_every) {
+		draw_since_flush = 0;
 		rspq_flush();
 	}
 }
@@ -41,7 +59,9 @@ static void rsp_pal_convert(uint16_t *src, uint16_t *dst) {
 	rspq_write(RSP_OVL_ID, 0x3, PhysicalAddr(src), PhysicalAddr(dst));
 }
 static void rsp_sprite_begin(uint16_t *palette_ram) {
-	rspq_write(RSP_OVL_ID, 0x4, PhysicalAddr(palette_ram));
+	CromResolveCtx cx;
+	crom_resolve_ctx(&cx);
+	rspq_write(RSP_OVL_ID, 0x4, PhysicalAddr(palette_ram), PhysicalAddr(cx.sprites));
 }
 
 // Produce the visible-tile record list on the RSP (cmd_sprite_walk), split

@@ -438,6 +438,16 @@ static inline void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uin
 #ifdef DRAW_PERF
 		sprite_consume_p0(tnum, w0, w1);
 #endif
+		if (mvs64_spr2w) {
+#ifdef DRAW_PERF_COARSE
+			uint32_t _r0 = TICKS_READ();
+#endif
+			rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1);
+#ifdef DRAW_PERF_COARSE
+			perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
+#endif
+			return;
+		}
 		draw_sprite_src(src, (w0 >> 20) & 0xFF,
 		                w1 & 0xFFF, (w1 >> 12) & 0xFFF,
 		                ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
