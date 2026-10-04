@@ -158,13 +158,14 @@ static inline bool carry(int bit_no, uint16_t a, uint16_t b, bool cy) {
 }
 
 // returns the parity of byte: 0 if number of 1 bits in `val` is odd, else 1
+// (xor-fold: bit 0 ends up as the xor of all 8 bits; GCC kept the old
+// counting loop as an 8-iteration loop on N64, ~45 instructions per call)
 static inline bool parity(uint8_t val) {
-  uint8_t nb_one_bits = 0;
-  for (int i = 0; i < 8; i++) {
-    nb_one_bits += ((val >> i) & 1);
-  }
-
-  return (nb_one_bits & 1) == 0;
+  unsigned v = val;
+  v ^= v >> 4;
+  v ^= v >> 2;
+  v ^= v >> 1;
+  return (v & 1) == 0;
 }
 
 static void exec_opcode(z80* const z, uint8_t opcode);
