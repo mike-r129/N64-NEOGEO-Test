@@ -19,6 +19,7 @@
         RSPQ_DefineCommand cmd_sprite_batch, 12 # 0x6
 #endif
         RSPQ_DefineCommand cmd_sprite_draw2, 8 # 0x7
+        RSPQ_DefineCommand cmd_nop, 4          # 0x8
 	RSPQ_EndOverlayHeader
 
 RSPQ_BeginSavedState
@@ -467,12 +468,22 @@ cmd_sprite_begin:
     .endfunc
 
     ######################################################
+    # cmd_nop - 4-byte filler: the CPU uses it to put the sprite commands
+    # on 8-byte boundaries so it can store each one with a single sd.
+    ######################################################
+    .func cmd_nop
+cmd_nop:
+    jr ra
+    nop
+    .endfunc
+
+    ######################################################
     # cmd_sprite_draw2 - draw a sprite, 2-word form
     #
     # a0: bit 0 .. 7: palette
     #     bit 8:      flip x
     #     bit 9:      flip y
-    #     bit 10..20: C-ROM pixel slot (128 bytes each, from SPR_PIXBASE)
+    #     bit 10..23: C-ROM pixel slot (128 bytes each, from SPR_PIXBASE)
     # a1: the walk record's w1 verbatim: x[0..11] y[12..23] sw-1[24..27]
     #     sh-1[28..31]
     #
@@ -499,7 +510,7 @@ cmd_sprite_draw2:
     # see (overlay id nibble | command 2): it lands in the SetTexImage
     # address word, so the RDP stream stays byte-identical.
     srl t0, a0, 10
-    andi t0, 0x7FF
+    andi t0, 0x3FFF
     sll t0, 7
     lw t2, %lo(SPR_PIXBASE)
     add t0, t2

@@ -48,8 +48,30 @@ int mvs64_spr2w __attribute__((section(".data"))) = 0;
 #else
 int mvs64_spr2w __attribute__((section(".data"))) = 1;
 #endif
+// Each 2-word command goes out as ONE uncached 64-bit store when the queue
+// pointer is 8-byte aligned: on hardware every uncached store is its own
+// RDRAM transaction (PERFOSD E was ~1 us/tile on a real console vs ~0.4 in
+// ares). Same bytes and the same order guarantee as rspq_write (the header
+// word can never be visible without its argument). render_begin_sprites
+// pads the queue to 8 bytes with cmd_nop; a misaligned pointer still takes
+// the two-store path. Runtime twin knob (.data; OFF twin -DMVS64_SPR64_OFF).
+#ifdef MVS64_SPR64_OFF
+int mvs64_spr64 __attribute__((section(".data"))) = 0;
+#else
+int mvs64_spr64 __attribute__((section(".data"))) = 1;
+#endif
 static inline void rsp_sprite_draw2(uint32_t slot, uint32_t w0, uint32_t w1) {
-	rspq_write(RSP_OVL_ID, 0x7, (slot << 10) | ((w0 >> 20) & 0x3FF), w1);
+	uint32_t word0 = (RSP_OVL_ID + (0x7 << 24)) | (slot << 10) | ((w0 >> 20) & 0x3FF);
+	volatile uint32_t *p = rspq_cur_pointer;
+	if (mvs64_spr64 && !((uint32_t)p & 7)) {
+		*(volatile uint64_t *)p = ((uint64_t)word0 << 32) | w1;
+	} else {
+		p[1] = w1;
+		p[0] = word0;
+	}
+	rspq_cur_pointer = p + 2;
+	if (__builtin_expect(rspq_cur_pointer > rspq_cur_sentinel, 0))
+		rspq_next_buffer();
 	if (mvs64_draw_flush_every && ++draw_since_flush >= mvs64_draw_flush_every) {
 		draw_since_flush = 0;
 		rspq_flush();
@@ -384,6 +406,10 @@ static void render_begin_sprites(void) {
 			rdpq_mode_tlut(TLUT_RGBA16);
 			rdpq_mode_alphacompare(1);
 		rdpq_mode_end();
+		// 8-byte align the queue for the 64-bit sprite command stores
+		// (sprite commands are 8 bytes, buffers start aligned).
+		if (mvs64_spr64 && ((uint32_t)rspq_cur_pointer & 7))
+			rspq_write(RSP_OVL_ID, 0x8);
 		return;
 	}
 
