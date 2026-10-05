@@ -90,9 +90,11 @@ CFLAGS += $(EXTRA_DEFINES)
 # The YM2610 ADPCM-A/B decoders run on the RSP pipelined under the CPU's FM
 # pass (gated bit-exact vs the C core; ares 300s dual-compute run, 35840
 # chunks, 0 mismatches; in-fight fps 22.0 -> 26.3). Disable with
-# make ... ADPCM_CPU=1 to force the C decoders (debug/fallback).
+# make ... ADPCM_CPU=1 WP_OFF=1 to force the C decoders (debug/fallback).
 ifndef ADPCM_CPU
 CFLAGS += -DMVS64_RSPADPCM
+else ifndef WP_OFF
+$(error ADPCM_CPU=1 needs WP_OFF=1: the whole-pump offload keeps the ADPCM state on the RSP)
 endif
 # Whole-pump audio batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM AND
 # ADPCM on the RSP with RSP-resident dynamic state, cross-pump output
