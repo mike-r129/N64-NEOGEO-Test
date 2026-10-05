@@ -138,9 +138,6 @@ ROMDIR=$(ROM:%.zip=%.n64)
 
 all: mvsmakerom mvs64-${ROMNAME}.z64
 
-test:
-	make -f Makefile.tests all
-
 $(BUILD_DIR)/mvs64-${ROMNAME}.dfs: $(ROM) mvsmakerom
 	@echo "    [MVS] ${ROMDIR}"
 	./mvsmakerom $(BIOS) $(ROM)
@@ -167,4 +164,4 @@ clean:
 
 -include $(src:%.c=$(BUILD_DIR)/%.d) $(asm:%.S=$(BUILD_DIR)/%.d) $(src_makerom:%.c=$(BUILD_DIR)/%.d)
 
-.PHONY: clean test
+.PHONY: clean
