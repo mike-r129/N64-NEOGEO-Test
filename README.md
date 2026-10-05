@@ -133,11 +133,11 @@ next to `samsho2.zip`.
 | File | Contents |
 | --- | --- |
 | [BUILDING.md](BUILDING.md) | Toolchain, libdragon patches, BIOS, flashing |
-| [PLAN.md](PLAN.md) | The original port plan |
+| [docs/archive/PLAN.md](docs/archive/PLAN.md) | The original port plan |
 | [PLAN-OPTIMIZATION.md](PLAN-OPTIMIZATION.md) | Performance log; the top entry is the current state |
 | [WHOLEPUMP-DESIGN.md](WHOLEPUMP-DESIGN.md) | Design of the RSP audio offload |
 | [PLAN-DRAW-RDP.md](PLAN-DRAW-RDP.md) | Draw pipeline plan and results |
-| [PLAN-BRINGUP.md](PLAN-BRINGUP.md) | Bring-up notes |
+| [docs/archive/PLAN-BRINGUP.md](docs/archive/PLAN-BRINGUP.md) | Bring-up notes; the archive also holds the July build logs |
 | [m64k/README.md](m64k/README.md) | The 68000 core |
 
 ## Credits and licenses

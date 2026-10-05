@@ -1346,14 +1346,14 @@ fm≈2.4ms/chunk, q=0 → pure compute stall the CPU cannot overlap), exact skip
 no change (fight channels keep slots live), ship-2 split 21.8 (glue > saving),
 cross-pump deferred collect 21.25 (samsho2's driver writes YM regs every tick, so
 sync-on-touch fires immediately; branch fm-defer-experiment), ADPCM-only+defer 20.25.
-Full table in BUILDS-2026-07-08.md. The C FM path (~1.1ms/chunk/channel, dcache-
+Full table in docs/archive/BUILDS-2026-07-08.md. The C FM path (~1.1ms/chunk/channel, dcache-
 resident narrowed tables) is the bar; a future attempt needs whole-pump batching
 with RSP-resident state. Remaining viable levers: RSP draw-issue offload (draw ~33%),
 m68k rank-4 residual, and the deeper Z80/m68k structural work.
 
 ## ✅ RSP TIER, STEP 1 LANDED (2026-07-08 overnight) — ADPCM on the RSP
 
-The first structural lever is in (see BUILDS-2026-07-08.md): YM2610 ADPCM-A (6ch) +
+The first structural lever is in (see docs/archive/BUILDS-2026-07-08.md): YM2610 ADPCM-A (6ch) +
 ADPCM-B decode runs on the RSP (`rsp_audio.S` rspq overlay), kicked at the top of each
 synthesis chunk so it decodes underneath the CPU's FM/SSG passes. Gated bit-exact by a
 300s ares dual-compute run (35840 chunks, 0 mismatches) + PC WAV byte-identity.
@@ -1366,7 +1366,7 @@ table restructuring, a full session of its own; (2) RSP draw-issue offload (draw
 ## ✅ SCOPE CLOSED (2026-07-07 overnight) — CPU-side plan complete
 
 Every remaining ranked item is now landed, measured-neutral-but-kept, or closed with
-measured reasoning (see BUILDS-2026-07-07.md for the full table): rank 5 (io reads are
+measured reasoning (see docs/archive/BUILDS-2026-07-07.md for the full table): rank 5 (io reads are
 ~0.1ms — write-dominated bucket already asm-fast-pathed), rank 7 (deterministic eviction,
 landed), rank 9 (snapshot gating provably breaks WAV; bus inline priced ~1.5-2%), rank 11
 (Y-cull landed, pixel-identical, ~neutral in fights), rank 12/13 (no meat on hot paths),
