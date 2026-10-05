@@ -81,6 +81,36 @@ uint32_t perf_dr_copyt, perf_dr_flipt;
 #define DRAW_PERF_COARSE 1
 #endif
 
+// Draw-path timers and counters; all compile to nothing in a release build.
+//   DPERF_T0(t) / DPERF_ADD(acc, t): start a TICKS timer, add its elapsed
+//   ticks to acc (DRAW_PERF_COARSE: PERFOSD and PERFCOUNT builds).
+//   DPERF_INC(c): per-record counter (DRAW_PERF: PERFCOUNT builds only).
+//   dperf_tile(w0, w1): count a drawn tile, split by RDP path (G/H).
+#ifdef DRAW_PERF_COARSE
+#define DPERF_T0(t)        uint32_t t = TICKS_READ()
+#define DPERF_ADD(acc, t)  ((acc) += TICKS_DISTANCE(t, TICKS_READ()))
+// (same predicate as the ucode's modal test, cmd_sprite_draw)
+#define dperf_tile(w0, w1) do { \
+	perf_dr_tiles++; \
+	int _x = ((int32_t)((w1) << 20)) >> 20, _y = ((int32_t)((w1) << 8)) >> 20; \
+	if (_x >= 512-16) _x -= 512; \
+	if (_y >= 512-16) _y -= 512; \
+	if (((w1) >> 24) == 0xFF && _x >= 0 && _x <= 304 && _y >= -15 && _y <= 223) { \
+		if ((w0) & (3u << 28)) perf_dr_flipt++; \
+		else perf_dr_copyt++; \
+	} \
+} while (0)
+#else
+#define DPERF_T0(t)        ((void)0)
+#define DPERF_ADD(acc, t)  ((void)0)
+#define dperf_tile(w0, w1) ((void)0)
+#endif
+#ifdef DRAW_PERF
+#define DPERF_INC(c)       ((c)++)
+#else
+#define DPERF_INC(c)       ((void)0)
+#endif
+
 // --- sprite walk -------------------------------------------------------------
 // The SCB walk turns each visible tile into a record and draws it on the
 // spot. A record is two words, exactly what the draw needs:
@@ -143,36 +173,17 @@ void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
 #ifdef N64
 	// Fused empty-test + resolve through the C-ROM direct table (roms.c):
 	// one sparse read per record, NULL for an all-transparent tile.
-#ifdef DRAW_PERF_COARSE
-	uint32_t _c0 = TICKS_READ();
-#endif
+	DPERF_T0(c0);
 	uint8_t *src = crom_resolve_fast(cx, tnum);
-#ifdef DRAW_PERF_COARSE
-	perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
-#endif
+	DPERF_ADD(perf_dr_cache, c0);
 	if (!src) {
-#ifdef DRAW_PERF
-		perf_dr_empty++;
-#endif
+		DPERF_INC(perf_dr_empty);
 		return;
 	}
-#ifdef DRAW_PERF_COARSE
-	perf_dr_tiles++;
-	{   // same predicate as the ucode's modal test (cmd_sprite_draw)
-		int x = ((int32_t)(w1 << 20)) >> 20, y = ((int32_t)(w1 << 8)) >> 20;
-		if (x >= 512-16) x -= 512;
-		if (y >= 512-16) y -= 512;
-		if ((w1 >> 24) == 0xFF && x >= 0 && x <= 304 && y >= -15 && y <= 223) {
-			if (w0 & (3u << 28)) perf_dr_flipt++;
-			else perf_dr_copyt++;
-		}
-	}
-	uint32_t _r0 = TICKS_READ();
-#endif
+	dperf_tile(w0, w1);
+	DPERF_T0(r0);
 	rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1);
-#ifdef DRAW_PERF_COARSE
-	perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
-#endif
+	DPERF_ADD(perf_dr_rspq, r0);
 #else
 	// PC: skip tiles known to decode to all-transparent pixels (learned on
 	// first fetch; index-0 pixels never pass the alpha compare), then draw
@@ -236,9 +247,7 @@ static void sprite_walk(void) {
 		// speedup, pixel-identical by construction); chain bookkeeping
 		// (sx += sw) already happened above.
 		if (sy >= 224 && sy + sh <= 512) continue;
-#ifdef DRAW_PERF
-		perf_walk_spr++;
-#endif
+		DPERF_INC(perf_walk_spr);
 
 		// debugf("[VIDEO] sprite snum:%d xc:%04x yc:%04x zc:%04x pos:%d,%d sh:%d chain:%d repeat:%d tmap:%04x:%04x\n", snum, xc, yc, zc, sx, sy, sh, (yc & 0x40), repeat_tiles, tmap[0], tmap[1]);
 
@@ -291,9 +300,7 @@ static void sprite_walk(void) {
 
 			// Loop through the vertical sprite, tile by tile
 			while (y < maxy) {
-#ifdef DRAW_PERF
-				perf_walk_iter++;
-#endif
+				DPERF_INC(perf_walk_iter);
 				// Calculate the vertical size of this tile. This is
 				// a pixel-perfect formula using the magic table derived
 				// from the original NeoGeo L0 ROM.
