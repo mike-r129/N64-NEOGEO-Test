@@ -132,7 +132,8 @@ endif
 ASFLAGS += $(EXTRA_DEFINES)
 N64_ASFLAGS += $(EXTRA_DEFINES)
 # ...and to the RSP assembler (rsp_*.S build with RSPASFLAGS, not ASFLAGS),
-# so ucode-side verify gates (MVS64_BATCHDBG) can be driven the same way.
+# so ucode-side gates (e.g. -DMVS64_ROTA_OFF in rsp_video.S) can be driven
+# the same way.
 RSPASFLAGS += $(EXTRA_DEFINES)
 
 ROMNAME=$(notdir $(basename $(ROM)))
