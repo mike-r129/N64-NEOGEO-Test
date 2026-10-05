@@ -40,26 +40,25 @@ static inline bool srom_tile_empty_fast(int spritenum) {
 	return srom_tile_empty(spritenum);
 }
 
-// Same fact for sprite (C-ROM) tiles: all index-0 pixels can never touch
-// the screen (alpha-compare kills them in every palette). Learns lazily on
-// first fetch; reset by crom_set_bank.
+#ifndef N64
+// Same fact for sprite (C-ROM) tiles on the PC build: all index-0 pixels can
+// never touch the screen. Learns lazily on first fetch; reset by
+// crom_set_bank. (N64 uses the direct table below.)
 bool crom_tile_empty(int spritenum);
+#endif
 
-// Fused empty-test + lookup through the per-tile direct table: NULL if the
-// tile is all-transparent (skip it), else the cached pixel pointer (valid
-// for the rest of the frame). One sparse table read on the hot path.
-uint8_t* crom_resolve(int spritenum);
-
-// Same lookup, inlined, reading a per-render context (crom_resolve_ctx) that
-// the caller keeps in registers across the sprite walk. Identical results
-// to crom_resolve, including the LRU tick store; misses go out of line.
+// Fused empty-test + lookup through the per-tile C-ROM direct table, inlined,
+// reading a per-render context (crom_resolve_ctx) that the caller keeps in
+// registers across the sprite walk: NULL if the tile is all-transparent
+// (skip it), else the cached pixel pointer (valid for the rest of the frame).
+// One sparse table read on the hot path, plus the LRU tick store; misses go
+// out of line.
 typedef struct {
 	const uint16_t *dt;     // CROM direct table (0 unknown, 1 empty, 2 solid, >=3 slot+3)
-	uint8_t *slot_tick;     // per-slot LRU tick (possibly the uncached alias)
+	uint8_t *slot_tick;     // per-slot LRU tick (uncached alias on N64)
 	uint8_t *sprites;       // pixel slots, 128 bytes each
 	unsigned mask, ntiles;
-	uint8_t tick;           // (uint8_t)cur_tick, as crom_resolve stores it
-	int fast;               // mvs64_cdt_inline: use crom_resolve_fast
+	uint8_t tick;           // (uint8_t)cur_tick
 } CromResolveCtx;
 void crom_resolve_ctx(CromResolveCtx *c);
 uint8_t *crom_resolve_slowpath(unsigned sn);

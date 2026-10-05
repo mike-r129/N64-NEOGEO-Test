@@ -59,23 +59,6 @@ static unsigned int crom_mask;
 static unsigned int crom_num_tiles;
 unsigned int srom_num_tiles;    // non-static: srom_tile_empty_fast (roms.h)
 
-// CDT resolver-context knobs (layout-identical twins: -DMVS64_CDTCTX_OFF
-// builds both OFF). mvs64_cdt_inline: the walk resolves through
-// crom_resolve_fast with a per-frame context held in registers instead of
-// the out-of-line crom_resolve re-reading six scattered globals per record
-// (the CDT hit path swung 932 vs 293 us/frame with heap/link layout alone:
-// those global lines alias the sparse crom_dt reads in the 8 KB dcache).
-// mvs64_cdt_unc: the sprite cache's per-slot LRU ticks are written through
-// the uncached alias - a fire-and-forget store instead of a write-allocate
-// that evicts a line per record.
-#ifdef MVS64_CDTCTX_OFF
-int mvs64_cdt_inline __attribute__((section(".data"))) = 0;
-int mvs64_cdt_unc    __attribute__((section(".data"))) = 0;
-#else
-int mvs64_cdt_inline __attribute__((section(".data"))) = 1;
-int mvs64_cdt_unc    __attribute__((section(".data"))) = 1;
-#endif
-
 // C-ROM tile cache size in 128-byte slots. Fights draw 600-1000+ tiles per
 // frame and 1280 slots (160KB) thrashed: in ares, 4000 slots cut the miss
 // reads (PERFOSD C) 0.41 -> 0.07 ms/frame and draw CPU (V) by 0.6 ms.
@@ -98,14 +81,16 @@ static void rom_cache_init(void) {
 	sprite_cache_init(&srom_cache, 4*8, 256);
 	sprite_cache_init(&crom_cache, 8*16, slots);
 	#ifdef N64
-	// Give the C-ROM slot ticks their own 16-byte lines (always, so both
-	// twins have the same heap), so the uncached alias never shares a line
-	// with cached data that a later writeback could clobber.
+	// The C-ROM slot LRU ticks are written through the uncached alias: a
+	// fire-and-forget store per drawn record instead of a write-allocate
+	// that evicts a dcache line. They get their own 16-byte lines, so the
+	// alias never shares a line with cached data that a later writeback
+	// could clobber.
 	free(crom_cache.slot_tick);
 	uint8_t *st = memalign(16, (slots + 15) & ~15);
 	assertf(st, "memory allocation failed");
 	data_cache_hit_writeback_invalidate(st, (slots + 15) & ~15);
-	crom_cache.slot_tick = mvs64_cdt_unc ? (uint8_t *)UncachedAddr(st) : st;
+	crom_cache.slot_tick = (uint8_t *)UncachedAddr(st);
 	#endif
 }
 
@@ -166,15 +151,15 @@ uint8_t* srom_get_sprite(int spritenum) {
 	return pix;
 }
 
-// Empty-tile knowledge for the sprite (C) ROM — the render_sprites analogue
-// of srom_tile_empty above. An all-index-0 tile is fully transparent in
-// every palette (pal_convert forces color 0 alpha to 0 and the sprite path
-// draws with alpha-compare on), and tile pixel data is immutable ROM, so
-// emptiness is a stable per-tile fact: learn it on the first fetch, then
-// skip the cache lookup AND the RSP/RDP draw forever. samsho2's dense
-// sprite-background stages issue 8-10k tiles/frame at up to ~100% of the
-// frame budget; [PERF2] empty= reports how many draws this removes.
 #define CROM_MAX_TILES (1u << 18)   // 32MB of C-ROM; samsho2 uses 2^17
+
+#ifndef N64
+// Empty-tile knowledge for the sprite (C) ROM on the PC build — the
+// render_sprites analogue of srom_tile_empty above. An all-index-0 tile is
+// fully transparent in every palette, and tile pixel data is immutable ROM,
+// so emptiness is a stable per-tile fact: learn it on the first fetch, then
+// skip the cache lookup and the draw forever. (N64 keeps the same fact in
+// the C-ROM direct table below.)
 static uint8_t crom_known[CROM_MAX_TILES/8];
 static uint8_t crom_emptyb[CROM_MAX_TILES/8];
 
@@ -192,6 +177,7 @@ bool crom_tile_empty(int spritenum) {
 	}
 	return (crom_emptyb[byte] & bit) != 0;
 }
+#endif
 
 uint8_t* crom_get_sprite(int spritenum) {
 	spritenum &= crom_mask;
@@ -272,21 +258,10 @@ static uint8_t *crom_resolve_miss(unsigned sn, uint32_t e) {
 	return pix;
 }
 
-uint8_t* crom_resolve(int spritenum) {
-	unsigned sn = (unsigned)spritenum & crom_mask;
-	if (sn >= crom_num_tiles) sn = crom_num_tiles-1;
-	uint32_t e = crom_dt[sn];
-	if (e >= CDT_SLOT0) {
-		e -= CDT_SLOT0;
-		crom_cache.slot_tick[e] = crom_cache.cur_tick;
-		return crom_cache.sprites + (e << 7);
-	}
-	if (e == CDT_EMPTY)
-		return NULL;
-	return crom_resolve_miss(sn, e);
-}
-
-// Snapshot of everything crom_resolve reads, valid for one render: none of
+// Snapshot of everything crom_resolve_fast reads, valid for one render: the
+// walk keeps it in registers instead of re-reading six scattered globals per
+// record (whose lines alias the sparse crom_dt reads in the 8 KB dcache: the
+// hit path swung 932 vs 293 us/frame with heap/link layout alone). None of
 // it changes mid-walk (a miss may evict and demote crom_dt ENTRIES, but the
 // pointers, mask, tile count and tick stay fixed until rom_next_frame /
 // crom_set_bank, which run outside the walk).
@@ -297,7 +272,6 @@ void crom_resolve_ctx(CromResolveCtx *c) {
 	c->mask = crom_mask;
 	c->ntiles = crom_num_tiles;
 	c->tick = (uint8_t)crom_cache.cur_tick;
-	c->fast = mvs64_cdt_inline;
 }
 
 uint8_t *crom_resolve_slowpath(unsigned sn) {
@@ -357,8 +331,10 @@ void crom_set_bank(int bank) {
 		crom_num_tiles);
 
 	// Tile numbers refer to the new bank now: relearn emptiness.
+#ifndef N64
 	memset(crom_known, 0, sizeof(crom_known));
 	memset(crom_emptyb, 0, sizeof(crom_emptyb));
+#endif
 	free(crom_dt);
 	crom_dt = calloc(crom_num_tiles, sizeof(uint16_t));
 	assertf(crom_dt, "CROM direct table: out of memory (%u tiles)", crom_num_tiles);
