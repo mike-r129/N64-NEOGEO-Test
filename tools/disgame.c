@@ -1,6 +1,6 @@
 // Throwaway: disassemble the converted samsho2 program ROM (p.rom, already in
 // 68k big-endian order for m64k) at a 68k address range. Build:
-//   cc disgame.c m68kdasm.c -o disgame   (run from N64-NEOGEO/)
+//   cc -I. tools/disgame.c m68kdasm.c -o disgame   (from mvs64/; run from N64-NEOGEO/)
 #include <stdio.h>
 #include <stdlib.h>
 #include "m68k.h"
