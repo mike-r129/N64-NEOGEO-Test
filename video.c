@@ -109,11 +109,7 @@ static int sprwalk_rsp_ovfl;   // overflow count reported by the RSP walk
 #endif
 
 #ifdef N64
-	#if 1
-	#include "video_n64.c"
-	#else
-	#include "video_cpu.c"
-	#endif
+#include "video_n64.c"
 #else
 #include "video_cpu.c"
 #endif
