@@ -12,14 +12,16 @@ RSP, and tunes the 68000 core and the renderer for samsho2.
 ## Status
 
 - **Playable on real hardware** from a flash cart, with music, sound effects
-  and voices. Needs the 8 MB Expansion Pak. Audio runs at 11,025 Hz.
-- **Framerate:** not a locked 60 fps. The current build (sndfix6) runs at a
-  median 45.9 fps over scripted content windows in ares; busy fight scenes run
-  lower.
-- **Long sessions:** the latest builds fix the failures seen in long hardware
-  sessions: sound dying after 17.9 minutes, sound lost mid-round, and an RSP
-  crash after 30+ minutes. A long hardware soak of the latest build is in
-  progress.
+  and voices. Audio runs at 11,025 Hz. With the 8 MB Expansion Pak the C-ROM
+  tile cache gets 4,096 slots (512 KB); without it, 1,280.
+- **Framerate:** not a locked 60 fps. On a real console, fights usually run
+  around 50 fps; the heaviest fight scenes measured so far drop to about 42
+  (41.9 fps with ~785 sprite tiles on screen). In ares the scripted fight
+  windows have a median of 51.8 fps.
+- **Long sessions:** the failures seen in long hardware sessions (sound dying
+  after 17.9 minutes, sound lost mid-round, an RSP crash after 30+ minutes)
+  are fixed, and hardware play sessions since 2026-08-30 have run without
+  sound loss.
 - **Other games:** only samsho2 is tested. Games that upstream MVS64 booted may
   still build, but they have not been tested with sound or the performance
   work. The 68000 idle-skip list is tuned for samsho2, so other games also lose
@@ -31,9 +33,9 @@ RSP, and tunes the 68000 core and the renderer for samsho2.
 | --- | --- |
 | Sound | Z80 sound CPU and YM2610 (FM, SSG, ADPCM-A/B), integer-only. ADPCM samples stream from the cart. Audio reaches the N64 through an interrupt-fed ring, so it can never loop a stale buffer. |
 | RSP audio | ADPCM decode and FM synthesis run on the RSP (`rsp_audio.S`, `rsp_fm.S`), with channel state kept on the RSP between chunks. |
-| 68000 (m64k) | Inline fast paths for hot opcodes, fused DBF copy/fill loops, a working idle-skip, and an experimental dynarec (off by default). |
-| Video | Empty-tile skipping for sprites and the fix layer, a direct CROM tile table, and RDP load pipelining with COPY mode for plain 16x16 tiles. |
-| Reliability | Two libdragon rspq patches (`patches/`), wrap-safe timing, automatic restart of stalled RSP audio, and an on-screen audio-health overlay for hardware tests. |
+| 68000 (m64k) | Inline fast paths for hot opcodes, fused DBF copy/fill loops, inline stores to the video RAM ports, a working idle-skip, and an experimental dynarec (off by default). The core's hot data and code are pinned to fixed cache sets. |
+| Video | Empty-tile skipping for sprites and the fix layer, a direct C-ROM tile table, a 2-word RSP sprite command, RDP load pipelining with COPY mode for plain 16x16 tiles, and triple buffering. |
+| Reliability | Three libdragon rspq patches (`patches/`), wrap-safe timing, automatic restart of stalled RSP audio, and on-screen overlays for hardware tests. |
 
 ## Building
 
@@ -48,12 +50,16 @@ never be committed; see BUILDING.md §3.
 | Build | `EXTRA_DEFINES` | Use |
 | --- | --- | --- |
 | Release | `-DMVS64_QUIET` | Normal play; per-frame logging compiled out |
-| Hardware test | `-DMVS64_QUIET -DMVS64_SNDOSD` | Release plus the audio-health overlay and a health log on the SD card (`sd:/mvs64log.txt`) |
+| Performance overlay | `-DMVS64_QUIET -DMVS64_PERFOSD` | Release plus the frame-time overlay described below |
+| Audio-health test | `-DMVS64_QUIET -DMVS64_SNDOSD` | Release plus the audio-health overlay and a health log on the SD card (`sd:/mvs64log.txt`) |
 | Debug | none | Per-frame debug logging; slower on hardware |
 
-Make switches such as `WP_OFF=1`, `ADPCM_CPU=1`, `FP_OFF=1` and
-`BLOCKOPS_OFF=1` turn single optimizations back off for A/B tests. The
-experimental features below have their own switches.
+Make switches turn single optimizations back off for A/B tests:
+`WP_OFF=1` (whole-pump RSP audio), `ADPCM_CPU=1 WP_OFF=1` (all ADPCM on the
+CPU), `FP_OFF=1` (68000 fast paths), `BLOCKOPS_OFF=1` (fused DBF loops) and
+`PORTSTORE_OFF=1` (inline video-port stores). `FRAMESKIP=n` lets the emulator
+skip drawing up to n frames in a row when it falls behind, so game speed holds
+instead of slowing down; it is off by default.
 
 ## Experimental features (off by default)
 
@@ -90,17 +96,38 @@ have no template yet, so fps is flat. Wider template coverage is the next step.
 per-frame state hash used to check bit-exactness. Template notes are in
 [m64k/DYNREC-PHASE2-TEMPLATES.md](m64k/DYNREC-PHASE2-TEMPLATES.md).
 
-### Other experiments
+### Removed experiments
 
-| Feature | Enable with | What it does | Result |
-| --- | --- | --- | --- |
-| Predecoded dispatch | `PD_ON=1` | Scaffold that dispatches through pre-decoded records per guest address instead of the opcode table | 5.5-5.9 fps slower: the record stream thrashes the 8 KB data cache. Closed |
-| RSP sprite walk | `EXTRA_DEFINES=-DMVS64_WALK_RSP` | The RSP walks the sprite tables and builds the visible-tile list the CPU draws from | Bit-exact over 11,400 frames, but about 1.3 fps slower in typical scenes |
-| Batched sprite draw | `EXTRA_DEFINES=-DMVS64_SPRBATCH` | One RSP command per 64 sprite tiles instead of one per tile | Pixel-identical, but 0.8-1.6 fps slower |
+Predecoded 68000 dispatch (5.5-5.9 fps slower), the wave-3 fast paths (2.9-3.9
+fps slower), the RSP sprite walk (~1.3 fps slower), batched sprite drawing
+(0.8-1.6 fps slower) and synchronous per-chunk FM on the RSP (slower than the
+whole-pump offload) were measured, found slower, and removed from the tree.
+Their code is in git history and their numbers are in
+[PLAN-OPTIMIZATION.md](PLAN-OPTIMIZATION.md) and
+[PLAN-DRAW-RDP.md](PLAN-DRAW-RDP.md).
+
+## Reading the performance overlay
+
+Performance-overlay builds draw ten lines below the HUD, refreshed every 60
+frames. Times are milliseconds per emulated frame, averaged over the window;
+a frame at 60 fps has 16.7 ms.
+
+| Line | Meaning |
+| --- | --- |
+| `F d g` | Frames drawn per second, then emulated (game-speed) frames per second; they differ only with `FRAMESKIP` |
+| `M m S s` | 68000 time (including I/O and Z80 catch-up), sound time (Z80 + YM2610) |
+| `V v W w` | Drawing time on the CPU, then time spent waiting for a free display buffer (large when the RDP is the bottleneck) |
+| `B b L l` | Inside V: palette conversion at frame start, fix layer |
+| `R r` | Inside V: sprites |
+| `Q q E e` | Inside R: C-ROM tile lookups, RSP command issue; the rest of R is the sprite walk |
+| `C c N n` | Inside Q: tile-cache misses read from the cart, then sprite tiles drawn per frame |
+| `G g H h` | Tiles drawn in RDP COPY mode, then tiles that would be COPY but are flipped |
+| `A a X x` | Whole frame, then the part of it no other line accounts for |
+| `P p T t` | RDP pipe-busy and TMEM-busy time per drawn frame (real hardware only; ares reads 0) |
 
 ## Reading the audio-health overlay
 
-Hardware-test builds draw five lines in the top-left corner, refreshed every
+Audio-health builds draw five lines in the top-left corner, refreshed every
 60 frames.
 
 | Line | Meaning | Healthy |
@@ -139,6 +166,7 @@ next to `samsho2.zip`.
 | [PLAN-DRAW-RDP.md](PLAN-DRAW-RDP.md) | Draw pipeline plan and results |
 | [docs/archive/PLAN-BRINGUP.md](docs/archive/PLAN-BRINGUP.md) | Bring-up notes; the archive also holds the July build logs |
 | [m64k/README.md](m64k/README.md) | The 68000 core |
+| [tools/README.md](tools/README.md) | Measurement and correctness-gate scripts |
 
 ## Credits and licenses
 

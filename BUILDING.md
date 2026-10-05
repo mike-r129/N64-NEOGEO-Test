@@ -79,8 +79,9 @@ Pass the BIOS file as `BIOS=<that file>`; `sfix.sfix` is auto‑read beside it.
 
 Copy `mvs64-samsho2.z64` to your flash cart (EverDrive‑64 X7 via SD, or 64drive)
 and boot on a real N64. It is a native `.z64` (big‑endian) — **not** `.x64`
-(which is a Commodore‑64/VICE format, not an N64 format). An 8 MB Expansion Pak
-is recommended once sound is added (see `docs/archive/PLAN.md` §4).
+(which is a Commodore‑64/VICE format, not an N64 format). The 8 MB Expansion
+Pak is recommended: with it the C-ROM tile cache gets 4,096 slots instead of
+1,280.
 
 ## 5. PC reference build (for debugging / A‑B)
 
