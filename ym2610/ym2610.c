@@ -956,8 +956,7 @@ static void ym_off_died(void) {
  *   ON_OFF  -> {phase=0, state=REL}          (unconditional: ON forced ATT,
  *              so the following OFF's test was true by construction)
  * The key flag itself stays CPU-authoritative (FM_KEYON/OFF gate on it),
- * which is what makes the net-code automaton exact. wp_dirty marks channels
- * whose static params changed and need a re-pack; wp_hatch trips on SSG-EG
+ * which is what makes the net-code automaton exact. wp_hatch trips on SSG-EG
  * enable (dynamic ssgn mutation the RSP port excludes -> CPU-only resync). */
 enum { WPK_NONE = 0, WPK_ON = 1, WPK_OFF = 2, WPK_ON_OFF = 3 };
 /* ADPCM residency (full WP-M2): like the FM dynamics, the ADPCM waveform
@@ -989,7 +988,6 @@ static u32 rspa_kicked_seq, rspa_seen_seq;
 static int rspa_kicked_slot;
 static void rspwpa_pull_b(void);
 static u8 wp_keyev[4][4];   /* [fm chan 0..3 = CH 1,2,4,5][slot 0..3] */
-static u8 wp_dirty[4];
 static u8 wp_hatch;
 static u32 wp_hatch_count;
 /* YM2610 FM channel index (1,2,4,5) -> whole-pump channel slot, else -1 */
@@ -1005,15 +1003,8 @@ INLINE void wp_track_key(FM_CH *CH, int s, int on) {
 	else
 		wp_keyev[j][s] = (wp_keyev[j][s] == WPK_ON) ? WPK_ON_OFF : WPK_OFF;
 }
-
-INLINE void wp_mark_dirty(int c) {
-	const int j = (c >= 0 && c < 6) ? wp_chmap[c] : -1;
-	if (j >= 0)
-		wp_dirty[j] = 1;
-}
 #else
 #define wp_track_key(CH, s, on) ((void)0)
-#define wp_mark_dirty(c) ((void)0)
 #endif
 
 INLINE void FM_KEYON(FM_CH *CH, int s) {
@@ -1964,11 +1955,6 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 	CH = &CH[c];
 
 	SLOT = &(CH->SLOT[OPN_SLOT(r)]);
-
-	/* MVS64 whole-pump: every OPNWriteReg case changes static channel
-	 * params (rates/levels/freq/algo/pan) the RSP-resident copy must
-	 * refresh from; key events and LFO are tracked elsewhere. */
-	wp_mark_dirty(c);
 
 	switch (r & 0xf0) {
 	case 0x30: /* DET , MUL */
@@ -3256,17 +3242,11 @@ static int rspwp_dead2;   /* tentative; defined with the WP section below */
 /* Stage the source bytes one channel will consume this chunk: the bytes at
  * the even addresses in [now_addr, now_addr+nib-1], i.e. byte addresses
  * starting at (now_addr+1)>>1. Returns the byte count. */
-/* mvs64_stage_bulk: copy each run that lies inside the resident image or the
- * current window with one memcpy instead of a per-byte fetch. The first byte
- * of every run still goes through ym2610_vrom_fetch, so window refills happen
- * at exactly the same addresses as the per-byte loop. -DMVS64_STAGEBULK_OFF
- * builds the OFF twin; -DMVS64_STAGE_VERIFY checks every staged run against
- * a direct vrom_read ([STAGEV] counts). */
-#ifdef MVS64_STAGEBULK_OFF
-int mvs64_stage_bulk __attribute__((section(".data"))) = 0;
-#else
-int mvs64_stage_bulk __attribute__((section(".data"))) = 1;
-#endif
+/* Each run that lies inside the resident image or the current window is
+ * copied with one memcpy instead of a per-byte fetch. The first byte of every
+ * run still goes through ym2610_vrom_fetch, so window refills happen at
+ * exactly the same addresses as a per-byte loop would. -DMVS64_STAGE_VERIFY
+ * checks every staged run against a direct vrom_read ([STAGEV] counts). */
 #ifdef MVS64_STAGE_VERIFY
 void vrom_read(uint32_t offset, uint8_t *buf, int len);
 unsigned long stagev_runs, stagev_bad;
@@ -3275,44 +3255,35 @@ static u32 rspa_stage(int win, u32 now_addr, u32 nib, u8 *dst,
 		const u8 *resident, u32 size) {
 	u32 a0b = (now_addr + 1) >> 1;
 	u32 cnt = nib ? ((now_addr + nib + 1) >> 1) - a0b : 0;
-	u32 k;
-	if (mvs64_stage_bulk) {
-		k = 0;
-		while (k < cnt) {
-			u32 a = a0b + k, n;
-			if (a >= size) { dst[k++] = 0; continue; }
-			if (resident) {
-				n = size - a;
+	u32 k = 0;
+	while (k < cnt) {
+		u32 a = a0b + k, n;
+		if (a >= size) { dst[k++] = 0; continue; }
+		if (resident) {
+			n = size - a;
+			if (n > cnt - k) n = cnt - k;
+			memcpy(dst + k, resident + a, n);
+		} else {
+			struct ym2610_vwin *w = &ym2610_vwin[win];
+			dst[k] = ym2610_vrom_fetch(win, a);  /* refills on a miss */
+			if (w->valid && w->base == (a & ~(u32)(YM2610_VWIN_SIZE - 1))) {
+				n = w->base + YM2610_VWIN_SIZE - a;
+				if (n > size - a) n = size - a;
 				if (n > cnt - k) n = cnt - k;
-				memcpy(dst + k, resident + a, n);
+				memcpy(dst + k, w->buf + (a - w->base), n);
 			} else {
-				struct ym2610_vwin *w = &ym2610_vwin[win];
-				dst[k] = ym2610_vrom_fetch(win, a);  /* refills on a miss */
-				if (w->valid && w->base == (a & ~(u32)(YM2610_VWIN_SIZE - 1))) {
-					n = w->base + YM2610_VWIN_SIZE - a;
-					if (n > size - a) n = size - a;
-					if (n > cnt - k) n = cnt - k;
-					memcpy(dst + k, w->buf + (a - w->base), n);
-				} else {
-					n = 1;   /* fetch_slow had nothing to load */
-				}
-#ifdef MVS64_STAGE_VERIFY
-				{
-					static u8 vbuf[YM2610_VWIN_SIZE];
-					vrom_read(a, vbuf, (int)n);
-					stagev_runs++;
-					if (memcmp(vbuf, dst + k, n)) stagev_bad++;
-				}
-#endif
+				n = 1;   /* fetch_slow had nothing to load */
 			}
-			k += n;
+#ifdef MVS64_STAGE_VERIFY
+			{
+				static u8 vbuf[YM2610_VWIN_SIZE];
+				vrom_read(a, vbuf, (int)n);
+				stagev_runs++;
+				if (memcmp(vbuf, dst + k, n)) stagev_bad++;
+			}
+#endif
 		}
-	} else {
-		for (k = 0; k < cnt; k++) {
-			u32 a = a0b + k;
-			dst[k] = (a < size) ? (resident ? resident[a]
-			                                : ym2610_vrom_fetch(win, a)) : 0;
-		}
+		k += n;
 	}
 	if (cnt)
 		data_cache_hit_writeback(dst, (cnt + 15) & ~(u32)15);
@@ -4545,7 +4516,6 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 				| (wp_keyev[j][SLOT2] << 4) | (wp_keyev[j][SLOT4] << 6));
 	}
 	memset(wp_keyev, 0, sizeof(wp_keyev));
-	wp_dirty[0] = wp_dirty[1] = wp_dirty[2] = wp_dirty[3] = 0;
 	pb->sinq_phys = PhysicalAddr(sin_tab);
 	pb->tlb_phys = PhysicalAddr(tl_tab_base);
 	pb->n = (u16) n;
@@ -4752,7 +4722,6 @@ void YM2610Reset(void) {
 	YM2610_wp_finish();
 	rspwp_seeded = 0;
 	memset(wp_keyev, 0, sizeof(wp_keyev));
-	memset(wp_dirty, 0, sizeof(wp_dirty));
 	wpa_res = 0;
 	wpb_res = 0;
 	rspa_seen_seq = rspa_kicked_seq;   /* nothing left in flight */
