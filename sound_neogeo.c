@@ -1,10 +1,11 @@
-// NeoGeo sound subsystem: Z80 audio CPU (+ YM2610 in WS3).
+// NeoGeo sound subsystem: Z80 audio CPU + YM2610.
 //
 // Implements the sound.h seam with a real Z80 (superzazu core) running the
-// m.rom driver. Memory map, bank switching and I/O port layout follow the
-// NeoGeo hardware (cross-checked against gngeo). The YM2610 is not wired yet
-// (WS3): its ports are stubbed, so this boots the driver and completes the
-// 68k<->Z80 command handshake but still emits silence.
+// m.rom driver and the MAME YM2610 core (ym2610/). Memory map, bank switching
+// and I/O port layout follow the NeoGeo hardware (cross-checked against
+// gngeo). sound_gen_samples steps the Z80 in cycle-proportional slices and
+// synthesizes the YM2610 output between them; on N64 the FM and ADPCM
+// synthesis runs on the RSP (whole-pump offload, WHOLEPUMP-DESIGN.md).
 #include "sound.h"
 #include "emu.h"
 #include "roms.h"
@@ -92,8 +93,9 @@ static void trace_drain(void) {
 }
 #endif
 
-// Last register selected on YM port A (control-A write). Needed by both the
-// SNDTRACE event log and the N64 stuck-voice guard, so tracked unconditionally.
+// Last register selected on YM port A (control-A write). Only the SNDTRACE
+// event log reads it now (the stuck-voice guard that also did is gone); the
+// store stays unconditional because removing it moves the sound code.
 static uint8_t ym_addr_a;
 #ifdef MVS64_SNDTRACE
 static uint8_t ym_addr_b;                // last register selected on YM port B
@@ -158,7 +160,9 @@ static inline int z80_snap_eq(const struct z80snap *a, const struct z80snap *b) 
 	return a->q0 == b->q0 && a->q1 == b->q1 && a->q2 == b->q2;
 }
 
-// YM2610 stream output (interleaved s16 L/R), filled by YM2610Update_stream().
+// YM2610 stream output (interleaved s16 L/R), filled by YM2610Update_stream()
+// on the PC and WP_OFF=1 builds. Whole-pump N64 builds write the AI staging
+// buffer directly (ym2610_wp_dest_base) and never touch it.
 uint16_t play_buffer[16384];
 
 // Resident ADPCM sample ROM (v.rom) when RAM allows (PC build); NULL otherwise.
@@ -283,6 +287,9 @@ static void switchbank(int bank, uint16_t port) {
 // the callback keeps it in one hot line — same lesson class as the -O3
 // audio regression. The Z80's ~300 host cycles/step is cache behavior, not
 // call overhead. Don't retry inline-bus; attack step count / locality.
+// (Reads later went inline in a different shape that did pay off: the
+// branchless rmap page table in z80.h, 33dc60c. z80_read below now only
+// serves the callback API and the idle-spin peek.)
 static uint8_t z80_read(void *ud, uint16_t addr) {
 	(void)ud;
 	if (addr < 0x8000) return M_ROM[addr];               // fixed first 32KB

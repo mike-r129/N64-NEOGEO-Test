@@ -17,11 +17,11 @@
 #    to the C decoder for a whole chunk when ADPCM-B could hit its limit-wrap /
 #    repeat-restart paths. ADPCM-A end-of-sample and ADPCM-B end-stop ARE
 #    handled here (they are the common case).
-#  - All multiplies are scalar shift-add loops (the SU has no multiply; the
-#    VU's clamping semantics are easy to get subtly wrong). Every product here
-#    either fits in 32 bits or is used modulo 2^32 in a sum whose exact value
-#    fits (ADPCM-B interpolator), so shift-add is exact. The RSP has head room:
-#    this whole overlay is hidden behind the CPU's FM synthesis pass.
+#  - The SU has no multiply. Products go through VMUL16 (the VU multiplier,
+#    operands that fit s16), which replaced the scalar shift-add loops that
+#    were about half of the ADPCM-B chunk cost. Every product either fits in
+#    32 bits or is used modulo 2^32 in a sum whose exact value fits (ADPCM-B
+#    interpolator), so the results are exact.
 #
 # Commands:
 #  0x0 cmd_adpcm_test: DMA-in bytes from a0, add 1 to each, DMA-out to a1.

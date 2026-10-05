@@ -4517,7 +4517,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	/* ring full? the oldest must complete before its slot is reused. It is
 	 * always from an earlier, fully-emitted span (a span is at most 8
 	 * chunks and the ring holds 16), so collecting it here cannot race
-	 * emit's play_buffer copy. */
+	 * the emit of its own span. */
 	if (rspwp_seq - rspwp_coll >= RSPWP_RING) {
 		if (rspwp_coll >= rspwp_emitted || !rspwp_collect(1)) {
 			rspwp_dead2 = 1;
@@ -4564,12 +4564,12 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	return 1;
 }
 
-/* Ship the prepared chunk command. Split from the pack so the caller can
- * order it AFTER the synchronous per-chunk ADPCM collect: the ADPCM command
- * then only ever queues behind the PREVIOUS chunk's FM command, which has
- * the whole inter-chunk CPU stretch to drain — instead of this chunk's
- * ADPCM wait paying for this chunk's FM compute (measured: snd 121->146,
- * fps 29.3->20.8 with the kick at chunk top). */
+/* Ship the prepared chunk command. Split from the pack so the caller decides
+ * where the highpri write lands: YM2610Update_stream ships the PREVIOUS
+ * chunk's command at the top of the next chunk, giving it the whole
+ * inter-chunk CPU stretch to drain. (Before full WP-M2 deferred the ADPCM
+ * too, shipping it in the same chunk put a blocking ADPCM wait behind this
+ * chunk's FM compute: snd 121->146, fps 29.3->20.8.) */
 static void rspwp_ship(void) {
 	const int slot = rspwp_ship_slot;
 	if (slot < 0)
@@ -4980,8 +4980,9 @@ int YM2610TimerOver(int ch) {
 extern Uint16 play_buffer[16384];
 //static Uint32 buf_pos;
 
-/* MVS64: samples per channel-major batch. 64 keeps the per-chunk scratch
- * (~1KB) plus one channel's state inside the VR4300's 8KB dcache. */
+/* MVS64: samples per channel-major batch. 128 keeps the per-chunk scratch
+ * (~1.9KB of stack arrays) plus one channel's state inside the VR4300's 8KB
+ * dcache. */
 #ifndef YM_CHUNK
 #define YM_CHUNK 128   /* also defined earlier for the whole-pump structs */
 #endif
@@ -5093,11 +5094,11 @@ void YM2610Update_stream(int length) {
 #endif
 #endif
 #if defined(N64) && defined(MVS64_RSPWP)
-			/* Ship the PREVIOUS chunk's deferred FM command now, right
-			 * after this chunk's ADPCM kick: the ADPCM command sits ahead
-			 * of it in the highpri queue, so pass 3's rspa_wait never pays
-			 * for FM compute, while the FM command still gets this whole
-			 * chunk's CPU stretch to drain. (Shipping at pass-3-end instead
+			/* Ship the PREVIOUS chunk's deferred FM command now, at chunk
+			 * top, so it gets this whole chunk's CPU stretch to drain (with
+			 * full WP-M2 this chunk's ADPCM command is kicked later, on the
+			 * same ring slot, and nothing waits on it here). (Shipping at
+			 * pass-3-end instead
 			 * hit an rspq wedge: highpri fired into idle-halt/video windows
 			 * — RSP CRASH in display_get after ~30s. Keeping the highpri
 			 * writes back-to-back at chunk top is the pattern the ADPCM
@@ -5452,9 +5453,8 @@ void YM2610Update_stream(int length) {
 			if (wp_this) {
 				/* Deferred: bank the SSG+ADPCM+deltaT partial with the
 				 * pending chunk; the collect adds the RSP FM, clamps and
-				 * writes the AI destination directly. play_buffer keeps
-				 * garbage for this span (emit's copy of it is overwritten
-				 * at collect, always before the pump returns). */
+				 * writes the AI destination directly. Only pl advances
+				 * for this span; play_buffer is not read on WP builds. */
 				rspwp_pend_t * const pd =
 						&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
 				/* passes 1-3 accumulated into pd->acc_* directly (ax_l/ax_r

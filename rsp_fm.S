@@ -25,7 +25,11 @@
 #
 # Commands:
 #  0x0 cmd_fm_run: a0 = param block physical, a1 = out block physical,
-#                  a2 = sequence word (written last; CPU poll target)
+#                  a2 = sequence word (written last; CPU poll target).
+#                  The synchronous per-chunk path; no longer issued by the CPU.
+#  0x1 cmd_fm_wp:  as 0x0, plus a3 = RDRAM physical of the RSP-resident
+#                  dynamic-state block (whole-pump mode; see below). Shares
+#                  cmd_fm_run's body.
 #
 # PARAM LAYOUT (header 288 bytes + 4 channel blocks of 416):
 #  header:
