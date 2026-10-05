@@ -18,12 +18,6 @@ M64K_CONFIG += -DM64K_CONFIG_ADDR_WRAP=1
 # Enable the inline fast paths so the testsuite exercises them (with ADDRERR=1
 # they additionally cover the bail-to-generic odd-address route).
 M64K_CONFIG += -DM64K_FASTPATHS
-# M64K_PREDECODE (killed 2026-08-07, kept opt-in): the phase-1a record
-# dispatch was testsuite-green (125/126) but regressed -5.5..-5.9 fps in
-# every bucket — the per-PC record stream adds ~20+ cyc/insn of dcache
-# misses, more than phase-2 specialization could recover. Enable here to
-# re-test the machinery if the design is ever revisited.
-# M64K_CONFIG += -DM64K_PREDECODE
 # m64k dynarec phase-1 machinery (arena + empty block-table probes): opt-in
 # via make ... DYNREC_ON=1 so the testsuite covers the probe-instrumented
 # dispatch. (The EPC-range extension lives in the game's hw_n64.S and is

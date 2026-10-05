@@ -50,14 +50,6 @@ CFLAGS += -DM64K_FASTPATHS
 ASFLAGS += -DM64K_FASTPATHS
 N64_ASFLAGS += -DM64K_FASTPATHS
 endif
-# Per-PC predecode record dispatch (60fps campaign track A). Phase 1a is a
-# semantics-neutral scaffold (all pages route through the classic trampoline);
-# testsuite-covered via the standalone m64k Makefile. Opt-in: make ... PD_ON=1.
-ifdef PD_ON
-CFLAGS += -DM64K_PREDECODE
-ASFLAGS += -DM64K_PREDECODE
-N64_ASFLAGS += -DM64K_PREDECODE
-endif
 # m64k dynarec (60fps campaign, PLAN-OPTIMIZATION.md blueprint): translates
 # hot 68000 ROM code into MIPS blocks in a 256KB arena (per-instruction
 # templates, branch enders, direct block chaining, write-through An register
