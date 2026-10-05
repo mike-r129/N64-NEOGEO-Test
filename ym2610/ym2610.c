@@ -3129,12 +3129,13 @@ INLINE s32 OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
  * gate is ZERO mismatches over a long ares run).
  * ==========================================================================*/
 /* Wait-stall telemetry for the RSP offloads (AUTOINPUT/RSPWAITPROF builds):
- * cumulative ticks blocked on each seq poll + worst single wait, printed
- * every 256 FM chunks — so a stall source is measured, not guessed. */
+ * cumulative ticks blocked on each seq poll + worst single wait, printed as
+ * [RSPWAIT] every 128 whole-pump calls (YM2610_wp_finish_async) — so a stall
+ * source is measured, not guessed. WP_OFF=1 builds accumulate but never
+ * print. */
 #if defined(N64) && (defined(MVS64_AUTOINPUT) || defined(MVS64_RSPWAITPROF))
 #define RSPWAIT_PROF 1
 static u32 rspwait_fm, rspwait_fm_max, rspwait_adpcm, rspwait_adpcm_max;
-static u32 rspwait_chunks;
 #endif
 
 #if defined(N64) && defined(MVS64_RSPADPCM)
@@ -3789,15 +3790,15 @@ static void rspa_verify_cmp(int n, const s32 *refl, const s32 *refr,
 /* ============================================================================
  * MVS64: RSP FM synthesis offload (-DMVS64_RSPFM, N64 only).
  *
- * rsp_fm.S replays pass 1 of YM2610Update_stream bit-exactly for the shipped
- * channels: the shared EG tick schedule, the per-slot envelope state machine,
- * the operator chain with feedback/MEM, and the phase generators. Per chunk
- * the CPU ships each eligible channel's state plus a per-sample dp index into
- * a precomputed phase-delta table (this is how LFO phase modulation works
- * without the 16KB fn_table: the deltas depend only on the <=8 distinct
- * lfo_pm values in a chunk). Channels fall back to the C path per chunk when
- * any slot uses SSG-EG, or when a fast LFO (48/72Hz) yields >8 distinct
- * lfo_pm values. The silent-channel fast path stays on the CPU as before.
+ * rsp_fm.S replays pass 1 of YM2610Update_stream bit-exactly: the shared EG
+ * tick schedule, the per-slot envelope state machine, the operator chain with
+ * feedback/MEM, and the phase generators. The whole pump (MVS64_RSPWP below)
+ * packs each channel's static state plus a per-sample dp index into a
+ * precomputed phase-delta table per chunk (this is how LFO phase modulation
+ * works without the 16KB fn_table: the deltas depend only on the <=8 distinct
+ * lfo_pm values in a chunk). A chunk that cannot be packed (a slot using
+ * SSG-EG, or a fast LFO (48/72Hz) yielding >8 distinct lfo_pm values) hatches:
+ * the pump drains, adopts the RSP state and continues on the C path.
  *
  * The RSP reconstructs sin_tab from its first 256 entries by quarter folding;
  * rspfm_init() verifies that fold against the real table once at boot and
@@ -3868,7 +3869,7 @@ _Static_assert(offsetof(rspfm_out_t, echo) == 1024, "rspfm echo offset");
 _Static_assert(offsetof(rspfm_out_t, seq) == 2688, "rspfm seq offset");
 _Static_assert(sizeof(rspfm_out_t) == 2704, "rspfm out size");
 
-static int rspfm_dead;      /* fold-check fail or poll timeout */
+static int rspfm_dead;      /* sin fold check failed (collect timeouts latch rspwp_dead2) */
 static int rspfm_checked;
 /* last-sample pm cache values to restore into CH after adopting (pms only) */
 static u32 rspfm_pmkey_last[4];
