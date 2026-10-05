@@ -640,20 +640,16 @@ void plat_save_screenshot(const char *fn) {
 uint8_t *g_screen_ptr;
 int g_screen_pitch;
 
-#if defined(MVS64_FBCRC) || defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD)
+#if defined(MVS64_FBCRC) || defined(MVS64_SNDOSD)
 static surface_t *fbcrc_disp;
 #endif
 
-#if defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD) || defined(MVS64_PERFOSD)
+#if defined(MVS64_SNDOSD) || defined(MVS64_PERFOSD)
 // On-screen text for the hardware overlays (ares/paraLLEl-RDP does not model
 // the DPC counters, so RDP numbers come from a real console). dpcosd_text
-// draws a 4x6 bitmap font at 2x into a 16-bit buffer: DPCOSD and SNDOSD draw
-// onto the finished frame through the uncached segment (detach_wait first);
-// PERFOSD draws into its own texture (see below). The DPCOSD lines:
-//   F ff.f   emulated fps (wall-clock, 30-frame window)
-//   P pp.pp  RDP PIPE_BUSY ms per frame (60fps budget = 16.7ms)
-//   T tt.tt  RDP TMEM_BUSY ms per frame (texture-load serialization)
-//   B bb     PIPE_BUSY as % of DP_CLOCK (RDP duty cycle)
+// draws a 4x6 bitmap font at 2x into a 16-bit buffer: SNDOSD draws onto the
+// finished frame through the uncached segment (detach_wait first); PERFOSD
+// draws into its own texture (see below).
 static const uint8_t dpcosd_font[32][6] = {
 	{0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, // 0 1
 	{0x6,0x9,0x1,0x2,0x4,0xF}, {0xE,0x1,0x6,0x1,0x1,0xE}, // 2 3
@@ -713,8 +709,8 @@ static void dpcosd_text(uint16_t *fb, int stride_px, int x, int y, const char *s
 #endif
 
 #ifdef MVS64_PERFOSD
-// Hardware perf overlay that does NOT stall the pipeline: unlike SNDOSD/
-// DPCOSD (detach_wait, then CPU-draw onto the finished frame, which
+// Hardware perf overlay that does NOT stall the pipeline: unlike SNDOSD
+// (detach_wait, then CPU-draw onto the finished frame, which
 // serializes CPU and RDP every frame), the text is rendered into a small
 // RGBA16 texture only when the numbers change (every 60 drawn frames) and
 // blitted each frame with one copy-mode rectangle queued at the end of the
@@ -858,7 +854,7 @@ void plat_beginframe(void) {
 
 	g_screen_ptr = rdp_disp->buffer;
 	g_screen_pitch = 320*2;
-#if defined(MVS64_FBCRC) || defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD)
+#if defined(MVS64_FBCRC) || defined(MVS64_SNDOSD)
 	fbcrc_disp = rdp_disp;
 #endif
 
@@ -867,28 +863,6 @@ void plat_beginframe(void) {
 }
 
 void plat_endframe(void) {
-#ifdef MVS64_RDPDBG
-	// PLAN-DRAW-RDP Phase 3 recon rig: log the validated RDP stream for a
-	// few frames so we can read the EXACT SetOtherModes words the rdpq
-	// mode engine composes (render_begin_sprites standard mode, fix-layer
-	// copy mode). The ucode's mid-pass mode switches must reproduce the
-	// standard word bit-for-bit. Also doubles as a validator pass over the
-	// raw ucode stream (0 errors expected). Frame windows: ~900 (title)
-	// and ~3600 (attract demo, dense sprites).
-	{
-		static uint32_t rdpdbg_frame;
-		rdpdbg_frame++;
-		// Validation stays ON from frame 60 for the whole run (validator
-		// errors print regardless of the log flag); the full command dump
-		// is only windowed to keep the log readable.
-		if (rdpdbg_frame == 60)
-			rdpq_debug_start();
-		if (rdpdbg_frame == 900 || rdpdbg_frame == 3600)
-			rdpq_debug_log(true);
-		if (rdpdbg_frame == 903 || rdpdbg_frame == 3603)
-			rdpq_debug_log(false);
-	}
-#endif
 #ifdef MVS64_FBCRC
 	// Pixel-identity gate rig (PLAN-DRAW-RDP §6): drain the RDP, hash the
 	// finished frame, then show. FNV-1a over the visible 320x224 region,
@@ -914,47 +888,6 @@ void plat_endframe(void) {
 	fbcrc_frame++;
 	plat_log("[FBCRC] %lu %08lx\n", (unsigned long)g_frame,
 	         (unsigned long)crc);
-	display_show(fbcrc_disp);
-#elif defined(MVS64_DPCOSD)
-	rdpq_detach_wait();
-	{
-		static uint32_t clk0, pipe0, tmem0, tick0, accn;
-		static uint32_t acc_clk, acc_pipe, acc_tmem, acc_ticks;
-		static char l1[28], l2[28], l3[28], l4[28];
-		uint32_t clk  = *(volatile uint32_t*)0xA4100010 & 0xFFFFFF;
-		uint32_t pipe = *(volatile uint32_t*)0xA4100018 & 0xFFFFFF;
-		uint32_t tmem = *(volatile uint32_t*)0xA410001C & 0xFFFFFF;
-		uint32_t now  = TICKS_READ();
-		if (accn || clk0) {   // skip the bootstrap window
-			acc_clk  += (clk  - clk0)  & 0xFFFFFF;
-			acc_pipe += (pipe - pipe0) & 0xFFFFFF;
-			acc_tmem += (tmem - tmem0) & 0xFFFFFF;
-			acc_ticks += TICKS_DISTANCE(tick0, now);
-			accn++;
-		}
-		clk0 = clk; pipe0 = pipe; tmem0 = tmem; tick0 = now;
-		if (accn >= 30) {
-			// RDP clock = 62.5MHz -> 62500 cycles/ms
-			uint32_t pms = (uint32_t)((uint64_t)acc_pipe * 100 / (accn * 62500u));
-			uint32_t tms = (uint32_t)((uint64_t)acc_tmem * 100 / (accn * 62500u));
-			uint32_t bpc = acc_clk ? (uint32_t)((uint64_t)acc_pipe * 100 / acc_clk) : 0;
-			uint32_t f10 = acc_ticks ? (uint32_t)((uint64_t)TICKS_PER_SECOND * accn * 10 / acc_ticks) : 0;
-			sprintf(l1, "F %lu.%lu",  (unsigned long)(f10/10), (unsigned long)(f10%10));
-			sprintf(l2, "P %lu.%02lu", (unsigned long)(pms/100), (unsigned long)(pms%100));
-			sprintf(l3, "T %lu.%02lu", (unsigned long)(tms/100), (unsigned long)(tms%100));
-			sprintf(l4, "B %lu",      (unsigned long)bpc);
-			plat_log("[DPCOSD] f10=%lu pms=%lu tms=%lu busy=%lu\n",
-			         (unsigned long)f10, (unsigned long)pms,
-			         (unsigned long)tms, (unsigned long)bpc);
-			acc_clk = acc_pipe = acc_tmem = acc_ticks = accn = 0;
-		}
-		uint16_t *fb = (uint16_t *)UncachedAddr(fbcrc_disp->buffer);
-		int stride_px = fbcrc_disp->stride / 2;
-		dpcosd_text(fb, stride_px, 8,  8, l1);
-		dpcosd_text(fb, stride_px, 8, 22, l2);
-		dpcosd_text(fb, stride_px, 8, 36, l3);
-		dpcosd_text(fb, stride_px, 8, 50, l4);
-	}
 	display_show(fbcrc_disp);
 #elif defined(MVS64_SNDOSD)
 	rdpq_detach_wait();

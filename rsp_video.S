@@ -682,7 +682,7 @@ sprite_draw:
     # pipe drain covers every rotation hazard too, so the wrap syncs are
     # skipped on those records. SOM words are the VERBATIM payloads the
     # rdpq engine composes for these two modes, captured off the
-    # validated stream (MVS64_RDPDBG rig, 2026-08-08):
+    # validated stream (2026-08-08, with a since-removed rdpq log rig):
     #   1cyc: EF008CF000000201  "1cyc tlut alpha_compare cvg=[zap]"
     #   copy: EF20800000000001  "copy tlut alpha_compare" (fix layer's
     #         own copy mode — proven with the same CI4+TLUT+alpha setup)
