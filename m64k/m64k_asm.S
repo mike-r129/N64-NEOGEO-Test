@@ -41,6 +41,17 @@
 .endm
 
      .section .sdata
+#ifndef M64K_SDATA_SETOFS
+#define M64K_SDATA_SETOFS 0x8C0
+#endif
+# Pin this object's .sdata (context + dispatch tables, per-instruction hot)
+# to fixed dcache sets: 8KB-aligned, then offset to set 140. Otherwise it
+# moves with every .data change before it (e.g. PERFOSD vs release builds
+# put it on different sets). Set 140..194 overlaps only the tail of the Z80
+# work RAM in z80_hot, which z80_anchor.c pins at 0x1CF0; this pairing
+# measured fast (p24a). Costs < 10KB of .sdata padding.
+    .balign 8192
+    .space M64K_SDATA_SETOFS
 #ifdef M64K_SDATA_PAD
 # Layout steering (2026-08-07): the per-insn PERFCOUNT counter bump and the
 # per-insn m64k ctx accesses must not share a dcache set (8KB direct-mapped;
@@ -93,6 +104,17 @@ m64k_fp_imm_d16:
     .globl m64k_port_base
 m64k_port_base:
 #ifdef MVS64_PORTSTORE_OFF
+    .long 1
+#else
+    .long 0xFF3C0000
+#endif
+# MOVE.l to the address port (0x3C0000) = address write + data write, the
+# VRAM upload loops at 0xCEF2/0xCF34 (~90% of the port stores still
+# trapping: two traps per instruction). Own word for a layout-identical
+# OFF twin (-DMVS64_PORTL_OFF).
+    .globl m64k_portl_base
+m64k_portl_base:
+#if defined(MVS64_PORTSTORE_OFF) || defined(MVS64_PORTL_OFF)
     .long 1
 #else
     .long 0xFF3C0000
@@ -3138,6 +3160,32 @@ m64k_port_store:
     dispatch_next
 4:  sh result, %gprel(reg_vram_mod)(gp)  # ---- modulo port ----
     dispatch_next
+
+# MOVE.l to 0x3C0000 (movel_slow): what the SWL+SWR trap pair does - the
+# high word to the address port (asm_lspc_vram_addr_w), then the low word
+# to the data port (asm_lspc_vram_data_w), in that order.
+m64k_port_store_l:
+    srl t0, result, 16                 # SWL value: the high word
+    andi t2, t0, 0x8000
+    bnez t2, 1f
+    la t2, VIDEO_RAM
+    li t1, 0x7FFF
+    j 2f
+1:  la t2, VIDEO_RAM + 0x8000*2
+    li t1, 0x7FF
+2:  sw t2, %gprel(reg_vram_bank)(gp)
+    sh t1, %gprel(reg_vram_mask)(gp)
+    and t1, t0                         # t1 = new VRAM address, t2 = bank
+    sh t1, %gprel(reg_vram_addr)(gp)
+    addu t2, t1                        # data port with the low word
+    addu t2, t1
+    sh result, 0(t2)
+    lhu t2, %gprel(reg_vram_mod)(gp)
+    addu t1, t2
+    lhu t2, %gprel(reg_vram_mask)(gp)
+    and t1, t2
+    sh t1, %gprel(reg_vram_addr)(gp)
+    j main_loop
 #endif
 movew_fanp_dn:                         # ---- move.w (An)+,Dn  (8 cycles) ----
     andi t1, opcode, 7
@@ -3323,6 +3371,10 @@ OP(movel):
     andi t0, opcode, 7<<3           # isolate EA-destination mode
     xori t0, 4<<3                   # check if it's pre-decrement mode
     beqz t0, 1f                     # if so, write memory in reversed order
+#ifdef M64K_PORTSTORE
+    lw t1, %gprel(m64k_portl_base)(gp)
+    beq eaptr, t1, m64k_port_store_l  # MOVE.l to 0x3C0000 (standard order only)
+#endif
     .set noreorder
     swl result, 0(eaptr)            # standard order: SWL+SWR
     j main_loop

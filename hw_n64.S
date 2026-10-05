@@ -42,6 +42,8 @@
 perf_tlb_faults: .long 0
 	.globl perf_trap_ring_n
 perf_trap_ring_n: .long 0
+	.globl perf_trap_ring_skip
+perf_trap_ring_skip: .long 0
 	.section .bss
 	.balign 8
 	.globl perf_trap_hist
@@ -113,8 +115,9 @@ tlbcallhandler:
 	lw $2, 0($1)
 	addiu $2, 1
 	sw $2, 0($1)
-	# Sample ring ([TRAPS]): the first 1024 LSPC-page (0x3Cxxxx) store traps
-	# after a reset, as (host EPC, m_pc) pairs - which interpreter path and
+	# Sample ring ([TRAPS]): every 1024th LSPC-page (0x3Cxxxx) store trap
+	# (a uniform sample over the window; the first-N ring caught one burst)
+	# up to 1024 after a reset, as (host EPC, m_pc) pairs - which path and
 	# which guest code still trap. v1 parked in arg slot 1.
 	srl $1, k1, 16
 	xori $1, $1, 0x3C
@@ -125,6 +128,13 @@ tlbcallhandler:
 	beqz $1, 9f
 	 nop
 	sd $3, 8(sp)
+	la $1, perf_trap_ring_skip
+	lw $2, 0($1)
+	addiu $3, $2, 1
+	sw $3, 0($1)
+	andi $2, $2, 1023
+	bnez $2, 8f
+	 nop
 	la $1, perf_trap_ring_n
 	lw $2, 0($1)
 	sltiu $3, $2, 1024

@@ -34,6 +34,32 @@ LAWS:
 - Fix-layer/begin are small (L ~1.0, B ~0-0.4 ms); the walk itself (R-Q-E)
   is ~2 ms on hardware.
 
+### Round 4, part 2 (after the push): traps + layout pinning
+| Step (commit) | Evidence | Gate |
+| --- | --- | --- |
+| Sprite-command knobs passed to the walk as one packed local (1287a79) | E 0.30 -> 0.24 ms | FBCRC 14,083 f |
+| Uniform trap sampler, every 1024th port trap (216bf4d) | the first-1024 ring had caught one burst (CLR.w SCB loop) | - |
+| MOVE.l to 0x3C0000 inline (112f874, twin MVS64_PORTL_OFF) | port traps 268 -> 32/frame; twin M -0.15 ms, +0.4 fps | matched pair TRCRC 5,620 f + IO stream 21,732 reads; FBCRC 13,694 f |
+| z80.o rodata anchored to 8KB, z80_hot at 0x1CF0 (fae50c0) | S 5.31 -> 4.41 vs the unlucky build; pads move M/S/R <= 0.01 ms | layout only |
+| m64k .sdata block pinned at set 140 (0882a17) | same sets in PERFOSD and release builds; M/S/R = p24a | testsuite 125/126 |
+
+Dropped: CLR.w (An) port check in rmw16_eadst (flat: only ~16 traps/frame).
+
+LAWS:
+- **Layout is now pinned for the two CPU cores:** z80_anchor.c (linked
+  before z80.o) and the 8KB .balign at the top of m64k_asm.S's .sdata.
+  Edits before them no longer move the Z80/68k hot data. If z80.c's jump
+  tables change, re-derive MVS64_Z80_ANCHOR_PAD (see z80_anchor.c).
+- **Cross-tree FBCRC/TRCRC pairs still fork at f=3153 after pure speed or
+  layout changes** (fb7 vs fb8off: anchors only, no logic). Matched pairs
+  (same tree, knob flipped) are the only valid gate.
+- **68k opcode histogram (ophist3, in-fight):** 57% of executed insns take
+  fast paths; the generic remainder is a flat tail (largest forms grp0.w
+  #,Dn 1.45%, BTST #,(d16,An) 1.41%, JSR (xxx).L 1.26%, misc48 (d8,An,Xn)
+  1.24%, CMP.w (d16,An),Dn 1.02%). Each further fast path is worth < 0.1
+  ms and grows m64k text toward the wave-3 icache cliff - not pursued. The
+  remaining big 68k lever is the dynarec.
+
 ## 📊 2026-10-04 — ROUND 3 (branch perf-round3): HARDWARE-GUIDED, TRIPLE BUFFERING
 
 New hardware instrument MVS64_PERFOSD (1874703, 076ea2c): non-stalling

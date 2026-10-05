@@ -60,10 +60,16 @@ int mvs64_spr64 __attribute__((section(".data"))) = 0;
 #else
 int mvs64_spr64 __attribute__((section(".data"))) = 1;
 #endif
-static inline void rsp_sprite_draw2(uint32_t slot, uint32_t w0, uint32_t w1) {
+// mode: the caller's knob snapshot (video.c WALK_KNOB_2W), held in a register
+// across the walk instead of reloading the knobs after every uncached store.
+#define SPR_MODE_2W           1
+#define SPR_MODE_64           2
+#define SPR_MODE_FLUSH_SHIFT  2
+static inline void rsp_sprite_draw2(uint32_t slot, uint32_t w0, uint32_t w1, int mode) {
+	const int flush_every = mode >> SPR_MODE_FLUSH_SHIFT;
 	uint32_t word0 = (RSP_OVL_ID + (0x7 << 24)) | (slot << 10) | ((w0 >> 20) & 0x3FF);
 	volatile uint32_t *p = rspq_cur_pointer;
-	if (mvs64_spr64 && !((uint32_t)p & 7)) {
+	if ((mode & SPR_MODE_64) && !((uint32_t)p & 7)) {
 		*(volatile uint64_t *)p = ((uint64_t)word0 << 32) | w1;
 	} else {
 		p[1] = w1;
@@ -72,7 +78,7 @@ static inline void rsp_sprite_draw2(uint32_t slot, uint32_t w0, uint32_t w1) {
 	rspq_cur_pointer = p + 2;
 	if (__builtin_expect(rspq_cur_pointer > rspq_cur_sentinel, 0))
 		rspq_next_buffer();
-	if (mvs64_draw_flush_every && ++draw_since_flush >= mvs64_draw_flush_every) {
+	if (flush_every && ++draw_since_flush >= flush_every) {
 		draw_since_flush = 0;
 		rspq_flush();
 	}

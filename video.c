@@ -180,13 +180,17 @@ static inline void sprite_consume_begin(void);
 // Forced inline: as a call (GCC kept it out of line) every drawn tile paid
 // ~35 instructions of spills/reloads and prologue, and re-read the CDT
 // context and the knobs from memory. Callers read the knobs once into
-// locals and pass them in (cdt = mvs64_cdt_enable, two = mvs64_spr2w).
+// locals and pass them in: cdt = mvs64_cdt_enable, and two = the sprite
+// command mode, packed (SPR_MODE_*: 2-word command, 64-bit store, flush
+// interval) because the uncached command stores otherwise make GCC reload
+// each knob per tile.
 static inline __attribute__((always_inline))
 void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two);
 #ifdef N64
 extern int mvs64_cdt_enable;
 #define WALK_KNOB_CDT mvs64_cdt_enable
-#define WALK_KNOB_2W  mvs64_spr2w
+#define WALK_KNOB_2W  (mvs64_spr2w ? (SPR_MODE_2W | (mvs64_spr64 ? SPR_MODE_64 : 0) \
+                       | (mvs64_draw_flush_every << SPR_MODE_FLUSH_SHIFT)) : 0)
 #else
 #define WALK_KNOB_CDT 0
 #define WALK_KNOB_2W  0
@@ -471,7 +475,7 @@ void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int 
 #ifdef DRAW_PERF_COARSE
 			uint32_t _r0 = TICKS_READ();
 #endif
-			rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1);
+			rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1, two);
 #ifdef DRAW_PERF_COARSE
 			perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
 #endif

@@ -733,6 +733,11 @@ static inline void process_interrupts(z80* const z) {
 // initialises a z80 struct. Note that read_byte, write_byte, port_in, port_out
 // and userdata must be manually set by the user afterwards.
 void z80_init(z80* const z) {
+#ifdef N64
+  // MVS64: keep z80_anchor.c's alignment marker past --gc-sections.
+  extern const uint8_t z80_rodata_anchor[];
+  __asm__ volatile("" :: "r"(z80_rodata_anchor));
+#endif
   z->read_byte = NULL;
 #ifndef Z80_RMAP_OFF
   z->rmap = NULL;
