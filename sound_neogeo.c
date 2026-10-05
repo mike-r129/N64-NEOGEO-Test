@@ -129,13 +129,6 @@ static uint32_t g_z80_segs;
 // z80ms/ymms per 60-call interval (TICKS_PER_SECOND/1000 ticks per ms).
 #if defined(SND_HEALTH) && defined(N64)
 static uint32_t g_prof_z80t, g_prof_ymt;
-#ifdef MVS64_Z80WARM
-// Diagnostic: per-segment cold/warm split of Z80 stepping cost. The first
-// Z80WARM_N steps after each emit() run against caches the YM synthesis just
-// evicted; the rest run warm. [Z80WARM] reports ticks+steps for both halves.
-#define Z80WARM_N 32
-static uint32_t g_zw_ct, g_zw_cs, g_zw_wt, g_zw_ws, g_zw_seg;
-#endif
 static uint32_t g_prof_gen;   // whole sound_gen_samples body: genms - z80ms
                               // - ymms = the unaccounted seam (timer service,
                               // boundary math, RMS probe, wp ship/sweep)
@@ -388,11 +381,7 @@ void sound_init(void) {
 #ifdef N64
 		plat_log("[SND] N64: v.rom streamed from cart (%u bytes); ADPCM enabled\n", v_rom_size);
 #else
-		if (getenv("MVS64_NO_ADPCM")) {
-			// A/B: force the no-ADPCM condition (what N64 used to be).
-			adpcm_size = 0;
-			plat_log("[SND] MVS64_NO_ADPCM: ADPCM force-disabled\n");
-		} else if (getenv("MVS64_STREAM_ADPCM")) {
+		if (getenv("MVS64_STREAM_ADPCM")) {
 			// A/B: exercise the N64 streaming path on the PC build; the WAV
 			// must be byte-identical to the resident path.
 			plat_log("[SND] MVS64_STREAM_ADPCM: v.rom streamed (%u bytes)\n", v_rom_size);
@@ -465,14 +454,6 @@ void sound_write_command(uint8_t cmd) {
 	pending_command = 1;
 #ifdef MVS64_SNDTRACE
 	trace_push(1, cmd);
-#endif
-#ifdef MVS64_FASTBOOT
-	// Diagnostic only: the one-time SNK boot voice/jingle (cmd 0x01) runs the Z80
-	// flat-out (~957k steps, not idle-skippable) and drops the emulator to ~4fps,
-	// so ares takes minutes just to clear boot. It is silenced anyway. Skip its
-	// processing and fake the echo-ack reply so boot is fast and we can reach
-	// combat quickly for tracing. NOT for release builds.
-	if (cmd == 0x01) { result_code = cmd; pending_command = 0; return; }
 #endif
 	if (!z80_active) return;
 	// On N64 this runs inside the TLB/MMIO exception handler (68k sound-latch
@@ -644,10 +625,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #ifdef MVS64_Z80HIST
 		if ((long)(next - cpu.cyc) > 0) g_z80_segs++;
 #endif
-#ifdef MVS64_Z80WARM
-		int _zw_si = 0; uint32_t _zw_t = TICKS_READ();
-		if ((long)(next - cpu.cyc) > 0) g_zw_seg++;
-#endif
 		while ((long)(next - cpu.cyc) > 0) {   // wrap-safe (see NMI note)
 			z80_service_level_irq();   // must precede the HALT check: a
 			                           // re-delivered tick wakes a halted CPU
@@ -682,12 +659,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #endif
 #ifdef SND_HEALTH
 			g_z80_steps++;
-#endif
-#ifdef MVS64_Z80WARM
-			if (++_zw_si == Z80WARM_N) {
-				uint32_t t = TICKS_READ();
-				g_zw_ct += TICKS_DISTANCE(_zw_t, t); g_zw_cs += Z80WARM_N; _zw_t = t;
-			}
 #endif
 			if (z80_wrote) spin_armed = 0;      // any write breaks the pure spin
 #ifndef MVS64_NOIDLESKIP
@@ -743,10 +714,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		}
 #if defined(SND_HEALTH) && defined(N64)
 		g_prof_z80t += TICKS_DISTANCE(_zt0, TICKS_READ());
-#endif
-#ifdef MVS64_Z80WARM
-		if (_zw_si < Z80WARM_N) { g_zw_ct += TICKS_DISTANCE(_zw_t, TICKS_READ()); g_zw_cs += _zw_si; }
-		else { g_zw_wt += TICKS_DISTANCE(_zw_t, TICKS_READ()); g_zw_ws += _zw_si - Z80WARM_N; }
 #endif
 
 		// Generate samples up to the cycle-proportional point in the budget.
@@ -827,15 +794,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 				extern unsigned long stagev_runs, stagev_bad;
 				plat_log("[STAGEV] runs=%lu bad=%lu\n", stagev_runs, stagev_bad);
 			}
-#endif
-#ifdef MVS64_Z80WARM
-			// ticks are COUNT (cpu/2): host cyc/step = 2*ticks/steps
-			plat_log("[Z80WARM] seg=%lu cold=%lu/%lu warm=%lu/%lu cyc/step cold=%lu warm=%lu\n",
-				(unsigned long)g_zw_seg, (unsigned long)g_zw_ct, (unsigned long)g_zw_cs,
-				(unsigned long)g_zw_wt, (unsigned long)g_zw_ws,
-				(unsigned long)(g_zw_cs ? 2ull * g_zw_ct / g_zw_cs : 0),
-				(unsigned long)(g_zw_ws ? 2ull * g_zw_wt / g_zw_ws : 0));
-			g_zw_ct = g_zw_cs = g_zw_wt = g_zw_ws = g_zw_seg = 0;
 #endif
 			plat_log("[SNDTMR] fires=%d,%d\n", g_timer_fires[0], g_timer_fires[1]);
 			g_timer_fires[0] = g_timer_fires[1] = 0;

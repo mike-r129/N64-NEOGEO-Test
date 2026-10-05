@@ -113,30 +113,13 @@ DYNA:      .dcb.b 128
     .text
 
     #############################################################
-    # MULU: dst = mcand * mult, exact mod 2^32, for mult >= 0.
-    # Clobbers mcand, mult and one scratch reg. mult==0 -> dst=0.
-    #############################################################
-    .macro MULU dst, mcand, mult, tmp
-    move \dst, zero
-    beqz \mult, 9f
-    nop
-8:  andi \tmp, \mult, 1
-    subu \tmp, zero, \tmp
-    and  \tmp, \tmp, \mcand
-    addu \dst, \dst, \tmp
-    srl  \mult, \mult, 1
-    bnez \mult, 8b
-    sll  \mcand, \mcand, 1
-9:
-    .endm
-
-    #############################################################
     # VMUL16: dst = (s16)x * (s16)y, exact 32-bit product via the
     # VU multiplier: vmudh places the full product in ACC[47:16],
     # so ACC_HI = product[31:16] and ACC_MD = product[15:0].
     # BOTH OPERANDS MUST FIT s16. Clobbers \tmp and $v27-$v29
-    # lane 0. ~10 ops flat vs MULU's ~7 per multiplier bit — the
-    # shift-add loops were roughly half the ADPCM-B chunk cost.
+    # lane 0. ~10 ops flat vs ~7 per multiplier bit for the scalar
+    # shift-add multiply it replaced, whose loops were roughly half
+    # the ADPCM-B chunk cost.
     #############################################################
     .macro VMUL16 dst, x, y, tmp
     mtc2 \x, $v27.e0
