@@ -247,7 +247,6 @@ static inline void z80_service_level_irq(void) {
 // Window/bank geometry (see gngeo cpu_z80_switchbank):
 //   bank 0 -> 0x8000, 16KB, mask 0x0f   bank 1 -> 0xC000, 8KB,  mask 0x1f
 //   bank 2 -> 0xE000, 4KB,  mask 0x3f   bank 3 -> 0xF000, 2KB,  mask 0x7f
-#ifndef Z80_RMAP_OFF
 // Z80 read page map (see z80.h rmap): one pre-biased host pointer per 256-byte
 // page, mirroring z80_read's decode exactly. Every window is page-aligned, so
 // the map is exact; it is rebuilt at reset and per window on bank switch.
@@ -264,7 +263,6 @@ static void rmap_rebuild(void) {
 	rmap_fill(0xF8, 0x100, z80_ram);
 	cpu.rmap = z80_rmap;
 }
-#endif
 
 static void switchbank(int bank, uint16_t port) {
 	static const uint32_t bsize[4] = { 0x4000, 0x2000, 0x1000, 0x0800 };
@@ -272,9 +270,7 @@ static void switchbank(int bank, uint16_t port) {
 	uint32_t off = bsize[bank] * ((port >> 8) & bmask[bank]);
 	if (off < m_rom_size) {
 		z80_bank[bank] = M_ROM + off;
-#ifndef Z80_RMAP_OFF
 		rmap_fill(win_lo[bank], win_hi[bank], z80_bank[bank]);
-#endif
 	}
 }
 
@@ -360,9 +356,7 @@ void sound_init(void) {
 	cpu.write_byte = z80_write;
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
-#ifndef Z80_RMAP_OFF
 	cpu.rmap = z80_rmap;   // filled by sound_reset() below, before any step
-#endif
 #ifdef MVS64_CYCWRAP_TEST
 	// Wrap-gate rig — see the twin block in sound_reset().
 	cpu.cyc = 0xFFFFFFFFul - 4000000ul * 120ul;
@@ -420,9 +414,7 @@ void sound_reset(void) {
 	cpu.write_byte = z80_write;
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
-#ifndef Z80_RMAP_OFF
 	rmap_rebuild();
-#endif
 #ifdef MVS64_CYCWRAP_TEST
 	// Gate rig for the 2^32 cycle-counter wrap (the 17.9-minute permanent
 	// silence): park cyc ~2 minutes of audio time before the wrap so a short
@@ -652,11 +644,7 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #ifdef MVS64_Z80HIST
 			z80_hist[cpu.pc >> 4]++;
 #endif
-#ifdef MVS64_Z80STEP_CALL
-			z80_step(&cpu);                     // A/B: the out-of-line step
-#else
 			z80_step_inline(&cpu);
-#endif
 #ifdef SND_HEALTH
 			g_z80_steps++;
 #endif

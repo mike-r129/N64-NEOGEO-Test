@@ -892,7 +892,6 @@ u32 ym_off_deaths, ym_off_revives;
 int ym_off_structural;
 #if defined(N64) && (defined(MVS64_RSPADPCM) || defined(MVS64_RSPFM))
 #include <libdragon.h>            /* TICKS_* (idempotent re-include below) */
-#ifdef MVS64_WP_REVIVE
 static u32 ym_off_backoff_ms = 1000;
 static u32 ym_off_now_ms;         /* wrap-free monotonic ms, see ym_off_ms() */
 static u32 ym_off_ms_last_tick;
@@ -937,11 +936,8 @@ static void ym_off_incident(void) {
 	}
 	ym_off_dead_ms = ms;
 }
-#endif
 static void ym_off_died(void) {
-#ifdef MVS64_WP_REVIVE
 	ym_off_incident();
-#endif
 	ym_off_deaths++;
 }
 #endif
@@ -2010,9 +2006,7 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 			if (!wp_hatch)
 				wp_hatch_count++;
 			wp_hatch = 1;
-#ifdef MVS64_WP_REVIVE
 			ym_off_incident();   /* backoff anchor + budget-restore check */
-#endif
 		}
 #endif
 		SLOT->ssg = v & 0x0f;
@@ -4540,9 +4534,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 				ccs_oc1[algo], eg_base, OPN->eg_cnt, 1)) {
 			wp_hatch = 1;
 			rspwp_pack_hatches++;
-#ifdef MVS64_WP_REVIVE
 			ym_off_incident();   /* backoff anchor + budget-restore check */
-#endif
 			return 0;
 		}
 		/* no CPU-side skip knowledge: all slots due, no quiet locks */
@@ -4594,7 +4586,6 @@ static void rspwp_ship(void) {
 static int rspwp_ok(FM_CH **cch) {
 	if (!rspfm_checked)
 		rspfm_init();
-#ifdef MVS64_WP_REVIVE
 	/* Transient-stall hardening: a runtime dead-latch (RSP >50ms behind at
 	 * a blocking collect — e.g. RDP/RDRAM contention bursts on real
 	 * hardware) is retried after a backoff instead of writing the offload
@@ -4641,7 +4632,6 @@ static int rspwp_ok(FM_CH **cch) {
 					(unsigned long) ym_off_backoff_ms);
 		}
 	}
-#endif
 	if (rspfm_dead || rspwp_dead2 || wp_hatch) {
 		if (rspwp_seeded) {
 			YM2610_wp_finish();
@@ -4660,7 +4650,7 @@ static int rspwp_ok(FM_CH **cch) {
 #endif /* N64 && MVS64_RSPFM */
 
 #if defined(N64) && defined(MVS64_RSPWP) && defined(MVS64_WP_DEATHTEST)
-/* Test hook (emulator gate for MVS64_WP_REVIVE): fake a runtime dead-latch
+/* Test hook (emulator gate for the dead-latch revive): fake a runtime dead-latch
  * as if a blocking collect had timed out, so the revive cycle can be
  * exercised deterministically in ares without a real RSP stall. */
 void YM2610_offload_testkill(void) {

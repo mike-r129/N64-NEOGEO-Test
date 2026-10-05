@@ -109,12 +109,6 @@ ifndef WP_OFF
 CFLAGS += -DMVS64_RSPFM -DMVS64_RSPWP
 endif
 
-# Offload dead-latch revive (MVS64_WP_REVIVE, 8113e6f): retry a runtime
-# dead-latch on a 1s..16s doubling backoff instead of writing the offload
-# off for the session (the permanent mid-round sound-loss class diagnosed
-# 2026-08-09). Default ON since 2026-08-30: the user confirmed the sndfix
-# build survives real-hardware play sessions with no sound loss. Disable
-# with WP_REVIVE_OFF=1.
 ifdef FRAMESKIP
 # Auto frameskip: skip drawing up to $(FRAMESKIP) frames in a row when the
 # emulation is behind the VI clock, so game speed holds (emu_render, emu.c).
@@ -122,32 +116,15 @@ ifdef FRAMESKIP
 CFLAGS += -DMVS64_FRAMESKIP=$(FRAMESKIP)
 endif
 
-ifndef WP_REVIVE_OFF
-CFLAGS += -DMVS64_WP_REVIVE
-endif
-
-# NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
-# REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll
-# bloat thrashes the VR4300's 16KB icache in the synthesis loop. Keep -O2.
-# The opposite experiment (code-size-first, AUDIO_OS=1) was ALSO tried
-# (2026-07-07): -Os REGRESSED in-match snd% 136->155 (fps 22->19.3) — the
-# shorter-but-branchier codegen loses more in the synthesis inner loops than
-# the icache saves. -O2 is the confirmed sweet spot from both directions.
-ifdef AUDIO_OS
-$(BUILD_DIR)/ym2610/ym2610.o: CFLAGS += -Os
-$(BUILD_DIR)/z80.o: CFLAGS += -Os
-$(BUILD_DIR)/sound_neogeo.o: CFLAGS += -Os
-endif
-# Z80-core-only -Os (Z80_OS=1): MEASURED FLAT (2026-07-09). Text shrank 40%
-# (39KB->23KB) but us/Z80-step 3.37->3.42 and bucket-matched fps identical —
-# the interpreter's per-step cost is not switch-footprint-bound either (the
-# inline-bus experiment already ruled out callback overhead; struct layout is
-# already 3 hot dcache lines). Z80 stepping (~60% of snd, ~5.7ms/frame) is at
-# its practical interpreter floor; the next lever there is structural.
-# Knob kept off-by-default for reproducing the measurement.
-ifdef Z80_OS
-$(BUILD_DIR)/z80.o: CFLAGS += -Os
-endif
+# NOTE: the audio TUs (ym2610.c/z80.c/sound_neogeo.c) stay at -O2, measured
+# from both directions. -O3 REGRESSED in-match snd% by ~+40% (ares A/B,
+# 2026-07-02): the inline/unroll bloat thrashes the VR4300's 16KB icache in
+# the synthesis loop. -Os on all three REGRESSED snd% 136->155 (fps 22->19.3,
+# 2026-07-07): the shorter-but-branchier codegen loses more in the synthesis
+# inner loops than the icache saves. -Os on z80.c alone was FLAT (2026-07-09):
+# text shrank 40% but us/Z80-step 3.37->3.42 and bucket-matched fps were
+# identical, so Z80 stepping (~60% of snd) is at its interpreter floor; the
+# next lever there is structural.
 # Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
 # (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
 ASFLAGS += $(EXTRA_DEFINES)

@@ -63,11 +63,7 @@ struct z80_hot z80_hot __attribute__((aligned(16), section(".rodata.z80_hot"))) 
 #define GET_BIT(n, val) (((val) >> (n)) & 1)
 
 static inline uint8_t rb(z80* const z, uint16_t addr) {
-#ifndef Z80_RMAP_OFF
   return *(const uint8_t*)(z->rmap[addr >> 8] + addr);
-#else
-  return z->read_byte(z->userdata, addr);
-#endif
 }
 
 static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
@@ -77,12 +73,7 @@ static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
 // always_inline: two rmap loads; GCC otherwise outlines it (rw.isra), which
 // would put a call and a register frame back into the exec_opcode leaf.
 static inline __attribute__((always_inline)) uint16_t rw(z80* const z, uint16_t addr) {
-#ifndef Z80_RMAP_OFF
   return (rb(z, (uint16_t)(addr + 1)) << 8) | rb(z, addr);
-#else
-  return (z->read_byte(z->userdata, addr + 1) << 8) |
-         z->read_byte(z->userdata, addr);
-#endif
 }
 
 static inline void ww(z80* const z, uint16_t addr, uint16_t val) {
@@ -739,9 +730,7 @@ void z80_init(z80* const z) {
   __asm__ volatile("" :: "r"(z80_rodata_anchor));
 #endif
   z->read_byte = NULL;
-#ifndef Z80_RMAP_OFF
   z->rmap = NULL;
-#endif
   z->write_byte = NULL;
   z->port_in = NULL;
   z->port_out = NULL;
