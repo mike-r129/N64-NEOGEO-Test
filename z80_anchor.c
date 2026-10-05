@@ -1,6 +1,6 @@
 // Pins the Z80's per-step data to fixed dcache sets. z80.o's switch jump
 // tables (.rodata.<function> sections) and z80_hot (.rodata.z80_hot) are
-// read on every Z80 step and lie in one ~8.4 KB run, but that run used to
+// read on every Z80 step and lie in one ~7.4 KB run, but that run used to
 // start wherever the preceding .text/.rodata happened to end, so ANY edit
 // earlier in the image slid it across the 8 KB direct-mapped dcache. Most
 // positions are fine; some put it on sound data at fixed .bss addresses

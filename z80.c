@@ -1,6 +1,7 @@
 // Z80 CPU core — vendored from superzazu/z80 (https://github.com/superzazu/z80).
 // Copyright (c) 2019 Nicolas Allemand. MIT License — see z80.LICENSE.
-// Used as the NeoGeo audio CPU. Local modifications are marked "MVS64:".
+// Used as the NeoGeo audio CPU. Most local modifications are marked "MVS64:";
+// git history has the complete list.
 #include "z80.h"
 
 // MARK: timings
@@ -11,8 +12,8 @@
 // every Z80 step miss twice: 2x Z80 time). It is placed in a .rodata.*
 // input section (it is written at run time; RDRAM is not protected) so the
 // linker lays it out directly after this file's switch jump tables, also
-// read every step: tables + block are one ~8.4 KB run whose small wrap past
-// 8 KB lands on the CB/ED tables (~0.5% of steps).
+// read every step: tables + block are one ~7.4 KB run, shorter than the
+// dcache, so it cannot alias itself. z80_anchor.c pins where it starts.
 struct z80_hot z80_hot __attribute__((aligned(16), section(".rodata.z80_hot"))) = {
   .cyc_00 = {4, 10, 7, 6, 4, 4, 7, 4, 4, 11, 7, 6, 4, 4,
     7, 4, 8, 10, 7, 6, 4, 4, 7, 4, 12, 11, 7, 6, 4, 4, 7, 4, 7, 10, 16, 6, 4, 4,
