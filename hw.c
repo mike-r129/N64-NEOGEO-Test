@@ -102,12 +102,6 @@ uint32_t read_pbrom(uint32_t addr, int sz) {
 	return *rom;
 }
 
-#ifdef N64
-// I/O read trace ring buffer (boot-divergence debugging): last 1024 (68kPC,addr,val).
-volatile uint32_t io_trace[1024][3];
-volatile uint32_t io_trace_idx;
-#endif
-
 static uint32_t read_hwio_impl(uint32_t addr, int sz)  {
 	if (sz == 4) {
 		// NOTE: order is important

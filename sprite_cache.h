@@ -16,10 +16,6 @@ typedef struct {
 	uint16_t *free_sprite_indices;
 	int num_sprites;				// number of sprites currently in cache
 	SpriteCacheEntry *buckets;      // hashtable of the sprite entries
-	uint32_t evict_gen;             // bumped on every eviction: pixel buffers
-	                                // are reused after eviction, so any
-	                                // pointer memoized outside the cache is
-	                                // only valid while evict_gen is unchanged
 	int sprite_shift;               // log2(sprite_size): slot = offset >> shift
 	uint8_t *slot_tick;             // LRU tick per pixel slot (max_sprites):
 	                                // per SLOT, not per bucket, so a caller

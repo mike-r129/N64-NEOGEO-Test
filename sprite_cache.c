@@ -195,7 +195,6 @@ void sprite_cache_pop(SpriteCache *c) {
 			c->free_sprite_indices[c->max_sprites - c->num_sprites] = sprite_idx;
 			c->num_sprites--;
 			b->sprite = NULL;
-			c->evict_gen++;   // external memoized pointers are now stale
 			LOG("[CACHE] evicted (tick:%d cutoff:%d)\n", (int)b->last_tick, (int)c->tick_cutoff);
 			lcg = lcg * 1664525u + 1013904223u;
 			bidx = (lcg >> 16) & (c->num_buckets-1);
