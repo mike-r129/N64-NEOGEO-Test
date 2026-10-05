@@ -9,7 +9,7 @@ BUILD_DIR = build/mvs64
 
 include $(N64_INST)/include/n64.mk
 
-core_src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80_anchor.c z80.c ym2610/ym2610.c lib/rdl.c pcprof.c
+core_src = emu.c roms.c hw.c video.c platform_n64.c platform_n64_osd.c sprite_cache.c sound_neogeo.c z80_anchor.c z80.c ym2610/ym2610.c lib/rdl.c pcprof.c
 rsp = rsp_video.S rsp_audio.S rsp_fm.S
 ifdef MUSASHI
 # Fallback 68k core: portable Musashi (proven on the PC build). Slower than m64k
