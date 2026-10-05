@@ -1,6 +1,7 @@
 // Z80 CPU core — vendored from superzazu/z80 (https://github.com/superzazu/z80).
 // Copyright (c) 2019 Nicolas Allemand. MIT License — see z80.LICENSE.
-// Used as the NeoGeo audio CPU. Local modifications are marked "MVS64:".
+// Used as the NeoGeo audio CPU. Most local modifications are marked "MVS64:";
+// git history has the complete list.
 #include "z80.h"
 
 // MARK: timings
@@ -11,8 +12,8 @@
 // every Z80 step miss twice: 2x Z80 time). It is placed in a .rodata.*
 // input section (it is written at run time; RDRAM is not protected) so the
 // linker lays it out directly after this file's switch jump tables, also
-// read every step: tables + block are one ~8.4 KB run whose small wrap past
-// 8 KB lands on the CB/ED tables (~0.5% of steps).
+// read every step: tables + block are one ~7.4 KB run, shorter than the
+// dcache, so it cannot alias itself. z80_anchor.c pins where it starts.
 struct z80_hot z80_hot __attribute__((aligned(16), section(".rodata.z80_hot"))) = {
   .cyc_00 = {4, 10, 7, 6, 4, 4, 7, 4, 4, 11, 7, 6, 4, 4,
     7, 4, 8, 10, 7, 6, 4, 4, 7, 4, 12, 11, 7, 6, 4, 4, 7, 4, 7, 10, 16, 6, 4, 4,
@@ -63,11 +64,7 @@ struct z80_hot z80_hot __attribute__((aligned(16), section(".rodata.z80_hot"))) 
 #define GET_BIT(n, val) (((val) >> (n)) & 1)
 
 static inline uint8_t rb(z80* const z, uint16_t addr) {
-#ifndef Z80_RMAP_OFF
   return *(const uint8_t*)(z->rmap[addr >> 8] + addr);
-#else
-  return z->read_byte(z->userdata, addr);
-#endif
 }
 
 static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
@@ -77,12 +74,7 @@ static inline void wb(z80* const z, uint16_t addr, uint8_t val) {
 // always_inline: two rmap loads; GCC otherwise outlines it (rw.isra), which
 // would put a call and a register frame back into the exec_opcode leaf.
 static inline __attribute__((always_inline)) uint16_t rw(z80* const z, uint16_t addr) {
-#ifndef Z80_RMAP_OFF
   return (rb(z, (uint16_t)(addr + 1)) << 8) | rb(z, addr);
-#else
-  return (z->read_byte(z->userdata, addr + 1) << 8) |
-         z->read_byte(z->userdata, addr);
-#endif
 }
 
 static inline void ww(z80* const z, uint16_t addr, uint16_t val) {
@@ -739,9 +731,7 @@ void z80_init(z80* const z) {
   __asm__ volatile("" :: "r"(z80_rodata_anchor));
 #endif
   z->read_byte = NULL;
-#ifndef Z80_RMAP_OFF
   z->rmap = NULL;
-#endif
   z->write_byte = NULL;
   z->port_in = NULL;
   z->port_out = NULL;

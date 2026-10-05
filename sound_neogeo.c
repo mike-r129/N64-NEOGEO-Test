@@ -1,10 +1,11 @@
-// NeoGeo sound subsystem: Z80 audio CPU (+ YM2610 in WS3).
+// NeoGeo sound subsystem: Z80 audio CPU + YM2610.
 //
 // Implements the sound.h seam with a real Z80 (superzazu core) running the
-// m.rom driver. Memory map, bank switching and I/O port layout follow the
-// NeoGeo hardware (cross-checked against gngeo). The YM2610 is not wired yet
-// (WS3): its ports are stubbed, so this boots the driver and completes the
-// 68k<->Z80 command handshake but still emits silence.
+// m.rom driver and the MAME YM2610 core (ym2610/). Memory map, bank switching
+// and I/O port layout follow the NeoGeo hardware (cross-checked against
+// gngeo). sound_gen_samples steps the Z80 in cycle-proportional slices and
+// synthesizes the YM2610 output between them; on N64 the FM and ADPCM
+// synthesis runs on the RSP (whole-pump offload, WHOLEPUMP-DESIGN.md).
 #include "sound.h"
 #include "emu.h"
 #include "roms.h"
@@ -92,10 +93,8 @@ static void trace_drain(void) {
 }
 #endif
 
-// Last register selected on YM port A (control-A write). Needed by both the
-// SNDTRACE event log and the N64 stuck-voice guard, so tracked unconditionally.
-static uint8_t ym_addr_a;
 #ifdef MVS64_SNDTRACE
+static uint8_t ym_addr_a;                // last register selected on YM port A
 static uint8_t ym_addr_b;                // last register selected on YM port B
 #endif
 
@@ -129,13 +128,6 @@ static uint32_t g_z80_segs;
 // z80ms/ymms per 60-call interval (TICKS_PER_SECOND/1000 ticks per ms).
 #if defined(SND_HEALTH) && defined(N64)
 static uint32_t g_prof_z80t, g_prof_ymt;
-#ifdef MVS64_Z80WARM
-// Diagnostic: per-segment cold/warm split of Z80 stepping cost. The first
-// Z80WARM_N steps after each emit() run against caches the YM synthesis just
-// evicted; the rest run warm. [Z80WARM] reports ticks+steps for both halves.
-#define Z80WARM_N 32
-static uint32_t g_zw_ct, g_zw_cs, g_zw_wt, g_zw_ws, g_zw_seg;
-#endif
 static uint32_t g_prof_gen;   // whole sound_gen_samples body: genms - z80ms
                               // - ymms = the unaccounted seam (timer service,
                               // boundary math, RMS probe, wp ship/sweep)
@@ -165,7 +157,9 @@ static inline int z80_snap_eq(const struct z80snap *a, const struct z80snap *b) 
 	return a->q0 == b->q0 && a->q1 == b->q1 && a->q2 == b->q2;
 }
 
-// YM2610 stream output (interleaved s16 L/R), filled by YM2610Update_stream().
+// YM2610 stream output (interleaved s16 L/R), filled by YM2610Update_stream()
+// on the PC and WP_OFF=1 builds. Whole-pump N64 builds write the AI staging
+// buffer directly (ym2610_wp_dest_base) and never touch it.
 uint16_t play_buffer[16384];
 
 // Resident ADPCM sample ROM (v.rom) when RAM allows (PC build); NULL otherwise.
@@ -254,7 +248,6 @@ static inline void z80_service_level_irq(void) {
 // Window/bank geometry (see gngeo cpu_z80_switchbank):
 //   bank 0 -> 0x8000, 16KB, mask 0x0f   bank 1 -> 0xC000, 8KB,  mask 0x1f
 //   bank 2 -> 0xE000, 4KB,  mask 0x3f   bank 3 -> 0xF000, 2KB,  mask 0x7f
-#ifndef Z80_RMAP_OFF
 // Z80 read page map (see z80.h rmap): one pre-biased host pointer per 256-byte
 // page, mirroring z80_read's decode exactly. Every window is page-aligned, so
 // the map is exact; it is rebuilt at reset and per window on bank switch.
@@ -271,7 +264,6 @@ static void rmap_rebuild(void) {
 	rmap_fill(0xF8, 0x100, z80_ram);
 	cpu.rmap = z80_rmap;
 }
-#endif
 
 static void switchbank(int bank, uint16_t port) {
 	static const uint32_t bsize[4] = { 0x4000, 0x2000, 0x1000, 0x0800 };
@@ -279,9 +271,7 @@ static void switchbank(int bank, uint16_t port) {
 	uint32_t off = bsize[bank] * ((port >> 8) & bmask[bank]);
 	if (off < m_rom_size) {
 		z80_bank[bank] = M_ROM + off;
-#ifndef Z80_RMAP_OFF
 		rmap_fill(win_lo[bank], win_hi[bank], z80_bank[bank]);
-#endif
 	}
 }
 
@@ -294,6 +284,9 @@ static void switchbank(int bank, uint16_t port) {
 // the callback keeps it in one hot line — same lesson class as the -O3
 // audio regression. The Z80's ~300 host cycles/step is cache behavior, not
 // call overhead. Don't retry inline-bus; attack step count / locality.
+// (Reads later went inline in a different shape that did pay off: the
+// branchless rmap page table in z80.h, 33dc60c. z80_read below now only
+// serves the callback API and the idle-spin peek.)
 static uint8_t z80_read(void *ud, uint16_t addr) {
 	(void)ud;
 	if (addr < 0x8000) return M_ROM[addr];               // fixed first 32KB
@@ -330,7 +323,9 @@ static void z80_out(z80 *z, uint16_t port, uint8_t val) {
 	z80_wrote = 1;                                        // taints idle-skip window
 	switch (port & 0xff) {
 	case 0x04: YM2610Write(0, val);
+#ifdef MVS64_SNDTRACE
 		ym_addr_a = val;                                 // register select (bank A)
+#endif
 		break;                                           // control A
 	case 0x05: YM2610Write(1, val);
 #ifdef MVS64_SNDTRACE
@@ -367,9 +362,7 @@ void sound_init(void) {
 	cpu.write_byte = z80_write;
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
-#ifndef Z80_RMAP_OFF
 	cpu.rmap = z80_rmap;   // filled by sound_reset() below, before any step
-#endif
 #ifdef MVS64_CYCWRAP_TEST
 	// Wrap-gate rig — see the twin block in sound_reset().
 	cpu.cyc = 0xFFFFFFFFul - 4000000ul * 120ul;
@@ -388,11 +381,7 @@ void sound_init(void) {
 #ifdef N64
 		plat_log("[SND] N64: v.rom streamed from cart (%u bytes); ADPCM enabled\n", v_rom_size);
 #else
-		if (getenv("MVS64_NO_ADPCM")) {
-			// A/B: force the no-ADPCM condition (what N64 used to be).
-			adpcm_size = 0;
-			plat_log("[SND] MVS64_NO_ADPCM: ADPCM force-disabled\n");
-		} else if (getenv("MVS64_STREAM_ADPCM")) {
+		if (getenv("MVS64_STREAM_ADPCM")) {
 			// A/B: exercise the N64 streaming path on the PC build; the WAV
 			// must be byte-identical to the resident path.
 			plat_log("[SND] MVS64_STREAM_ADPCM: v.rom streamed (%u bytes)\n", v_rom_size);
@@ -431,9 +420,7 @@ void sound_reset(void) {
 	cpu.write_byte = z80_write;
 	cpu.port_in    = z80_in;
 	cpu.port_out   = z80_out;
-#ifndef Z80_RMAP_OFF
 	rmap_rebuild();
-#endif
 #ifdef MVS64_CYCWRAP_TEST
 	// Gate rig for the 2^32 cycle-counter wrap (the 17.9-minute permanent
 	// silence): park cyc ~2 minutes of audio time before the wrap so a short
@@ -465,14 +452,6 @@ void sound_write_command(uint8_t cmd) {
 	pending_command = 1;
 #ifdef MVS64_SNDTRACE
 	trace_push(1, cmd);
-#endif
-#ifdef MVS64_FASTBOOT
-	// Diagnostic only: the one-time SNK boot voice/jingle (cmd 0x01) runs the Z80
-	// flat-out (~957k steps, not idle-skippable) and drops the emulator to ~4fps,
-	// so ares takes minutes just to clear boot. It is silenced anyway. Skip its
-	// processing and fake the echo-ack reply so boot is fast and we can reach
-	// combat quickly for tracing. NOT for release builds.
-	if (cmd == 0x01) { result_code = cmd; pending_command = 0; return; }
 #endif
 	if (!z80_active) return;
 	// On N64 this runs inside the TLB/MMIO exception handler (68k sound-latch
@@ -644,10 +623,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #ifdef MVS64_Z80HIST
 		if ((long)(next - cpu.cyc) > 0) g_z80_segs++;
 #endif
-#ifdef MVS64_Z80WARM
-		int _zw_si = 0; uint32_t _zw_t = TICKS_READ();
-		if ((long)(next - cpu.cyc) > 0) g_zw_seg++;
-#endif
 		while ((long)(next - cpu.cyc) > 0) {   // wrap-safe (see NMI note)
 			z80_service_level_irq();   // must precede the HALT check: a
 			                           // re-delivered tick wakes a halted CPU
@@ -675,19 +650,9 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 #ifdef MVS64_Z80HIST
 			z80_hist[cpu.pc >> 4]++;
 #endif
-#ifdef MVS64_Z80STEP_CALL
-			z80_step(&cpu);                     // A/B: the out-of-line step
-#else
 			z80_step_inline(&cpu);
-#endif
 #ifdef SND_HEALTH
 			g_z80_steps++;
-#endif
-#ifdef MVS64_Z80WARM
-			if (++_zw_si == Z80WARM_N) {
-				uint32_t t = TICKS_READ();
-				g_zw_ct += TICKS_DISTANCE(_zw_t, t); g_zw_cs += Z80WARM_N; _zw_t = t;
-			}
 #endif
 			if (z80_wrote) spin_armed = 0;      // any write breaks the pure spin
 #ifndef MVS64_NOIDLESKIP
@@ -743,10 +708,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 		}
 #if defined(SND_HEALTH) && defined(N64)
 		g_prof_z80t += TICKS_DISTANCE(_zt0, TICKS_READ());
-#endif
-#ifdef MVS64_Z80WARM
-		if (_zw_si < Z80WARM_N) { g_zw_ct += TICKS_DISTANCE(_zw_t, TICKS_READ()); g_zw_cs += _zw_si; }
-		else { g_zw_wt += TICKS_DISTANCE(_zw_t, TICKS_READ()); g_zw_ws += _zw_si - Z80WARM_N; }
 #endif
 
 		// Generate samples up to the cycle-proportional point in the budget.
@@ -827,15 +788,6 @@ int sound_gen_samples(int16_t *out, int nsamples) {
 				extern unsigned long stagev_runs, stagev_bad;
 				plat_log("[STAGEV] runs=%lu bad=%lu\n", stagev_runs, stagev_bad);
 			}
-#endif
-#ifdef MVS64_Z80WARM
-			// ticks are COUNT (cpu/2): host cyc/step = 2*ticks/steps
-			plat_log("[Z80WARM] seg=%lu cold=%lu/%lu warm=%lu/%lu cyc/step cold=%lu warm=%lu\n",
-				(unsigned long)g_zw_seg, (unsigned long)g_zw_ct, (unsigned long)g_zw_cs,
-				(unsigned long)g_zw_wt, (unsigned long)g_zw_ws,
-				(unsigned long)(g_zw_cs ? 2ull * g_zw_ct / g_zw_cs : 0),
-				(unsigned long)(g_zw_ws ? 2ull * g_zw_wt / g_zw_ws : 0));
-			g_zw_ct = g_zw_cs = g_zw_wt = g_zw_ws = g_zw_seg = 0;
 #endif
 			plat_log("[SNDTMR] fires=%d,%d\n", g_timer_fires[0], g_timer_fires[1]);
 			g_timer_fires[0] = g_timer_fires[1] = 0;

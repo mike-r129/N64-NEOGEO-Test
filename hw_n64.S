@@ -988,3 +988,14 @@ __m64k_dyntest_thunk:
 	addiu sp, sp, 32
 	jr ra
 #endif
+
+#if !defined(MVS64_PERFCOUNT) && !defined(M64K_DYNREC)
+# Layout pin. m64k_asm.o links right after this object, so the size of this
+# .text decides which icache sets the whole 68k interpreter lands on (it
+# starts at 0x80000e00 today). Hold it fixed: growing past the mark is an
+# assembler error, and shrinking pads with zeros. Moving it on purpose is a
+# re-baseline: bump the size, then re-measure M/S in a PERFOSD build.
+# (PERFCOUNT and DYNREC builds add trap-path code here and are not pinned.)
+#define HW_N64_TEXT_SIZE 0x980
+	.org HW_N64_TEXT_SIZE
+#endif

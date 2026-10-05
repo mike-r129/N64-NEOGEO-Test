@@ -35,7 +35,6 @@ struct z80 {
   bool iff1 : 1, iff2 : 1;
   bool halted : 1;
   bool int_pending : 1, nmi_pending : 1;
-#ifndef Z80_RMAP_OFF
   // MVS64 read page map: byte at addr = *(uint8_t*)(rmap[addr >> 8] + addr).
   // Entries are host pointers pre-biased by the page's Z80 base address, so
   // every memory READ (opcode/operand fetch, data) is a branchless inline
@@ -43,7 +42,6 @@ struct z80 {
   // sync with its memory map (bank switches); read_byte must still be set
   // for owners that call it directly. Writes stay on write_byte.
   const uintptr_t* rmap;
-#endif
 };
 
 // MVS64: the Z80 per-step working set in one contiguous, 16-byte aligned
@@ -70,7 +68,7 @@ void z80_gen_int(z80* const z, uint8_t data);
 // away; interrupt servicing stays out of line. Identical to z80_step.
 void z80_exec_opcode(z80* const z, uint8_t opcode);
 void z80_process_interrupts(z80* const z);
-#if !defined(Z80_RMAP_OFF) && !defined(MVS64_Z80OPHIST)
+#ifndef MVS64_Z80OPHIST
 static inline void z80_step_inline(z80* const z) {
   uint8_t opcode = 0x00;               // HALT executes NOPs in place
   if (!z->halted) {

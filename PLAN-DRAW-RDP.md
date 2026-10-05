@@ -1,7 +1,14 @@
 # PLAN-DRAW-RDP.md — Dense-Scene Draw Path Redesign (structural candidate (b))
 
-**Status: NOT STARTED. Execute after the dynarec track (candidate (a), task #38
-lineage) reaches a stopping point.** This is the plan for the second of the two
+**Status: CLOSED.** Phase 0 is done; Phase 1 was killed by its decision data;
+Phase 2 (batch draw) was gated green but net-negative and was removed from the
+tree in the cleanup branch, together with the shelved RSP sprite walk; Phase 3
+§7.1+§7.2 (TMEM rotation, COPY-mode modal template) landed default-on; Phase
+3.3 (TLUT preload) was not started. See RESULTS. Section 2's map describes the
+2026-08-07 code; the consume path is now the CROM direct table (roms.c
+crom_resolve) feeding the 2-word cmd_sprite_draw2.
+
+Original header: this is the plan for the second of the two
 structural 60fps bets named in PLAN-OPTIMIZATION.md's campaign outlook:
 
 > (b) RDP-side redesign of the dense-scene draw path

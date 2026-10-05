@@ -93,9 +93,10 @@ label + charge placement:
 5. MOVE.w #imm,(An) [movew_fsrc_other tail:2904, 12]: imm baked.
 6. MOVE.w (An)+,(An) [movew_fsrc_anp:2925, 8+4]: same-register dst
    re-read AFTER src writeback — keep both AREGS reads in emitted order.
-7. TST/CLR/LEA/ADDA/CMP/ADDQ/JSR/BSR: transcribe from the parked W3_FULL
-   bodies (m64k_asm.S, #ifdef M64K_W3_FULL) — they are testsuite-covered
-   and already charge/flag-exact. Do NOT invent sequences.
+7. TST/CLR/LEA/ADDA/CMP/ADDQ/JSR/BSR: transcribe from the wave-3 W3_FULL
+   bodies (removed from the tree in the cleanup branch; read them at
+   c11ed5b:m64k/m64k_asm.S, #ifdef M64K_W3_FULL) — they were
+   testsuite-covered and charge/flag-exact. Do NOT invent sequences.
 
 Control transfers END a block in phase 2a (no emitted branches). A block
 is: head + maximal run of supported straight-line forms; stop at the

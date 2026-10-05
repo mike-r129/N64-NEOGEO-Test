@@ -1,6 +1,6 @@
 // Throwaway disassembler: loads the (byteswapped) Universe BIOS into the 68k
 // address space at 0xC00000 (mirrored at 0) and disassembles a requested range
-// using Musashi's m68kdasm.c. Build: cc disbios.c m68kdasm.c -o disbios
+// using Musashi's m68kdasm.c. Build from mvs64/: cc -I. tools/disbios.c m68kdasm.c -o disbios
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

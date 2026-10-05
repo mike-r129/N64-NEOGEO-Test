@@ -1,8 +1,11 @@
-﻿// m64k dynarec phase-2a: per-form MIPS emitter (DYNREC-PHASE2-TEMPLATES.md).
-// Skeleton increment: MOVEQ only, straight-line blocks, no game-side
-// translation trigger yet (the testsuite's forced mode is the only caller).
+// m64k dynarec (PLAN-OPTIMIZATION.md, DYNREC-PHASE2-TEMPLATES.md): translates
+// hot 68000 code into MIPS blocks in a 256 KB arena (per-form templates,
+// branch enders, direct block chaining, write-through An register cache).
+// Parked default-off (make ... DYNREC_ON=1): bit-exact against the
+// interpreter (TRCRC + the testsuite's emitter-differential rig) but
+// fps-flat at ~10% residency; template coverage is the missing piece.
 // NOTE (diagnostic counters): emitted blocks do not bump perf_m68k_insns /
-// OPHIST â€” instruction counts drift low in instrumented runs with blocks
+// OPHIST, so instruction counts drift low in instrumented runs with blocks
 // active; use interpreter builds for those measurements.
 #include "m64k.h"
 #include "m64k_internal.h"
@@ -259,8 +262,8 @@ static void emit_bail_check(emit_t *e, int addr_reg)
 }
 
 // Post-access slice-break check: a guest-memory access can MMIO-fault and
-// the handler's slice-break clamp then zeroes live a1 â€” the interpreter
-// exits at exactly that insn boundary (blez in dispatch), so the block
+// the handler's slice-break clamp then zeroes live a1, so the interpreter
+// exits at exactly that insn boundary (blez in dispatch), and the block
 // must too or IRQ delivery shifts. The C_max entry gate guarantees a1 > 0
 // at every internal boundary otherwise, so this branch is never taken in
 // the no-clamp case. goff_next = guest offset of the NEXT insn (the
@@ -689,7 +692,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         return 4;
     }
 
-    // ADDI.w #imm,Dn  [wave-3 W3_FULL body, 8 cycles, 2 words]: full ADD
+    // ADDI.w #imm,Dn  [wave-3 W3_FULL body (c11ed5b), 8 cycles, 2 words]: full ADD
     // flags including X (add_f_word idiom: flag_zc = 64-bit sum<<16 with
     // bit32 = carry, flag_x = that carry, flag_nv = sum of operands<<16).
     if ((op & 0xFFF8) == 0x0640) {

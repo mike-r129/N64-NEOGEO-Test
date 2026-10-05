@@ -115,7 +115,7 @@
 #include <math.h>
 
 #include "mvs.h"
-// MVS64: dropped "../state.h" (save-state, #ifdef SAVE_STATE — unused) and
+// MVS64: dropped "../state.h" (gngeo save-state; that code was removed) and
 // "2610intf.h" (gngeo host interface — not vendored). YM2610UpdateRequest()
 // is now a no-op in mvs.h.
 #include "ym2610.h"
@@ -892,7 +892,6 @@ u32 ym_off_deaths, ym_off_revives;
 int ym_off_structural;
 #if defined(N64) && (defined(MVS64_RSPADPCM) || defined(MVS64_RSPFM))
 #include <libdragon.h>            /* TICKS_* (idempotent re-include below) */
-#ifdef MVS64_WP_REVIVE
 static u32 ym_off_backoff_ms = 1000;
 static u32 ym_off_now_ms;         /* wrap-free monotonic ms, see ym_off_ms() */
 static u32 ym_off_ms_last_tick;
@@ -937,11 +936,8 @@ static void ym_off_incident(void) {
 	}
 	ym_off_dead_ms = ms;
 }
-#endif
 static void ym_off_died(void) {
-#ifdef MVS64_WP_REVIVE
 	ym_off_incident();
-#endif
 	ym_off_deaths++;
 }
 #endif
@@ -960,8 +956,7 @@ static void ym_off_died(void) {
  *   ON_OFF  -> {phase=0, state=REL}          (unconditional: ON forced ATT,
  *              so the following OFF's test was true by construction)
  * The key flag itself stays CPU-authoritative (FM_KEYON/OFF gate on it),
- * which is what makes the net-code automaton exact. wp_dirty marks channels
- * whose static params changed and need a re-pack; wp_hatch trips on SSG-EG
+ * which is what makes the net-code automaton exact. wp_hatch trips on SSG-EG
  * enable (dynamic ssgn mutation the RSP port excludes -> CPU-only resync). */
 enum { WPK_NONE = 0, WPK_ON = 1, WPK_OFF = 2, WPK_ON_OFF = 3 };
 /* ADPCM residency (full WP-M2): like the FM dynamics, the ADPCM waveform
@@ -993,7 +988,6 @@ static u32 rspa_kicked_seq, rspa_seen_seq;
 static int rspa_kicked_slot;
 static void rspwpa_pull_b(void);
 static u8 wp_keyev[4][4];   /* [fm chan 0..3 = CH 1,2,4,5][slot 0..3] */
-static u8 wp_dirty[4];
 static u8 wp_hatch;
 static u32 wp_hatch_count;
 /* YM2610 FM channel index (1,2,4,5) -> whole-pump channel slot, else -1 */
@@ -1009,15 +1003,8 @@ INLINE void wp_track_key(FM_CH *CH, int s, int on) {
 	else
 		wp_keyev[j][s] = (wp_keyev[j][s] == WPK_ON) ? WPK_ON_OFF : WPK_OFF;
 }
-
-INLINE void wp_mark_dirty(int c) {
-	const int j = (c >= 0 && c < 6) ? wp_chmap[c] : -1;
-	if (j >= 0)
-		wp_dirty[j] = 1;
-}
 #else
 #define wp_track_key(CH, s, on) ((void)0)
-#define wp_mark_dirty(c) ((void)0)
 #endif
 
 INLINE void FM_KEYON(FM_CH *CH, int s) {
@@ -1969,11 +1956,6 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 
 	SLOT = &(CH->SLOT[OPN_SLOT(r)]);
 
-	/* MVS64 whole-pump: every OPNWriteReg case changes static channel
-	 * params (rates/levels/freq/algo/pan) the RSP-resident copy must
-	 * refresh from; key events and LFO are tracked elsewhere. */
-	wp_mark_dirty(c);
-
 	switch (r & 0xf0) {
 	case 0x30: /* DET , MUL */
 		set_det_mul(&OPN->ST, CH, SLOT, v);
@@ -2010,9 +1992,7 @@ static void OPNWriteReg(FM_OPN *OPN, int r, int v) {
 			if (!wp_hatch)
 				wp_hatch_count++;
 			wp_hatch = 1;
-#ifdef MVS64_WP_REVIVE
 			ym_off_incident();   /* backoff anchor + budget-restore check */
-#endif
 		}
 #endif
 		SLOT->ssg = v & 0x0f;
@@ -3135,12 +3115,13 @@ INLINE s32 OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
  * gate is ZERO mismatches over a long ares run).
  * ==========================================================================*/
 /* Wait-stall telemetry for the RSP offloads (AUTOINPUT/RSPWAITPROF builds):
- * cumulative ticks blocked on each seq poll + worst single wait, printed
- * every 256 FM chunks — so a stall source is measured, not guessed. */
+ * cumulative ticks blocked on each seq poll + worst single wait, printed as
+ * [RSPWAIT] every 128 whole-pump calls (YM2610_wp_finish_async) — so a stall
+ * source is measured, not guessed. WP_OFF=1 builds accumulate but never
+ * print. */
 #if defined(N64) && (defined(MVS64_AUTOINPUT) || defined(MVS64_RSPWAITPROF))
 #define RSPWAIT_PROF 1
 static u32 rspwait_fm, rspwait_fm_max, rspwait_adpcm, rspwait_adpcm_max;
-static u32 rspwait_chunks;
 #endif
 
 #if defined(N64) && defined(MVS64_RSPADPCM)
@@ -3261,17 +3242,11 @@ static int rspwp_dead2;   /* tentative; defined with the WP section below */
 /* Stage the source bytes one channel will consume this chunk: the bytes at
  * the even addresses in [now_addr, now_addr+nib-1], i.e. byte addresses
  * starting at (now_addr+1)>>1. Returns the byte count. */
-/* mvs64_stage_bulk: copy each run that lies inside the resident image or the
- * current window with one memcpy instead of a per-byte fetch. The first byte
- * of every run still goes through ym2610_vrom_fetch, so window refills happen
- * at exactly the same addresses as the per-byte loop. -DMVS64_STAGEBULK_OFF
- * builds the OFF twin; -DMVS64_STAGE_VERIFY checks every staged run against
- * a direct vrom_read ([STAGEV] counts). */
-#ifdef MVS64_STAGEBULK_OFF
-int mvs64_stage_bulk __attribute__((section(".data"))) = 0;
-#else
-int mvs64_stage_bulk __attribute__((section(".data"))) = 1;
-#endif
+/* Each run that lies inside the resident image or the current window is
+ * copied with one memcpy instead of a per-byte fetch. The first byte of every
+ * run still goes through ym2610_vrom_fetch, so window refills happen at
+ * exactly the same addresses as a per-byte loop would. -DMVS64_STAGE_VERIFY
+ * checks every staged run against a direct vrom_read ([STAGEV] counts). */
 #ifdef MVS64_STAGE_VERIFY
 void vrom_read(uint32_t offset, uint8_t *buf, int len);
 unsigned long stagev_runs, stagev_bad;
@@ -3280,44 +3255,35 @@ static u32 rspa_stage(int win, u32 now_addr, u32 nib, u8 *dst,
 		const u8 *resident, u32 size) {
 	u32 a0b = (now_addr + 1) >> 1;
 	u32 cnt = nib ? ((now_addr + nib + 1) >> 1) - a0b : 0;
-	u32 k;
-	if (mvs64_stage_bulk) {
-		k = 0;
-		while (k < cnt) {
-			u32 a = a0b + k, n;
-			if (a >= size) { dst[k++] = 0; continue; }
-			if (resident) {
-				n = size - a;
+	u32 k = 0;
+	while (k < cnt) {
+		u32 a = a0b + k, n;
+		if (a >= size) { dst[k++] = 0; continue; }
+		if (resident) {
+			n = size - a;
+			if (n > cnt - k) n = cnt - k;
+			memcpy(dst + k, resident + a, n);
+		} else {
+			struct ym2610_vwin *w = &ym2610_vwin[win];
+			dst[k] = ym2610_vrom_fetch(win, a);  /* refills on a miss */
+			if (w->valid && w->base == (a & ~(u32)(YM2610_VWIN_SIZE - 1))) {
+				n = w->base + YM2610_VWIN_SIZE - a;
+				if (n > size - a) n = size - a;
 				if (n > cnt - k) n = cnt - k;
-				memcpy(dst + k, resident + a, n);
+				memcpy(dst + k, w->buf + (a - w->base), n);
 			} else {
-				struct ym2610_vwin *w = &ym2610_vwin[win];
-				dst[k] = ym2610_vrom_fetch(win, a);  /* refills on a miss */
-				if (w->valid && w->base == (a & ~(u32)(YM2610_VWIN_SIZE - 1))) {
-					n = w->base + YM2610_VWIN_SIZE - a;
-					if (n > size - a) n = size - a;
-					if (n > cnt - k) n = cnt - k;
-					memcpy(dst + k, w->buf + (a - w->base), n);
-				} else {
-					n = 1;   /* fetch_slow had nothing to load */
-				}
-#ifdef MVS64_STAGE_VERIFY
-				{
-					static u8 vbuf[YM2610_VWIN_SIZE];
-					vrom_read(a, vbuf, (int)n);
-					stagev_runs++;
-					if (memcmp(vbuf, dst + k, n)) stagev_bad++;
-				}
-#endif
+				n = 1;   /* fetch_slow had nothing to load */
 			}
-			k += n;
+#ifdef MVS64_STAGE_VERIFY
+			{
+				static u8 vbuf[YM2610_VWIN_SIZE];
+				vrom_read(a, vbuf, (int)n);
+				stagev_runs++;
+				if (memcmp(vbuf, dst + k, n)) stagev_bad++;
+			}
+#endif
 		}
-	} else {
-		for (k = 0; k < cnt; k++) {
-			u32 a = a0b + k;
-			dst[k] = (a < size) ? (resident ? resident[a]
-			                                : ym2610_vrom_fetch(win, a)) : 0;
-		}
+		k += n;
 	}
 	if (cnt)
 		data_cache_hit_writeback(dst, (cnt + 15) & ~(u32)15);
@@ -3795,22 +3761,19 @@ static void rspa_verify_cmp(int n, const s32 *refl, const s32 *refr,
 /* ============================================================================
  * MVS64: RSP FM synthesis offload (-DMVS64_RSPFM, N64 only).
  *
- * rsp_fm.S replays pass 1 of YM2610Update_stream bit-exactly for the shipped
- * channels: the shared EG tick schedule, the per-slot envelope state machine,
- * the operator chain with feedback/MEM, and the phase generators. Per chunk
- * the CPU ships each eligible channel's state plus a per-sample dp index into
- * a precomputed phase-delta table (this is how LFO phase modulation works
- * without the 16KB fn_table: the deltas depend only on the <=8 distinct
- * lfo_pm values in a chunk). Channels fall back to the C path per chunk when
- * any slot uses SSG-EG, or when a fast LFO (48/72Hz) yields >8 distinct
- * lfo_pm values. The silent-channel fast path stays on the CPU as before.
+ * rsp_fm.S replays pass 1 of YM2610Update_stream bit-exactly: the shared EG
+ * tick schedule, the per-slot envelope state machine, the operator chain with
+ * feedback/MEM, and the phase generators. The whole pump (MVS64_RSPWP below)
+ * packs each channel's static state plus a per-sample dp index into a
+ * precomputed phase-delta table per chunk (this is how LFO phase modulation
+ * works without the 16KB fn_table: the deltas depend only on the <=8 distinct
+ * lfo_pm values in a chunk). A chunk that cannot be packed (a slot using
+ * SSG-EG, or a fast LFO (48/72Hz) yielding >8 distinct lfo_pm values) hatches:
+ * the pump drains, adopts the RSP state and continues on the C path.
  *
  * The RSP reconstructs sin_tab from its first 256 entries by quarter folding;
  * rspfm_init() verifies that fold against the real table once at boot and
  * permanently disables the offload if libm rounding ever breaks the symmetry.
- *
- * -DMVS64_RSPFM_VERIFY dual-computes every chunk (C authoritative) with
- * [RSPFM] mismatch telemetry — the gate is zero mismatches over a long run.
  * ==========================================================================*/
 #if defined(N64) && defined(MVS64_RSPFM)
 #include <libdragon.h>
@@ -3877,17 +3840,11 @@ _Static_assert(offsetof(rspfm_out_t, echo) == 1024, "rspfm echo offset");
 _Static_assert(offsetof(rspfm_out_t, seq) == 2688, "rspfm seq offset");
 _Static_assert(sizeof(rspfm_out_t) == 2704, "rspfm out size");
 
-static rspfm_param_t rspfm_pb;
-static rspfm_out_t rspfm_ob;
-static u32 rspfm_seqno;
-static int rspfm_dead;      /* fold-check fail or poll timeout */
+static int rspfm_dead;      /* sin fold check failed (collect timeouts latch rspwp_dead2) */
 static int rspfm_checked;
 /* last-sample pm cache values to restore into CH after adopting (pms only) */
 static u32 rspfm_pmkey_last[4];
 static u32 rspfm_pmdp_last[4][4];   /* C order: S1,S2,S3,S4 */
-#ifdef MVS64_RSPFM_VERIFY
-static u32 rspfm_chunks, rspfm_badchunks, rspfm_badsamp, rspfm_badstate;
-#endif
 
 /* One-time init: verify the RSP's quarter fold reproduces sin_tab exactly
  * (libm rounding could in principle break the mirror symmetry), and push the
@@ -4102,167 +4059,6 @@ static int rspfm_pack_chan(rspfm_param_t *pbp, FM_OPN *OPN, FM_CH *CH,
 	}
 	return 1;
 }
-
-static void rspfm_kick(int n, u32 eg_base, const u8 *egt_arr,
-		const u8 *lfo_am_arr) {
-	if (!rspfm_checked)
-		rspfm_init();
-	rspfm_pb.sinq_phys = PhysicalAddr(sin_tab);
-	rspfm_pb.tlb_phys = PhysicalAddr(tl_tab_base);
-	rspfm_pb.n = (u16) n;
-	rspfm_pb.eg_base = eg_base;
-	memcpy(rspfm_pb.egt, egt_arr, (size_t) n);
-	memcpy(rspfm_pb.lfo_am, lfo_am_arr, (size_t) n);
-	rspfm_seqno++;
-	data_cache_hit_writeback(&rspfm_pb, sizeof(rspfm_pb));
-	data_cache_hit_invalidate(&rspfm_ob, sizeof(rspfm_ob));
-	rspq_highpri_begin();
-	rspq_write(RSP_FM_OVL_ID, 0x0, PhysicalAddr(&rspfm_pb),
-			PhysicalAddr(&rspfm_ob), rspfm_seqno);
-	rspq_highpri_end();
-}
-
-#ifdef RSPWAIT_PROF
-static u32 rspwait_fm_q;
-#endif
-
-static int rspfm_wait(void) {
-	volatile u32 * const seqp = (volatile u32 *) UncachedAddr(&rspfm_ob.seq);
-	u32 t0 = TICKS_READ();
-#ifdef RSPWAIT_PROF
-	/* queue latency first: the ucode DMAs a start stamp (= seq) into the
-	 * pad word right after seq the moment the command begins executing */
-	{
-		volatile u32 * const startp =
-				(volatile u32 *) UncachedAddr(&rspfm_ob.pad[0]);
-		while (*startp != rspfm_seqno) {
-			if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50))
-				break;   /* fall through to the seq loop's timeout path */
-		}
-		rspwait_fm_q += (u32) TICKS_DISTANCE(t0, TICKS_READ());
-	}
-#endif
-	while (*seqp != rspfm_seqno) {
-		if (TICKS_DISTANCE(t0, TICKS_READ()) > (s32) TICKS_FROM_MS(50)) {
-			debugf("[RSPFM] TIMEOUT seq=%lu got=%lu - disabling FM offload\n",
-					(unsigned long) rspfm_seqno, (unsigned long) *seqp);
-			rspfm_dead = 1;
-			ym_off_died();
-			return 0;
-		}
-	}
-#ifdef RSPWAIT_PROF
-	{
-		u32 d = (u32) TICKS_DISTANCE(t0, TICKS_READ());
-		rspwait_fm += d;
-		if (d > rspwait_fm_max)
-			rspwait_fm_max = d;
-		rspwait_chunks++;
-		if ((rspwait_chunks & 255) == 0) {
-			debugf("[RSPWAIT] fm=%lums max=%luus q=%lums adpcm=%lums max=%luus /256ch\n",
-					(unsigned long) (rspwait_fm / (TICKS_PER_SECOND / 1000)),
-					(unsigned long) (rspwait_fm_max / (TICKS_PER_SECOND / 1000000)),
-					(unsigned long) (rspwait_fm_q / (TICKS_PER_SECOND / 1000)),
-					(unsigned long) (rspwait_adpcm / (TICKS_PER_SECOND / 1000)),
-					(unsigned long) (rspwait_adpcm_max / (TICKS_PER_SECOND / 1000000)));
-			rspwait_fm = rspwait_adpcm = rspwait_fm_q = 0;
-			rspwait_fm_max = rspwait_adpcm_max = 0;
-		}
-	}
-#endif
-	return 1;
-}
-
-/* Write the echoed channel state back into the live structs (non-verify). */
-static void rspfm_adopt_chan(FM_CH *CH, int j) {
-	const rspfm_ch_t * const e = &rspfm_ob.echo[j];
-	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
-	int s;
-	for (s = 0; s < 4; s++) {
-		FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
-		const rspfm_slot_t * const q = &e->slot[s];
-		SL->phase = q->phase;
-		SL->volume = q->volume;
-		SL->vol_out = q->vol_out;
-		SL->state = q->state;
-	}
-	CH->op1_out[0] = e->op1_out[0];
-	CH->op1_out[1] = e->op1_out[1];
-	CH->mem_value = e->mem_value;
-	if (CH->pms) {
-		CH->pm_key = rspfm_pmkey_last[j];
-		CH->pm_dp[0] = rspfm_pmdp_last[j][0];
-		CH->pm_dp[1] = rspfm_pmdp_last[j][1];
-		CH->pm_dp[2] = rspfm_pmdp_last[j][2];
-		CH->pm_dp[3] = rspfm_pmdp_last[j][3];
-	}
-}
-
-#ifdef MVS64_RSPFM_VERIFY
-/* Compare the RSP result against the (authoritative) C pass-1 outcome for
- * the shipped channels. refl/refr are the C contributions of exactly those
- * channels. */
-static void rspfm_verify_cmp(int n, const s32 *refl, const s32 *refr,
-		FM_CH **cch) {
-	static const u8 fm_chix[4] = { 0, 1, 2, 3 };
-	static const u8 slot_names[4] = { SLOT1, SLOT3, SLOT2, SLOT4 };
-	static int prints;
-	int i, j, s, bad = 0;
-	(void) fm_chix;
-	for (i = 0; i < n; i++) {
-		if (rspfm_ob.l[i] != refl[i] || rspfm_ob.r[i] != refr[i]) {
-			bad++;
-			if (prints < 8) {
-				prints++;
-				debugf("[RSPFM] SAMPDIFF chunk=%lu i=%d rsp=%ld/%ld c=%ld/%ld\n",
-						(unsigned long) rspfm_chunks, i,
-						(long) rspfm_ob.l[i], (long) rspfm_ob.r[i],
-						(long) refl[i], (long) refr[i]);
-			}
-		}
-	}
-	rspfm_badsamp += (u32) bad;
-	for (j = 0; j < 4; j++) {
-		const rspfm_ch_t * const e = &rspfm_ob.echo[j];
-		const FM_CH *CH;
-		if (!(rspfm_pb.chmask & (1 << j)))
-			continue;
-		CH = cch[j];
-		for (s = 0; s < 4; s++) {
-			const FM_SLOT * const SL = &CH->SLOT[(int) slot_names[s]];
-			const rspfm_slot_t * const q = &e->slot[s];
-			if (q->phase != SL->phase || q->volume != SL->volume
-					|| q->vol_out != SL->vol_out || q->state != SL->state) {
-				bad++;
-				rspfm_badstate++;
-				if (prints < 8) {
-					prints++;
-					debugf("[RSPFM] SLOTSTATE ch%d s%d rsp=%lx/%ld/%lu/%d "
-							"c=%lx/%ld/%lu/%d\n", j, s,
-							(unsigned long) q->phase, (long) q->volume,
-							(unsigned long) q->vol_out, q->state,
-							(unsigned long) SL->phase, (long) SL->volume,
-							(unsigned long) SL->vol_out, SL->state);
-				}
-			}
-		}
-		if (e->op1_out[0] != CH->op1_out[0] || e->op1_out[1] != CH->op1_out[1]
-				|| e->mem_value != CH->mem_value) {
-			bad++;
-			rspfm_badstate++;
-			if (prints < 8) {
-				prints++;
-				debugf("[RSPFM] CHSTATE ch%d rsp=%ld/%ld/%ld c=%ld/%ld/%ld\n",
-						j, (long) e->op1_out[0], (long) e->op1_out[1],
-						(long) e->mem_value, (long) CH->op1_out[0],
-						(long) CH->op1_out[1], (long) CH->mem_value);
-			}
-		}
-	}
-	if (bad)
-		rspfm_badchunks++;
-}
-#endif /* MVS64_RSPFM_VERIFY */
 
 #ifndef YM_CHUNK
 #define YM_CHUNK 128
@@ -4692,7 +4488,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	/* ring full? the oldest must complete before its slot is reused. It is
 	 * always from an earlier, fully-emitted span (a span is at most 8
 	 * chunks and the ring holds 16), so collecting it here cannot race
-	 * emit's play_buffer copy. */
+	 * the emit of its own span. */
 	if (rspwp_seq - rspwp_coll >= RSPWP_RING) {
 		if (rspwp_coll >= rspwp_emitted || !rspwp_collect(1)) {
 			rspwp_dead2 = 1;
@@ -4710,9 +4506,7 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 				ccs_oc1[algo], eg_base, OPN->eg_cnt, 1)) {
 			wp_hatch = 1;
 			rspwp_pack_hatches++;
-#ifdef MVS64_WP_REVIVE
 			ym_off_incident();   /* backoff anchor + budget-restore check */
-#endif
 			return 0;
 		}
 		/* no CPU-side skip knowledge: all slots due, no quiet locks */
@@ -4722,7 +4516,6 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 				| (wp_keyev[j][SLOT2] << 4) | (wp_keyev[j][SLOT4] << 6));
 	}
 	memset(wp_keyev, 0, sizeof(wp_keyev));
-	wp_dirty[0] = wp_dirty[1] = wp_dirty[2] = wp_dirty[3] = 0;
 	pb->sinq_phys = PhysicalAddr(sin_tab);
 	pb->tlb_phys = PhysicalAddr(tl_tab_base);
 	pb->n = (u16) n;
@@ -4741,12 +4534,12 @@ static int rspwp_kick_chunk(FM_OPN *OPN, FM_CH **cch, int n,
 	return 1;
 }
 
-/* Ship the prepared chunk command. Split from the pack so the caller can
- * order it AFTER the synchronous per-chunk ADPCM collect: the ADPCM command
- * then only ever queues behind the PREVIOUS chunk's FM command, which has
- * the whole inter-chunk CPU stretch to drain — instead of this chunk's
- * ADPCM wait paying for this chunk's FM compute (measured: snd 121->146,
- * fps 29.3->20.8 with the kick at chunk top). */
+/* Ship the prepared chunk command. Split from the pack so the caller decides
+ * where the highpri write lands: YM2610Update_stream ships the PREVIOUS
+ * chunk's command at the top of the next chunk, giving it the whole
+ * inter-chunk CPU stretch to drain. (Before full WP-M2 deferred the ADPCM
+ * too, shipping it in the same chunk put a blocking ADPCM wait behind this
+ * chunk's FM compute: snd 121->146, fps 29.3->20.8.) */
 static void rspwp_ship(void) {
 	const int slot = rspwp_ship_slot;
 	if (slot < 0)
@@ -4764,7 +4557,6 @@ static void rspwp_ship(void) {
 static int rspwp_ok(FM_CH **cch) {
 	if (!rspfm_checked)
 		rspfm_init();
-#ifdef MVS64_WP_REVIVE
 	/* Transient-stall hardening: a runtime dead-latch (RSP >50ms behind at
 	 * a blocking collect — e.g. RDP/RDRAM contention bursts on real
 	 * hardware) is retried after a backoff instead of writing the offload
@@ -4811,7 +4603,6 @@ static int rspwp_ok(FM_CH **cch) {
 					(unsigned long) ym_off_backoff_ms);
 		}
 	}
-#endif
 	if (rspfm_dead || rspwp_dead2 || wp_hatch) {
 		if (rspwp_seeded) {
 			YM2610_wp_finish();
@@ -4830,7 +4621,7 @@ static int rspwp_ok(FM_CH **cch) {
 #endif /* N64 && MVS64_RSPFM */
 
 #if defined(N64) && defined(MVS64_RSPWP) && defined(MVS64_WP_DEATHTEST)
-/* Test hook (emulator gate for MVS64_WP_REVIVE): fake a runtime dead-latch
+/* Test hook (emulator gate for the dead-latch revive): fake a runtime dead-latch
  * as if a blocking collect had timed out, so the revive cycle can be
  * exercised deterministically in ares without a real RSP stall. */
 void YM2610_offload_testkill(void) {
@@ -4871,26 +4662,11 @@ u32 YM2610_offload_flags(void) {
 
 /* YM2610(OPNB) */
 
-#ifdef SOUND_TEST
-static int stream_pos;
-static int samples_left;
-#endif
 static FM_TIMERHANDLER sav_TimerHandler;
 static FM_IRQHANDLER sav_IRQHandler;
 
 void YM2610Init(int clock, int rate, void *pcmroma, int pcmsizea, void *pcmromb,
 		int pcmsizeb, FM_TIMERHANDLER TimerHandler, FM_IRQHANDLER IRQHandler) {
-	/*
-	 sound->stack    = 0x10000;
-	 sound->stereo   = 1;
-	 #ifdef SOUND_TEST
-	 if (sound_test)
-	 sound->callback = YM2610Update_SoundTest;
-	 else
-	 #endif
-	 sound->callback = YM2610Update;
-	 */
-
 	/* clear */
 	memset(&YM2610, 0, sizeof(YM2610));
 	memset(&SSG, 0, sizeof(SSG));
@@ -4946,7 +4722,6 @@ void YM2610Reset(void) {
 	YM2610_wp_finish();
 	rspwp_seeded = 0;
 	memset(wp_keyev, 0, sizeof(wp_keyev));
-	memset(wp_dirty, 0, sizeof(wp_dirty));
 	wpa_res = 0;
 	wpb_res = 0;
 	rspa_seen_seq = rspa_kicked_seq;   /* nothing left in flight */
@@ -5025,10 +4800,6 @@ void YM2610Reset(void) {
 	if (YM2610.adpcmb.status_change_BRDY_bit)
 		YM2610.adpcm_arrivedEndAddress |= YM2610.adpcmb.status_change_BRDY_bit;
 
-#ifdef SOUND_TEST
-	stream_pos = 0;
-	samples_left = 0;
-#endif
 }
 
 /* YM2610 write */
@@ -5175,12 +4946,12 @@ int YM2610TimerOver(int ch) {
 
 	return ST->irq;
 }
-s16 mixing_buffer[2][16384];
 extern Uint16 play_buffer[16384];
 //static Uint32 buf_pos;
 
-/* MVS64: samples per channel-major batch. 64 keeps the per-chunk scratch
- * (~1KB) plus one channel's state inside the VR4300's 8KB dcache. */
+/* MVS64: samples per channel-major batch. 128 keeps the per-chunk scratch
+ * (~1.9KB of stack arrays) plus one channel's state inside the VR4300's 8KB
+ * dcache. */
 #ifndef YM_CHUNK
 #define YM_CHUNK 128   /* also defined earlier for the whole-pump structs */
 #endif
@@ -5292,11 +5063,11 @@ void YM2610Update_stream(int length) {
 #endif
 #endif
 #if defined(N64) && defined(MVS64_RSPWP)
-			/* Ship the PREVIOUS chunk's deferred FM command now, right
-			 * after this chunk's ADPCM kick: the ADPCM command sits ahead
-			 * of it in the highpri queue, so pass 3's rspa_wait never pays
-			 * for FM compute, while the FM command still gets this whole
-			 * chunk's CPU stretch to drain. (Shipping at pass-3-end instead
+			/* Ship the PREVIOUS chunk's deferred FM command now, at chunk
+			 * top, so it gets this whole chunk's CPU stretch to drain (with
+			 * full WP-M2 this chunk's ADPCM command is kicked later, on the
+			 * same ring slot, and nothing waits on it here). (Shipping at
+			 * pass-3-end instead
 			 * hit an rspq wedge: highpri fired into idle-halt/video windows
 			 * — RSP CRASH in display_get after ~30s. Keeping the highpri
 			 * writes back-to-back at chunk top is the pattern the ADPCM
@@ -5322,9 +5093,7 @@ void YM2610Update_stream(int length) {
 			}
 			YMPROF_A(0, a);
 
-#if defined(N64) && defined(MVS64_RSPFM)
-			int fm_any = 0;
-#ifdef MVS64_RSPWP
+#if defined(N64) && defined(MVS64_RSPWP)
 			/* Whole-pump: kick this chunk deferred (RSP-resident state, no
 			 * wait). On any hatch, drain + adopt and fall through to the
 			 * plain CPU path for this and all further chunks. */
@@ -5375,64 +5144,9 @@ void YM2610Update_stream(int length) {
 				rspwpa_pull_all();
 			}
 #endif
-#else /* !MVS64_RSPWP: per-chunk ship-half path */
-			/* MVS64: ship the eligible FM channels to the RSP now, so it
-			 * synthesizes them underneath the CPU's remaining passes.
-			 * Packing MUST happen before any C code mutates channel state
-			 * this chunk; silent channels stay on the CPU fast path. */
-			if (!rspfm_checked)
-				rspfm_init();
-			if (!rspfm_dead) {
-				/* Ship at most HALF the active channels: the CPU synthesizes
-				 * its share between the kick and the collect, so RSP and CPU
-				 * run in parallel on different channels. Shipping everything
-				 * was measured NET-NEGATIVE: the CPU just idled for the whole
-				 * RSP compute time (~2.4ms/chunk, [RSPWAIT] q=0). */
-				int shipped = 0;
-				rspfm_pb.chmask = 0;
-				rspfm_pm_scan_gen++;
-				for (j = 0; j < 4 && shipped < 2; j++) {
-					FM_CH * const CH = cch[j];
-					const int algo = CH->ALGO & 7;
-					if (CH->SLOT[SLOT1].state == EG_OFF
-					    && CH->SLOT[SLOT2].state == EG_OFF
-					    && CH->SLOT[SLOT3].state == EG_OFF
-					    && CH->SLOT[SLOT4].state == EG_OFF
-					    && CH->SLOT[SLOT1].vol_out >= ENV_QUIET
-					    && CH->SLOT[SLOT2].vol_out >= ENV_QUIET
-					    && CH->SLOT[SLOT3].vol_out >= ENV_QUIET
-					    && CH->SLOT[SLOT4].vol_out >= ENV_QUIET
-					    && CH->op1_out[0] == 0 && CH->op1_out[1] == 0
-					    && CH->mem_value == 0)
-						continue;   /* silent: CPU batch-advances phases */
-					if (rspfm_pack_chan(&rspfm_pb, OPN, CH, j, n, lfo_pm,
-							OPN->pan[fmn[j] * 2 + 0],
-							OPN->pan[fmn[j] * 2 + 1],
-							ccs_memc[algo], ccs_om1[algo],
-							ccs_om2[algo], ccs_oc1[algo],
-							eg_base, OPN->eg_cnt, 0)) {
-						rspfm_pb.chmask |= (u8) (1 << j);
-						shipped++;
-					}
-				}
-				if (rspfm_pb.chmask) {
-					fm_any = 1;
-					rspfm_kick(n, eg_base, egt, lfo_am);
-				}
-			}
-#ifdef MVS64_RSPFM_VERIFY
-			static s32 rspfm_refl[YM_CHUNK], rspfm_refr[YM_CHUNK];
-			if (fm_any) {
-				for (i = 0; i < n; i++) {
-					rspfm_refl[i] = 0;
-					rspfm_refr[i] = 0;
-				}
-			}
-#endif
-#endif /* MVS64_RSPWP */
 #endif
 
-#if defined(N64) && defined(MVS64_RSPFM) && defined(MVS64_RSPWP)
+#if defined(N64) && defined(MVS64_RSPWP)
 			/* Track C step 3 (banking-copy elision): WP chunks accumulate
 			 * the SSG/ADPCM/deltaT partial straight into the pending slot's
 			 * banked arrays. Safe: the kick owns the slot exclusively until
@@ -5460,8 +5174,7 @@ void YM2610Update_stream(int length) {
 				u32 cnt = eg_base;
 				s32 *fm_al = ax_l, *fm_ar = ax_r;
 
-#if defined(N64) && defined(MVS64_RSPFM)
-#ifdef MVS64_RSPWP
+#if defined(N64) && defined(MVS64_RSPWP)
 				if (wp_this) {
 #ifdef MVS64_RSPWP_VERIFY
 					/* C stays authoritative; synthesize into the pending
@@ -5472,17 +5185,6 @@ void YM2610Update_stream(int length) {
 					fm_ar = pdv->ref_r;
 #else
 					continue;   /* the RSP owns all FM channels this chunk */
-#endif
-				}
-#endif
-				if (fm_any && (rspfm_pb.chmask & (1 << j))) {
-#ifdef MVS64_RSPFM_VERIFY
-					/* C stays authoritative but synthesizes into the ref
-					 * arrays so the RSP result can be compared 1:1 */
-					fm_al = rspfm_refl;
-					fm_ar = rspfm_refr;
-#else
-					continue;   /* the RSP owns this channel this chunk */
 #endif
 				}
 #endif
@@ -5714,81 +5416,14 @@ void YM2610Update_stream(int length) {
 #endif
 			YMPROF_A(3, d);
 
-#if defined(N64) && defined(MVS64_RSPFM)
-			/* collect the RSP FM result (kicked right after pass 0) */
-			if (fm_any) {
-#ifdef MVS64_RSPFM_VERIFY
-				rspfm_chunks++;
-				if (rspfm_wait())
-					rspfm_verify_cmp(n, rspfm_refl, rspfm_refr, cch);
-				else
-					rspfm_badchunks++;
-				for (i = 0; i < n; i++) {
-					ax_l[i] += rspfm_refl[i];
-					ax_r[i] += rspfm_refr[i];
-				}
-				if ((rspfm_chunks & 1023) == 0)
-					debugf("[RSPFM] chunks=%lu badchunks=%lu badsamp=%lu "
-							"badstate=%lu\n",
-							(unsigned long) rspfm_chunks,
-							(unsigned long) rspfm_badchunks,
-							(unsigned long) rspfm_badsamp,
-							(unsigned long) rspfm_badstate);
-#else
-				if (rspfm_wait()) {
-					for (i = 0; i < n; i++) {
-						ax_l[i] += rspfm_ob.l[i];
-						ax_r[i] += rspfm_ob.r[i];
-					}
-					for (j = 0; j < 4; j++)
-						if (rspfm_pb.chmask & (1 << j))
-							rspfm_adopt_chan(cch[j], j);
-				} else {
-					/* timeout: no state was adopted — synthesize the shipped
-					 * channels on the CPU from their untouched state (cold
-					 * path; rspfm_dead now forces C for the session) */
-					for (j = 0; j < 4; j++) {
-						FM_CH * const CH = cch[j];
-						const u32 panl = OPN->pan[fmn[j] * 2 + 0];
-						const u32 panr = OPN->pan[fmn[j] * 2 + 1];
-						u32 cnt = eg_base;
-						if (!(rspfm_pb.chmask & (1 << j)))
-							continue;
-						{
-							const int algo = CH->ALGO & 7;
-							const int i_memc = ccs_memc[algo];
-							const int i_om1 = ccs_om1[algo];
-							const int i_om2 = ccs_om2[algo];
-							const int i_oc1 = ccs_oc1[algo];
-							for (i = 0; i < n; i++) {
-								u32 t = egt[i];
-								s32 o;
-								while (t--) {
-									cnt++;
-									advance_eg_channel(cnt, &CH->SLOT[SLOT1]);
-								}
-								o = chan_calc_stream(OPN, CH, lfo_am[i],
-										lfo_pm[i], algo, i_memc, i_om1,
-										i_om2, i_oc1) >> 1;
-								ax_l[i] += o & (s32) panl;
-								ax_r[i] += o & (s32) panr;
-							}
-						}
-					}
-				}
-#endif
-			}
-#endif
-
 			/* pass 4: mix + output */
 			YMPROF_T(e);
 #ifdef MVS64_RSPWP
 			if (wp_this) {
 				/* Deferred: bank the SSG+ADPCM+deltaT partial with the
 				 * pending chunk; the collect adds the RSP FM, clamps and
-				 * writes the AI destination directly. play_buffer keeps
-				 * garbage for this span (emit's copy of it is overwritten
-				 * at collect, always before the pump returns). */
+				 * writes the AI destination directly. Only pl advances
+				 * for this span; play_buffer is not read on WP builds. */
 				rspwp_pend_t * const pd =
 						&rspwp_pend[(rspwp_seq - 1) % RSPWP_RING];
 				/* passes 1-3 accumulated into pd->acc_* directly (ax_l/ax_r
@@ -5872,389 +5507,6 @@ void YM2610Update_stream(int length) {
 }
 #undef YMPROF_T
 #undef YMPROF_A
-
-void YM2610Update(int *p) {
-	int i;
-	s16 *buffer = (s16 *) p;
-	s16 lt, rt;
-
-	switch (/*option_samplerate*/0) {
-	case 0:
-		YM2610Update_stream(SOUND_SAMPLES >> 2);
-		for (i = 0; i < SOUND_SAMPLES >> 2; i++) {
-			lt = mixing_buffer[0][i];
-			rt = mixing_buffer[1][i];
-			*buffer++ = lt;
-			*buffer++ = rt;
-			*buffer++ = lt;
-			*buffer++ = rt;
-			*buffer++ = lt;
-			*buffer++ = rt;
-			*buffer++ = lt;
-			*buffer++ = rt;
-		}
-		break;
-
-	case 1:
-		YM2610Update_stream(SOUND_SAMPLES >> 1);
-		for (i = 0; i < SOUND_SAMPLES >> 1; i++) {
-			lt = mixing_buffer[0][i];
-			rt = mixing_buffer[1][i];
-			*buffer++ = lt;
-			*buffer++ = rt;
-			*buffer++ = lt;
-			*buffer++ = rt;
-		}
-		break;
-
-	case 2:
-		YM2610Update_stream(SOUND_SAMPLES);
-		for (i = 0; i < SOUND_SAMPLES; i++) {
-			*buffer++ = mixing_buffer[0][i];
-			*buffer++ = mixing_buffer[1][i];
-		}
-		break;
-	}
-}
-
-#ifdef SOUND_TEST
-static int stream_pos;
-static int samples_left;
-
-void YM2610Update_SoundTest(int p)
-{
-	int i, length;
-	s16 *buffer = (s16 *)p;
-
-	length = SOUND_SAMPLES;
-
-	if (samples_left)
-	{
-		for (i = 0; i < samples_left; i++)
-		{
-			*buffer++ = mixing_buffer[0][stream_pos];
-			*buffer++ = mixing_buffer[1][stream_pos];
-			stream_pos++;
-			length--;
-		}
-	}
-
-	next_frame:
-	timer_update_subcpu();
-	YM2610Update_stream(736);
-	samples_left = 736;
-	stream_pos = 0;
-
-	for (i = 0; i < 736; i++)
-	{
-		*buffer++ = mixing_buffer[0][stream_pos];
-		*buffer++ = mixing_buffer[1][stream_pos];
-		stream_pos++;
-		samples_left--;
-
-		if (--length == 0) break;
-	}
-	if (length) goto next_frame;
-}
-#endif
-
-#if 0  // MVS64: gngeo save-state (gzFile/mkstate_data) — not used
-void ym2610_mkstate(gzFile *gzf, int mode) {
-	int r;
-	/* Old save state version was buggy, tried to load it anyway
-	 * Thanks Robert for the fix
-	 * */
-	if (state_version == ST_VER2 && mode == STREAD) {
-		struct ym2610_t ym2610_sav;
-		memcpy(&ym2610_sav, &YM2610, sizeof(YM2610));
-		mkstate_data(gzf, &YM2610, sizeof(YM2610), mode);
-		/* restore some pointer */
-		int fm, ch, slot;
-		YM2610.OPN.ST.Timer_Handler = ym2610_sav.OPN.ST.Timer_Handler;
-		YM2610.OPN.ST.IRQ_Handler = ym2610_sav.OPN.ST.IRQ_Handler;
-		for (ch = 0; ch < 6; ch++) {
-			YM2610.CH[ch].connect1 = ym2610_sav.CH[ch].connect1;
-			YM2610.CH[ch].connect2 = ym2610_sav.CH[ch].connect2;
-			YM2610.CH[ch].connect3 = ym2610_sav.CH[ch].connect3;
-			YM2610.CH[ch].connect4 = ym2610_sav.CH[ch].connect4;
-			YM2610.CH[ch].mem_connect = ym2610_sav.CH[ch].mem_connect;
-			for (slot = 0; slot < 4; slot++) {
-				YM2610.CH[ch].SLOT[slot].DT = ym2610_sav.CH[ch].SLOT[slot].DT;
-			}
-		}
-		YM2610.OPN.P_CH = ym2610_sav.OPN.P_CH;
-		for (ch = 0; ch < 6; ch++) {
-			YM2610.adpcma[ch].pan = ym2610_sav.adpcma[ch].pan;
-		}
-		YM2610.adpcmb.pan = ym2610_sav.adpcmb.pan;
-	} else {
-		int fm, ch, slot;
-
-		mkstate_data(gzf, &YM2610.regs, 512, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.BusyExpire, 4, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.address, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.irq, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.irqmask, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.status, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.mode, 4, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.prescaler_sel, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.fn_h, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.TA, 4, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.TAC, 4, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.TB, 1, mode);
-		mkstate_data(gzf, &YM2610.OPN.ST.TBC, 4, mode);
-
-		for (ch = 0; ch < 6; ch++) {
-			mkstate_data(gzf, YM2610.CH[ch].op1_out, 4 * 2, mode);
-			mkstate_data(gzf, &YM2610.CH[ch].fc, 4, mode);
-
-			for (slot = 0; slot < 4; slot++) {
-				FM_SLOT *SLOT = &YM2610.CH[ch].SLOT[slot];
-
-				mkstate_data(gzf, &SLOT->phase, 4, mode);
-				mkstate_data(gzf, &SLOT->state, 1, mode);
-				mkstate_data(gzf, &SLOT->volume, 4, mode);
-			}
-		}
-
-		mkstate_data(gzf, YM2610.OPN.SL3.fc, 4 * 3, mode);
-		mkstate_data(gzf, &YM2610.OPN.SL3.fn_h, 1, mode);
-		mkstate_data(gzf, YM2610.OPN.SL3.kcode, 3, mode);
-
-		mkstate_data(gzf, &YM2610.addr_A1, 1, mode);
-		mkstate_data(gzf, &YM2610.adpcm_arrivedEndAddress, 1, mode);
-
-		for (ch = 0; ch < 6; ch++) {
-			mkstate_data(gzf, &YM2610.adpcma[ch].flag, 1, mode);
-			mkstate_data(gzf, &YM2610.adpcma[ch].now_data, 1, mode);
-			mkstate_data(gzf, &YM2610.adpcma[ch].now_addr, 4, mode);
-			mkstate_data(gzf, &YM2610.adpcma[ch].now_step, 4, mode);
-			mkstate_data(gzf, &YM2610.adpcma[ch].adpcma_acc, 4, mode);
-			mkstate_data(gzf, &YM2610.adpcma[ch].adpcma_step, 4, mode);
-			mkstate_data(gzf, &YM2610.adpcma[ch].adpcma_out, 4, mode);
-		}
-
-		mkstate_data(gzf, &YM2610.adpcmb.portstate, 1, mode);
-		mkstate_data(gzf, &YM2610.adpcmb.now_addr, 4, mode);
-		mkstate_data(gzf, &YM2610.adpcmb.now_step, 4, mode);
-		mkstate_data(gzf, &YM2610.adpcmb.acc, 4, mode);
-		mkstate_data(gzf, &YM2610.adpcmb.prev_acc, 4, mode);
-		mkstate_data(gzf, &YM2610.adpcmb.adpcmd, 4, mode);
-		mkstate_data(gzf, &YM2610.adpcmb.adpcml, 4, mode);
-
-	}
-	if (mode == STREAD) {
-
-		for (r = 0; r < 16; r++) {
-			SSG_write(0, r);
-			SSG_write(1, YM2610.regs[r]);
-		}
-
-		for (r = 0x30; r < 0x9e; r++) {
-			if ((r & 3) != 3) {
-				OPNWriteReg(&YM2610.OPN, r, YM2610.regs[r]);
-				OPNWriteReg(&YM2610.OPN, r | 0x100, YM2610.regs[r | 0x100]);
-			}
-		}
-
-		for (r = 0xb0; r < 0xb6; r++) {
-			if ((r & 3) != 3) {
-				OPNWriteReg(&YM2610.OPN, r, YM2610.regs[r]);
-				OPNWriteReg(&YM2610.OPN, r | 0x100, YM2610.regs[r | 0x100]);
-			}
-		}
-
-		OPNB_ADPCMA_write(0x101, YM2610.regs[0x101]);
-		for (r = 0; r < 6; r++) {
-			OPNB_ADPCMA_write(r + 0x108, YM2610.regs[r + 0x108]);
-			OPNB_ADPCMA_write(r + 0x110, YM2610.regs[r + 0x110]);
-			OPNB_ADPCMA_write(r + 0x118, YM2610.regs[r + 0x118]);
-			OPNB_ADPCMA_write(r + 0x120, YM2610.regs[r + 0x120]);
-			OPNB_ADPCMA_write(r + 0x128, YM2610.regs[r + 0x128]);
-		}
-
-		YM2610.adpcmb.volume = 0;
-
-		for (r = 1; r < 16; r++)
-			OPNB_ADPCMB_write(&YM2610.adpcmb, r + 0x10, YM2610.regs[r + 0x10]);
-
-		if (pcmbufB)
-			YM2610.adpcmb.now_data = *(pcmbufB + (YM2610.adpcmb.now_addr >> 1));
-	}
-}
-#endif  // MVS64: ym2610_mkstate disabled
-
-#ifdef SAVE_STATE
-
-STATE_SAVE( ym2610 )
-{
-	int slot, ch;
-
-	state_save_byte(YM2610.regs, 512);
-
-	state_save_double(&YM2610.OPN.ST.BusyExpire, 1);
-	state_save_byte(&YM2610.OPN.ST.address, 1);
-	state_save_byte(&YM2610.OPN.ST.irq, 1);
-	state_save_byte(&YM2610.OPN.ST.irqmask, 1);
-	state_save_byte(&YM2610.OPN.ST.status, 1);
-	state_save_long(&YM2610.OPN.ST.mode, 1);
-	state_save_byte(&YM2610.OPN.ST.prescaler_sel, 1);
-	state_save_byte(&YM2610.OPN.ST.fn_h, 1);
-	state_save_long(&YM2610.OPN.ST.TA, 1);
-	state_save_long(&YM2610.OPN.ST.TAC, 1);
-	state_save_byte(&YM2610.OPN.ST.TB, 1);
-	state_save_long(&YM2610.OPN.ST.TBC, 1);
-
-	for (ch = 0; ch < 6; ch++)
-	{
-		state_save_long(YM2610.CH[ch].op1_out, 2);
-		state_save_long(&YM2610.CH[ch].fc, 1);
-
-		for (slot = 0; slot < 4; slot++)
-		{
-			FM_SLOT *SLOT = &YM2610.CH[ch].SLOT[slot];
-
-			state_save_long(&SLOT->phase, 1);
-			state_save_byte(&SLOT->state, 1);
-			state_save_long(&SLOT->volume, 1);
-		}
-	}
-
-	state_save_long(YM2610.OPN.SL3.fc, 3);
-	state_save_byte(&YM2610.OPN.SL3.fn_h, 1);
-	state_save_byte(YM2610.OPN.SL3.kcode, 3);
-
-	state_save_byte(&YM2610.addr_A1, 1);
-	state_save_byte(&YM2610.adpcm_arrivedEndAddress, 1);
-
-	for (ch = 0; ch < 6; ch++)
-	{
-		state_save_byte(&YM2610.adpcma[ch].flag, 1);
-		state_save_byte(&YM2610.adpcma[ch].now_data, 1);
-		state_save_long(&YM2610.adpcma[ch].now_addr, 1);
-		state_save_long(&YM2610.adpcma[ch].now_step, 1);
-		state_save_long(&YM2610.adpcma[ch].adpcma_acc, 1);
-		state_save_long(&YM2610.adpcma[ch].adpcma_step, 1);
-		state_save_long(&YM2610.adpcma[ch].adpcma_out, 1);
-	}
-
-	state_save_byte(&YM2610.adpcmb.portstate, 1);
-	state_save_long(&YM2610.adpcmb.now_addr, 1);
-	state_save_long(&YM2610.adpcmb.now_step, 1);
-	state_save_long(&YM2610.adpcmb.acc, 1);
-	state_save_long(&YM2610.adpcmb.prev_acc, 1);
-	state_save_long(&YM2610.adpcmb.adpcmd, 1);
-	state_save_long(&YM2610.adpcmb.adpcml, 1);
-
-	state_save_long(&option_samplerate, 1);
-}
-
-STATE_LOAD( ym2610 )
-{
-	int slot, ch, r;
-
-	state_load_byte(YM2610.regs, 512);
-
-	state_load_double(&YM2610.OPN.ST.BusyExpire, 1);
-	state_load_byte(&YM2610.OPN.ST.address, 1);
-	state_load_byte(&YM2610.OPN.ST.irq, 1);
-	state_load_byte(&YM2610.OPN.ST.irqmask, 1);
-	state_load_byte(&YM2610.OPN.ST.status, 1);
-	state_load_long(&YM2610.OPN.ST.mode, 1);
-	state_load_byte(&YM2610.OPN.ST.prescaler_sel, 1);
-	state_load_byte(&YM2610.OPN.ST.fn_h, 1);
-	state_load_long(&YM2610.OPN.ST.TA, 1);
-	state_load_long(&YM2610.OPN.ST.TAC, 1);
-	state_load_byte(&YM2610.OPN.ST.TB, 1);
-	state_load_long(&YM2610.OPN.ST.TBC, 1);
-
-	for (ch = 0; ch < 6; ch++)
-	{
-		state_load_long(YM2610.CH[ch].op1_out, 2);
-		state_load_long(&YM2610.CH[ch].fc, 1);
-
-		for (slot = 0; slot < 4; slot++)
-		{
-			FM_SLOT *SLOT = &YM2610.CH[ch].SLOT[slot];
-
-			state_load_long(&SLOT->phase, 1);
-			state_load_byte(&SLOT->state, 1);
-			state_load_long(&SLOT->volume, 1);
-		}
-	}
-
-	state_load_long(YM2610.OPN.SL3.fc, 3);
-	state_load_byte(&YM2610.OPN.SL3.fn_h, 1);
-	state_load_byte(YM2610.OPN.SL3.kcode, 3);
-
-	state_load_byte(&YM2610.addr_A1, 1);
-	state_load_byte(&YM2610.adpcm_arrivedEndAddress, 1);
-
-	for (ch = 0; ch < 6; ch++)
-	{
-		state_load_byte(&YM2610.adpcma[ch].flag, 1);
-		state_load_byte(&YM2610.adpcma[ch].now_data, 1);
-		state_load_long(&YM2610.adpcma[ch].now_addr, 1);
-		state_load_long(&YM2610.adpcma[ch].now_step, 1);
-		state_load_long(&YM2610.adpcma[ch].adpcma_acc, 1);
-		state_load_long(&YM2610.adpcma[ch].adpcma_step, 1);
-		state_load_long(&YM2610.adpcma[ch].adpcma_out, 1);
-	}
-
-	state_load_byte(&YM2610.adpcmb.portstate, 1);
-	state_load_long(&YM2610.adpcmb.now_addr, 1);
-	state_load_long(&YM2610.adpcmb.now_step, 1);
-	state_load_long(&YM2610.adpcmb.acc, 1);
-	state_load_long(&YM2610.adpcmb.prev_acc, 1);
-	state_load_long(&YM2610.adpcmb.adpcmd, 1);
-	state_load_long(&YM2610.adpcmb.adpcml, 1);
-
-	state_load_long(&option_samplerate, 1);
-
-	for (r = 0; r < 16; r++)
-	{
-		SSG_write(0, r);
-		SSG_write(1, YM2610.regs[r]);
-	}
-
-	for (r = 0x30; r <0x9e; r++)
-	{
-		if ((r & 3) != 3)
-		{
-			OPNWriteReg(&YM2610.OPN, r, YM2610.regs[r]);
-			OPNWriteReg(&YM2610.OPN, r | 0x100, YM2610.regs[r | 0x100]);
-		}
-	}
-
-	for (r = 0xb0; r < 0xb6; r++)
-	{
-		if ((r & 3) != 3)
-		{
-			OPNWriteReg(&YM2610.OPN, r, YM2610.regs[r]);
-			OPNWriteReg(&YM2610.OPN, r | 0x100, YM2610.regs[r | 0x100]);
-		}
-	}
-
-	OPNB_ADPCMA_write(0x101, YM2610.regs[0x101]);
-	for (r = 0; r < 6; r++)
-	{
-		OPNB_ADPCMA_write(r + 0x108, YM2610.regs[r + 0x108]);
-		OPNB_ADPCMA_write(r + 0x110, YM2610.regs[r + 0x110]);
-		OPNB_ADPCMA_write(r + 0x118, YM2610.regs[r + 0x118]);
-		OPNB_ADPCMA_write(r + 0x120, YM2610.regs[r + 0x120]);
-		OPNB_ADPCMA_write(r + 0x128, YM2610.regs[r + 0x128]);
-	}
-
-	YM2610.adpcmb.volume = 0;
-
-	for (r = 1; r < 16; r++)
-	OPNB_ADPCMB_write(&YM2610.adpcmb, r + 0x10, YM2610.regs[r + 0x10]);
-
-	if (pcmbufB)
-	YM2610.adpcmb.now_data = *(pcmbufB + (YM2610.adpcmb.now_addr >> 1));
-}
-
-#endif /* SAVE_STATE */
 
 #if defined(MVS64_AUTOINPUT) || defined(MVS64_SNDHEALTH) || defined(MVS64_SNDOSD)
 #include <stdio.h>

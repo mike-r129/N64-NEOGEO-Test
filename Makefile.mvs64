@@ -9,7 +9,7 @@ BUILD_DIR = build/mvs64
 
 include $(N64_INST)/include/n64.mk
 
-core_src = emu.c roms.c hw.c video.c platform_n64.c sprite_cache.c sound_neogeo.c z80_anchor.c z80.c ym2610/ym2610.c lib/rdl.c pcprof.c $(wildcard hle_*.c)
+core_src = emu.c emu_diag.c roms.c hw.c video.c platform_n64.c platform_n64_osd.c sprite_cache.c sound_neogeo.c z80_anchor.c z80.c ym2610/ym2610.c lib/rdl.c pcprof.c
 rsp = rsp_video.S rsp_audio.S rsp_fm.S
 ifdef MUSASHI
 # Fallback 68k core: portable Musashi (proven on the PC build). Slower than m64k
@@ -49,14 +49,6 @@ ifndef FP_OFF
 CFLAGS += -DM64K_FASTPATHS
 ASFLAGS += -DM64K_FASTPATHS
 N64_ASFLAGS += -DM64K_FASTPATHS
-endif
-# Per-PC predecode record dispatch (60fps campaign track A). Phase 1a is a
-# semantics-neutral scaffold (all pages route through the classic trampoline);
-# testsuite-covered via the standalone m64k Makefile. Opt-in: make ... PD_ON=1.
-ifdef PD_ON
-CFLAGS += -DM64K_PREDECODE
-ASFLAGS += -DM64K_PREDECODE
-N64_ASFLAGS += -DM64K_PREDECODE
 endif
 # m64k dynarec (60fps campaign, PLAN-OPTIMIZATION.md blueprint): translates
 # hot 68000 ROM code into MIPS blocks in a 256KB arena (per-instruction
@@ -98,20 +90,11 @@ CFLAGS += $(EXTRA_DEFINES)
 # The YM2610 ADPCM-A/B decoders run on the RSP pipelined under the CPU's FM
 # pass (gated bit-exact vs the C core; ares 300s dual-compute run, 35840
 # chunks, 0 mismatches; in-fight fps 22.0 -> 26.3). Disable with
-# make ... ADPCM_CPU=1 to force the C decoders (debug/fallback).
+# make ... ADPCM_CPU=1 WP_OFF=1 to force the C decoders (debug/fallback).
 ifndef ADPCM_CPU
 CFLAGS += -DMVS64_RSPADPCM
-endif
-# Synchronous FM offload experiment (rsp_fm.S + ym2610.c rspfm_* glue):
-# make ... WP_OFF=1 RSPFM=1. The port is bit-exact (300s dual-compute gate,
-# 35840 chunks, 0 mismatches) but measured NET-NEGATIVE when collected per
-# chunk: the CPU idles for the RSP compute time ([RSPWAIT] fm~2.4ms/chunk,
-# q=0), and a 2-channel CPU/RSP split still loses ~4fps to per-chunk glue.
-# The whole-pump offload below (default ON) replaced it. Whole-pump reuses
-# this machinery and defines MVS64_RSPFM itself, so RSPFM=1 without
-# WP_OFF=1 changes nothing.
-ifdef RSPFM
-CFLAGS += -DMVS64_RSPFM
+else ifndef WP_OFF
+$(error ADPCM_CPU=1 needs WP_OFF=1: the whole-pump offload keeps the ADPCM state on the RSP)
 endif
 # Whole-pump audio batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM AND
 # ADPCM on the RSP with RSP-resident dynamic state, cross-pump output
@@ -121,17 +104,13 @@ endif
 # density buckets; snd 150-310% -> 51-64%). Bit-exactness gate green (300s,
 # 40960 chunks, 0 mismatches FM+ADPCM, 0 hatches). Disable with WP_OFF=1;
 # add EXTRA_DEFINES=-DMVS64_RSPWP_VERIFY for the dual-compute gate
-# ([RSPWP] counters).
+# ([RSPWP] counters). MVS64_RSPFM is the FM-on-RSP machinery (rsp_fm.S,
+# ym2610.c rspfm_*) the whole pump drives; the synchronous per-chunk FM
+# offload it was built for measured net-negative and was removed.
 ifndef WP_OFF
 CFLAGS += -DMVS64_RSPFM -DMVS64_RSPWP
 endif
 
-# Offload dead-latch revive (MVS64_WP_REVIVE, 8113e6f): retry a runtime
-# dead-latch on a 1s..16s doubling backoff instead of writing the offload
-# off for the session (the permanent mid-round sound-loss class diagnosed
-# 2026-08-09). Default ON since 2026-08-30: the user confirmed the sndfix
-# build survives real-hardware play sessions with no sound loss. Disable
-# with WP_REVIVE_OFF=1.
 ifdef FRAMESKIP
 # Auto frameskip: skip drawing up to $(FRAMESKIP) frames in a row when the
 # emulation is behind the VI clock, so game speed holds (emu_render, emu.c).
@@ -139,47 +118,28 @@ ifdef FRAMESKIP
 CFLAGS += -DMVS64_FRAMESKIP=$(FRAMESKIP)
 endif
 
-ifndef WP_REVIVE_OFF
-CFLAGS += -DMVS64_WP_REVIVE
-endif
-
-# NOTE: -O3 on the audio TUs (ym2610.c/z80.c/sound_neogeo.c) was tried and
-# REGRESSED in-match snd% by ~+40% (ares A/B, 2026-07-02): the inline/unroll
-# bloat thrashes the VR4300's 16KB icache in the synthesis loop. Keep -O2.
-# The opposite experiment (code-size-first, AUDIO_OS=1) was ALSO tried
-# (2026-07-07): -Os REGRESSED in-match snd% 136->155 (fps 22->19.3) — the
-# shorter-but-branchier codegen loses more in the synthesis inner loops than
-# the icache saves. -O2 is the confirmed sweet spot from both directions.
-ifdef AUDIO_OS
-$(BUILD_DIR)/ym2610/ym2610.o: CFLAGS += -Os
-$(BUILD_DIR)/z80.o: CFLAGS += -Os
-$(BUILD_DIR)/sound_neogeo.o: CFLAGS += -Os
-endif
-# Z80-core-only -Os (Z80_OS=1): MEASURED FLAT (2026-07-09). Text shrank 40%
-# (39KB->23KB) but us/Z80-step 3.37->3.42 and bucket-matched fps identical —
-# the interpreter's per-step cost is not switch-footprint-bound either (the
-# inline-bus experiment already ruled out callback overhead; struct layout is
-# already 3 hot dcache lines). Z80 stepping (~60% of snd, ~5.7ms/frame) is at
-# its practical interpreter floor; the next lever there is structural.
-# Knob kept off-by-default for reproducing the measurement.
-ifdef Z80_OS
-$(BUILD_DIR)/z80.o: CFLAGS += -Os
-endif
+# NOTE: the audio TUs (ym2610.c/z80.c/sound_neogeo.c) stay at -O2, measured
+# from both directions. -O3 REGRESSED in-match snd% by ~+40% (ares A/B,
+# 2026-07-02): the inline/unroll bloat thrashes the VR4300's 16KB icache in
+# the synthesis loop. -Os on all three REGRESSED snd% 136->155 (fps 22->19.3,
+# 2026-07-07): the shorter-but-branchier codegen loses more in the synthesis
+# inner loops than the icache saves. -Os on z80.c alone was FLAT (2026-07-09):
+# text shrank 40% but us/Z80-step 3.37->3.42 and bucket-matched fps were
+# identical, so Z80 stepping (~60% of snd) is at its interpreter floor; the
+# next lever there is structural.
 # Propagate EXTRA_DEFINES to the assembler too, so .S-file feature gates
 # (e.g. -DMVS64_IDLEPROBE in m64k_asm.S) take effect like C ones.
 ASFLAGS += $(EXTRA_DEFINES)
 N64_ASFLAGS += $(EXTRA_DEFINES)
 # ...and to the RSP assembler (rsp_*.S build with RSPASFLAGS, not ASFLAGS),
-# so ucode-side verify gates (MVS64_BATCHDBG) can be driven the same way.
+# so ucode-side gates (e.g. -DMVS64_ROTA_OFF in rsp_video.S) can be driven
+# the same way.
 RSPASFLAGS += $(EXTRA_DEFINES)
 
 ROMNAME=$(notdir $(basename $(ROM)))
 ROMDIR=$(ROM:%.zip=%.n64)
 
 all: mvsmakerom mvs64-${ROMNAME}.z64
-
-test:
-	make -f Makefile.tests all
 
 $(BUILD_DIR)/mvs64-${ROMNAME}.dfs: $(ROM) mvsmakerom
 	@echo "    [MVS] ${ROMDIR}"
@@ -207,4 +167,4 @@ clean:
 
 -include $(src:%.c=$(BUILD_DIR)/%.d) $(asm:%.S=$(BUILD_DIR)/%.d) $(src_makerom:%.c=$(BUILD_DIR)/%.d)
 
-.PHONY: clean test
+.PHONY: clean

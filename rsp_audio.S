@@ -17,11 +17,11 @@
 #    to the C decoder for a whole chunk when ADPCM-B could hit its limit-wrap /
 #    repeat-restart paths. ADPCM-A end-of-sample and ADPCM-B end-stop ARE
 #    handled here (they are the common case).
-#  - All multiplies are scalar shift-add loops (the SU has no multiply; the
-#    VU's clamping semantics are easy to get subtly wrong). Every product here
-#    either fits in 32 bits or is used modulo 2^32 in a sum whose exact value
-#    fits (ADPCM-B interpolator), so shift-add is exact. The RSP has head room:
-#    this whole overlay is hidden behind the CPU's FM synthesis pass.
+#  - The SU has no multiply. Products go through VMUL16 (the VU multiplier,
+#    operands that fit s16), which replaced the scalar shift-add loops that
+#    were about half of the ADPCM-B chunk cost. Every product either fits in
+#    32 bits or is used modulo 2^32 in a sum whose exact value fits (ADPCM-B
+#    interpolator), so the results are exact.
 #
 # Commands:
 #  0x0 cmd_adpcm_test: DMA-in bytes from a0, add 1 to each, DMA-out to a1.
@@ -113,30 +113,13 @@ DYNA:      .dcb.b 128
     .text
 
     #############################################################
-    # MULU: dst = mcand * mult, exact mod 2^32, for mult >= 0.
-    # Clobbers mcand, mult and one scratch reg. mult==0 -> dst=0.
-    #############################################################
-    .macro MULU dst, mcand, mult, tmp
-    move \dst, zero
-    beqz \mult, 9f
-    nop
-8:  andi \tmp, \mult, 1
-    subu \tmp, zero, \tmp
-    and  \tmp, \tmp, \mcand
-    addu \dst, \dst, \tmp
-    srl  \mult, \mult, 1
-    bnez \mult, 8b
-    sll  \mcand, \mcand, 1
-9:
-    .endm
-
-    #############################################################
     # VMUL16: dst = (s16)x * (s16)y, exact 32-bit product via the
     # VU multiplier: vmudh places the full product in ACC[47:16],
     # so ACC_HI = product[31:16] and ACC_MD = product[15:0].
     # BOTH OPERANDS MUST FIT s16. Clobbers \tmp and $v27-$v29
-    # lane 0. ~10 ops flat vs MULU's ~7 per multiplier bit — the
-    # shift-add loops were roughly half the ADPCM-B chunk cost.
+    # lane 0. ~10 ops flat vs ~7 per multiplier bit for the scalar
+    # shift-add multiply it replaced, whose loops were roughly half
+    # the ADPCM-B chunk cost.
     #############################################################
     .macro VMUL16 dst, x, y, tmp
     mtc2 \x, $v27.e0

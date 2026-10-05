@@ -57,25 +57,10 @@ uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix;
 uint32_t perf_dr_cache, perf_dr_rspq;
 uint32_t perf_dr_tiles, perf_dr_cells;
 uint32_t perf_dr_empty;   /* sprite tiles skipped as known-empty */
-uint32_t perf_dr_wwait;   /* RSP sprite walk: CPU time blocked in rspq_wait */
 uint32_t perf_walk_spr;   /* sprites that reach the tile loop (past all culls) */
 uint32_t perf_walk_iter;  /* tile-loop iterations, visible or not */
-// PLAN-DRAW-RDP Phase 0 decision counters ([PERF3] in emu.c):
-uint32_t perf_dr_recs;    /* records seen by consume (incl. empty-skipped) */
-uint32_t perf_dr_adjrep;  /* drawn records whose tnum == previous drawn */
-uint32_t perf_dr_maxrun;  /* longest consecutive same-tnum drawn run */
-uint32_t perf_dr_uniqx;   /* ~unique tnums (gen-stamped hash, collisions
-                             undercount uniques slightly) */
-uint32_t perf_dr_psw;     /* palette switches between consecutive draws */
-uint32_t perf_dr_modal;   /* drawn records matching the COPY-mode predicate
-                             (sw==16 && sh==16 && no flip) */
-uint32_t perf_dr_miss;    /* sprite-cache misses (PI DMA loads) */
+uint32_t perf_dr_miss;    /* sprite-cache misses (PI DMA loads, [PERF3]) */
 uint32_t perf_dr_missticks; /* ticks spent in the miss/DMA path */
-// Uniq table: 2048 gen-stamped entries accessed UNCACHED — heavy frames
-// touch most slots, and an 8KB cached resident table would evict the whole
-// dcache (PLAN-DRAW-RDP §9 law 1). Diagnostic builds only.
-static uint32_t perf_uniq_tab[2048] __attribute__((aligned(16)));
-static uint32_t perf_uniq_gen;
 #define DRAW_PERF 1
 #endif
 #if defined(N64) && (defined(MVS64_PERFCOUNT) || defined(MVS64_PERFOSD))
@@ -87,7 +72,7 @@ static uint32_t perf_uniq_gen;
 // misses), RSP command issue ticks (E, incl. flushes and buffer switches)
 // and the drawn-tile count (N); the walk itself is R minus Q and E.
 #ifndef MVS64_PERFCOUNT
-uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix, perf_dr_wwait, perf_dr_missticks;
+uint32_t perf_dr_begin, perf_dr_sprites, perf_dr_fix, perf_dr_missticks;
 uint32_t perf_dr_cache, perf_dr_rspq, perf_dr_tiles;
 #endif
 // Drawn tiles by RDP path (the ucode modal test, rsp_video.S): G = COPY
@@ -96,57 +81,64 @@ uint32_t perf_dr_copyt, perf_dr_flipt;
 #define DRAW_PERF_COARSE 1
 #endif
 
-// --- sprite walk: produce/consume split -----------------------------------
-// The SCB walk produces a flat list of visible-tile records; the consume
-// pass turns records into draw calls. The split is what lets the walk move
-// to the RSP on N64 (cmd_sprite_walk in rsp_video.S produces the same list):
-// the C producer below is the bit-exact reference, and the ucode is gated
-// against it record-by-record (MVS64_WALKDBG dual-compute). Record fields
-// carry exactly what draw_sprite needs; positions keep only the low 12 bits,
-// which is lossless: both draw paths reduce positions mod 512 (PC) or to a
-// 12-bit signed field (RSP), and sx/ssy never carry information above that.
-typedef struct {
-	uint32_t w0;   // tnum[0..19] | palnum[20..27] | flipx[28] | flipy[29]
-	uint32_t w1;   // sx[0..11] | ssy[12..23] | (sw-1)[24..27] | (ssh-1)[28..31]
-} SprWalkRec;
-
-// ~7x the observed in-fight maximum (~600 tiles). Overflowing content is
-// walked correctly but its excess records are dropped (logged), so pixels
-// would differ from the old direct-draw path only in that case.
-#define SPRWALK_MAX_RECS  4096
-// +2 records: the RSP walk writes its {nrec, ovfl} trailer at list+maxrecs*8
-// (sprite_walk_produce_rsp) — keep it inside the object for -Warray-bounds.
-static SprWalkRec sprwalk_recs[SPRWALK_MAX_RECS + 2] __attribute__((aligned(16)));
-static int sprwalk_overflow;   // records dropped this frame (diagnostic)
-#ifdef N64
-static int sprwalk_rsp_ovfl;   // overflow count reported by the RSP walk
+// Draw-path timers and counters; all compile to nothing in a release build.
+//   DPERF_T0(t) / DPERF_ADD(acc, t): start a TICKS timer, add its elapsed
+//   ticks to acc (DRAW_PERF_COARSE: PERFOSD and PERFCOUNT builds).
+//   DPERF_INC(c): per-record counter (DRAW_PERF: PERFCOUNT builds only).
+//   dperf_tile(w0, w1): count a drawn tile, split by RDP path (G/H).
+#ifdef DRAW_PERF_COARSE
+#define DPERF_T0(t)        uint32_t t = TICKS_READ()
+#define DPERF_ADD(acc, t)  ((acc) += TICKS_DISTANCE(t, TICKS_READ()))
+// (same predicate as the ucode's modal test, cmd_sprite_draw)
+#define dperf_tile(w0, w1) do { \
+	perf_dr_tiles++; \
+	int _x = ((int32_t)((w1) << 20)) >> 20, _y = ((int32_t)((w1) << 8)) >> 20; \
+	if (_x >= 512-16) _x -= 512; \
+	if (_y >= 512-16) _y -= 512; \
+	if (((w1) >> 24) == 0xFF && _x >= 0 && _x <= 304 && _y >= -15 && _y <= 223) { \
+		if ((w0) & (3u << 28)) perf_dr_flipt++; \
+		else perf_dr_copyt++; \
+	} \
+} while (0)
+#else
+#define DPERF_T0(t)        ((void)0)
+#define DPERF_ADD(acc, t)  ((void)0)
+#define dperf_tile(w0, w1) ((void)0)
+#endif
+#ifdef DRAW_PERF
+#define DPERF_INC(c)       ((c)++)
+#else
+#define DPERF_INC(c)       ((void)0)
 #endif
 
+// --- sprite walk -------------------------------------------------------------
+// The SCB walk turns each visible tile into a record and draws it on the
+// spot. A record is two words, exactly what the draw needs:
+//   w0 = tnum[0..19] | palnum[20..27] | flipx[28] | flipy[29]
+//   w1 = sx[0..11] | ssy[12..23] | (sw-1)[24..27] | (ssh-1)[28..31]
+// Positions keep only the low 12 bits, which is lossless: both draw paths
+// reduce positions mod 512 (PC) or to a 12-bit signed field (RSP), and
+// sx/ssy never carry information above that. On N64, w0/w1 go to the RSP
+// as the 2-word cmd_sprite_draw2 almost unchanged.
+
+// ~4x the in-fight maximum (~1000 drawn tiles measured in Round 4). Excess
+// tiles are walked correctly but dropped (logged).
+#define SPRWALK_MAX_RECS  4096
+static int sprwalk_overflow;   // records dropped this frame (diagnostic)
+
 #ifdef N64
-	#if 1
-	#include "video_n64.c"
-	#else
-	#include "video_cpu.c"
-	#endif
+#include "video_n64.c"
 #else
 #include "video_cpu.c"
 #endif
 
-// Fix-layer fast path (twin knob, MVS64_FIXFAST_OFF): the per-cell empty
-// test inlined (srom_tile_empty_fast) plus a 1-entry memo of the last blank
-// tile code — the map repeats the same blank codes, and ~950 of ~1120 cells
-// are blank in fights. Same draw decisions as the plain path. The memo is
-// per call: tile numbers only change meaning on srom_set_bank, which the 68k
-// does between renders.
-#ifdef MVS64_FIXFAST_OFF
-int mvs64_fix_fast __attribute__((section(".data"))) = 0;
-#else
-int mvs64_fix_fast __attribute__((section(".data"))) = 1;
-#endif
-
+// Fix layer. The per-cell empty test is inlined (srom_tile_empty_fast) with a
+// 1-entry memo of the last blank tile code: the map repeats the same blank
+// codes, and ~950 of ~1120 cells are blank in fights. The memo is per call:
+// tile numbers only change meaning on srom_set_bank, which the 68k does
+// between renders.
 static void render_fix(void) {
 	uint16_t *fix = VIDEO_RAM + 0x7000;
-	const int fast = mvs64_fix_fast;
 	int last_blank = -1;
 
 	render_begin_fix();
@@ -161,12 +153,8 @@ static void render_fix(void) {
 			// srom_tile_empty).
 			if (!v) continue;
 			int t = v & 0xFFF;
-			if (fast) {
-				if (t == last_blank) continue;
-				if (srom_tile_empty_fast(t)) { last_blank = t; continue; }
-			} else if (srom_tile_empty(t)) {
-				continue;
-			}
+			if (t == last_blank) continue;
+			if (srom_tile_empty_fast(t)) { last_blank = t; continue; }
 			draw_sprite_fix(t, (v >> 12) & 0xF, i*8, j*8);
 		}
 		fix += 2;
@@ -176,44 +164,48 @@ static void render_fix(void) {
 }
 
 
-static inline void sprite_consume_begin(void);
-// Forced inline: as a call (GCC kept it out of line) every drawn tile paid
-// ~35 instructions of spills/reloads and prologue, and re-read the CDT
-// context and the knobs from memory. Callers read the knobs once into
-// locals and pass them in: cdt = mvs64_cdt_enable, and two = the sprite
-// command mode, packed (SPR_MODE_*: 2-word command, 64-bit store, flush
-// interval) because the uncached command stores otherwise make GCC reload
-// each knob per tile.
+// Draw one record. Forced inline: as a call (GCC kept it out of line) every
+// drawn tile paid ~35 instructions of spills/reloads and prologue, and
+// re-read the C-ROM context from memory.
 static inline __attribute__((always_inline))
-void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two);
+void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
+	uint32_t tnum = w0 & 0xFFFFF;
 #ifdef N64
-extern int mvs64_cdt_enable;
-#define WALK_KNOB_CDT mvs64_cdt_enable
-#define WALK_KNOB_2W  (mvs64_spr2w ? (SPR_MODE_2W | (mvs64_spr64 ? SPR_MODE_64 : 0) \
-                       | (mvs64_draw_flush_every << SPR_MODE_FLUSH_SHIFT)) : 0)
+	// Fused empty-test + resolve through the C-ROM direct table (roms.c):
+	// one sparse read per record, NULL for an all-transparent tile.
+	DPERF_T0(c0);
+	uint8_t *src = crom_resolve_fast(cx, tnum);
+	DPERF_ADD(perf_dr_cache, c0);
+	if (!src) {
+		DPERF_INC(perf_dr_empty);
+		return;
+	}
+	dperf_tile(w0, w1);
+	DPERF_T0(r0);
+	rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1);
+	DPERF_ADD(perf_dr_rspq, r0);
 #else
-#define WALK_KNOB_CDT 0
-#define WALK_KNOB_2W  0
+	// PC: skip tiles known to decode to all-transparent pixels (learned on
+	// first fetch; index-0 pixels never pass the alpha compare), then draw
+	// on the CPU.
+	(void)cx;
+	if (crom_tile_empty(tnum))
+		return;
+	draw_sprite(tnum, (w0 >> 20) & 0xFF,
+	            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
+	            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
+	            w0 & (1 << 28), w0 & (1 << 29));
 #endif
+}
 
-// Walk early-out for non-wrapping sprites (see sprite_walk_produce).
-// Runtime twin knob pinned to .data; MVS64_CULLFAST_OFF builds the OFF twin.
-#ifdef MVS64_CULLFAST_OFF
-int mvs64_walk_cullfast __attribute__((section(".data"))) = 0;
-#else
-int mvs64_walk_cullfast __attribute__((section(".data"))) = 1;
-#endif
-
-// Bit-exact reference walk: same SCB reads, same vshrink math, same culls,
-// same order as the historical direct-draw loop.
-// recs == NULL is the FUSED mode (default path): each record is consumed
-// (empty-skip + draw) the moment it is produced instead of being stored —
-// the list only exists for the RSP-walk / batch paths that need it. Same
-// records, same order, same maxrecs drop rule => the draw stream is
-// identical by construction; what goes away is the cached record-list
-// write+readback (~5KB/frame modal, up to 32KB dense: a streaming sweep
-// through the 8KB dcache, PLAN-DRAW-RDP §9 law 1).
-static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
+// Same SCB reads, vshrink math, culls and order as the historical direct-draw
+// loop. Each record is drawn the moment it is produced (no record list: that
+// was a cached write+readback of ~5KB/frame modal, up to 32KB dense, i.e. a
+// streaming sweep through the 8KB dcache, PLAN-DRAW-RDP §9 law 1).
+// Kept out of line: inlined into video_render (which GCC does once the walk
+// has a single caller) the per-tile loop shares registers with the frame
+// timers there, and the sprite pass measured ~0.2 ms slower in ares.
+static __attribute__((noinline)) void sprite_walk(void) {
 	int sx = 0, sy = 0, sh = 0, sw = 0, vshrink = 0;
 	bool repeat_tiles = false;
 	int nrec = 0;
@@ -222,14 +214,12 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	bool aa_enabled = lspc_get_auto_animation(&aa);
 
 	sprwalk_overflow = 0;
-	if (!recs) sprite_consume_begin();
 	// Per-render CDT context, local so the walk keeps it in registers: the
 	// copy's address never escapes the inlined consume path (cx0's does,
 	// into crom_resolve_ctx, which made GCC reload it after every store).
 	CromResolveCtx cx0;
 	crom_resolve_ctx(&cx0);
 	const CromResolveCtx cx = cx0;
-	const int k_cdt = WALK_KNOB_CDT, k_2w = WALK_KNOB_2W;
 
 	for (int snum=0;snum<381;snum++) {
 		uint16_t zc = VIDEO_RAM[0x8000 + snum];
@@ -260,15 +250,13 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 		// speedup, pixel-identical by construction); chain bookkeeping
 		// (sx += sw) already happened above.
 		if (sy >= 224 && sy + sh <= 512) continue;
-#ifdef DRAW_PERF
-		perf_walk_spr++;
-#endif
+		DPERF_INC(perf_walk_spr);
 
 		// debugf("[VIDEO] sprite snum:%d xc:%04x yc:%04x zc:%04x pos:%d,%d sh:%d chain:%d repeat:%d tmap:%04x:%04x\n", snum, xc, yc, zc, sx, sy, sh, (yc & 0x40), repeat_tiles, tmap[0], tmap[1]);
 
 		int nt, y, maxy;
 		int halfy = sh < 256 ? sh : 256;
-		// Early-out (twin knob mvs64_walk_cullfast): when the sprite does not
+		// Early-out: when the sprite does not
 		// wrap (sy+sh <= 512), ssy+ssh <= 512 for every tile (ssh is clipped
 		// to sh), so a tile is visible iff ssy < 224. y never decreases in
 		// the top half, and the bottom half starts at y >= 241 (512 minus a
@@ -276,7 +264,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 		// top-half tile reaches ssy >= 224 nothing later in this sprite can
 		// be visible. Skips the culled lower tiles of full-height strips
 		// (~437 culled iterations/frame in fights). Same records, same order.
-		const bool nowrap = mvs64_walk_cullfast && (sy + sh <= 512);
+		const bool nowrap = (sy + sh <= 512);
 
 		// Iterate on the two halves of the vertical sprite. This for loop
 		// is mainly useful to reuse the core drawing loop. The setup
@@ -315,9 +303,7 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 			// Loop through the vertical sprite, tile by tile
 			while (y < maxy) {
-#ifdef DRAW_PERF
-				perf_walk_iter++;
-#endif
+				DPERF_INC(perf_walk_iter);
 				// Calculate the vertical size of this tile. This is
 				// a pixel-perfect formula using the magic table derived
 				// from the original NeoGeo L0 ROM.
@@ -350,17 +336,13 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 						else if (tc & 4) { tnum &= ~3; tnum |= aa & 3; }
 					}
 
-					// Emit the record the consume pass will draw.
-					if (nrec < maxrecs) {
+					// Build the record and draw it.
+					if (nrec < SPRWALK_MAX_RECS) {
 						uint32_t w0 = tnum | (palnum << 20)
 						            | ((tc & 1) << 28) | ((tc & 2) << 28);
 						uint32_t w1 = (sx & 0xFFF) | ((ssy & 0xFFF) << 12)
 						            | ((sw-1) << 24) | ((ssh-1) << 28);
-						if (recs) {
-							recs[nrec].w0 = w0;
-							recs[nrec].w1 = w1;
-						} else
-							sprite_consume_one(&cx, w0, w1, k_cdt, k_2w);
+						sprite_consume_one(&cx, w0, w1);
 						nrec++;
 					} else {
 						sprwalk_overflow++;
@@ -382,261 +364,15 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 
 	if (sprwalk_overflow)
 		debugf("[VIDEO] sprite walk overflow: %d records dropped\n", sprwalk_overflow);
-	return nrec;
-}
-
-#ifdef DRAW_PERF
-// Phase 0 run/repeat/palette stats over the DRAWN stream (post empty-skip:
-// that is the stream Phase 1's memo and Phase 3's mode runs would see).
-// Reset per consume pass (sprite_consume_begin); gen bump ages the uniq
-// table without clearing it.
-static uint32_t p0_last_tnum, p0_last_pal, p0_run;
-#endif
-
-#ifdef N64
-// CROM direct-table knob (runtime twin; .data-pinned like mvs64_walk_fuse).
-#ifdef MVS64_CDT_OFF
-int mvs64_cdt_enable __attribute__((section(".data"))) = 0;
-#else
-int mvs64_cdt_enable __attribute__((section(".data"))) = 1;
-#endif
-#endif
-
-static inline void sprite_consume_begin(void) {
-#ifdef DRAW_PERF
-	p0_last_tnum = ~0u; p0_last_pal = ~0u; p0_run = 0;
-	perf_uniq_gen++;
-#endif
-}
-
-#ifdef DRAW_PERF
-static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
-		volatile uint32_t *p0_uniq =
-			(volatile uint32_t *)UncachedAddr(perf_uniq_tab);
-		uint32_t pal = (w0 >> 20) & 0xFF;
-		uint32_t sw = ((w1 >> 24) & 0xF) + 1, sh = ((w1 >> 28) & 0xF) + 1;
-		if (tnum == p0_last_tnum) {
-			perf_dr_adjrep++;
-			if (++p0_run > perf_dr_maxrun) perf_dr_maxrun = p0_run;
-		} else
-			p0_run = 0;
-		if (pal != p0_last_pal) perf_dr_psw++;
-		if (sw == 16 && sh == 16 && !(w0 & (3u << 28))) perf_dr_modal++;
-		p0_last_tnum = tnum; p0_last_pal = pal;
-		uint32_t h = (tnum * 2654435761u) >> 21;
-		uint32_t key = (perf_uniq_gen << 20) | tnum;
-		if (p0_uniq[h] != key) { perf_dr_uniqx++; p0_uniq[h] = key; }
-}
-#endif
-
-// Consume one record: identical tail of the historical loop — empty-tile
-// skip, then draw_sprite (cache side effects unchanged).
-static inline __attribute__((always_inline))
-void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two) {
-	uint32_t tnum = w0 & 0xFFFFF;
-
-#ifdef DRAW_PERF
-	perf_dr_recs++;
-#endif
-#ifdef N64
-	if (cdt) {
-		// Fused empty-test + resolve through the CROM direct table
-		// (roms.c crom_resolve): one sparse read per record. Same
-		// records, same order, same skip set => same draw stream.
-#ifdef DRAW_PERF_COARSE
-		uint32_t _c0 = TICKS_READ();
-#endif
-		uint8_t *src = cx->fast ? crom_resolve_fast(cx, tnum) : crom_resolve(tnum);
-#ifdef DRAW_PERF_COARSE
-		perf_dr_cache += TICKS_DISTANCE(_c0, TICKS_READ());
-#endif
-		if (!src) {
-#ifdef DRAW_PERF
-			perf_dr_empty++;
-#endif
-			return;
-		}
-#ifdef DRAW_PERF_COARSE
-		perf_dr_tiles++;
-		{   // same predicate as the ucode's modal test (cmd_sprite_draw)
-			int x = ((int32_t)(w1 << 20)) >> 20, y = ((int32_t)(w1 << 8)) >> 20;
-			if (x >= 512-16) x -= 512;
-			if (y >= 512-16) y -= 512;
-			if ((w1 >> 24) == 0xFF && x >= 0 && x <= 304 && y >= -15 && y <= 223) {
-				if (w0 & (3u << 28)) perf_dr_flipt++;
-				else perf_dr_copyt++;
-			}
-		}
-#endif
-#ifdef DRAW_PERF
-		sprite_consume_p0(tnum, w0, w1);
-#endif
-		if (two) {
-#ifdef DRAW_PERF_COARSE
-			uint32_t _r0 = TICKS_READ();
-#endif
-			rsp_sprite_draw2((uint32_t)(src - cx->sprites) >> 7, w0, w1, two);
-#ifdef DRAW_PERF_COARSE
-			perf_dr_rspq += TICKS_DISTANCE(_r0, TICKS_READ());
-#endif
-			return;
-		}
-		draw_sprite_src(src, (w0 >> 20) & 0xFF,
-		                w1 & 0xFFF, (w1 >> 12) & 0xFFF,
-		                ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
-		                w0 & (1 << 28), w0 & (1 << 29));
-		return;
-	}
-#endif
-	// Skip tiles known to decode to all-transparent
-	// pixels — the sprite-layer analogue of the fix
-	// skip above (ROM-stable fact, learned on first
-	// fetch; pixel-identical by construction: index-0
-	// pixels never pass the alpha compare).
-	if (crom_tile_empty(tnum)) {
-#ifdef DRAW_PERF
-		perf_dr_empty++;
-#endif
-		return;
-	}
-
-#ifdef DRAW_PERF
-	sprite_consume_p0(tnum, w0, w1);
-#endif
-	draw_sprite(tnum, (w0 >> 20) & 0xFF,
-	            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
-	            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
-	            w0 & (1 << 28), w0 & (1 << 29));
-}
-
-// Consume pass over a produced record list, in record order.
-static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
-#if defined(N64) && defined(MVS64_SPRBATCH)
-	// Phase 2 batch path (video_n64.c): resolve pointers once, one RSP
-	// command per chunk. PC build always keeps the C path (plan §9 law 8).
-	if (mvs64_batch_enable) {
-		sprite_walk_consume_batch(recs, nrec);
-		return;
-	}
-#endif
-	sprite_consume_begin();
-	CromResolveCtx cx0;
-	crom_resolve_ctx(&cx0);
-	const CromResolveCtx cx = cx0;
-	const int k_cdt = WALK_KNOB_CDT, k_2w = WALK_KNOB_2W;
-	for (int i=0;i<nrec;i++)
-		sprite_consume_one(&cx, recs[i].w0, recs[i].w1, k_cdt, k_2w);
-}
-
-#if defined(N64) && defined(MVS64_WALK_RSP)
-// Runtime walk gate (twin-binary A/B law: ON and OFF builds differ by one
-// initializer constant, keeping layout identical — the old "-1.6 modal"
-// walk verdict was a cross-binary measurement and is layout-confounded).
-// The kick site latches the decision per frame so collect always matches.
-#ifdef MVS64_WALK_DISABLE
-int mvs64_walk_enable __attribute__((section(".data"))) = 0;
-#else
-int mvs64_walk_enable __attribute__((section(".data"))) = 1;
-#endif
-static int walk_kicked_this_frame;
-#endif
-
-// Fused walk knob (runtime twin, layout-identical A/B: the OFF twin differs
-// by this one initializer; pinned to .data so a 0 initializer cannot move
-// it into .bss and shift the layout). The batch path consumes a list, so
-// it always takes the split walk.
-#ifdef MVS64_FUSE_OFF
-int mvs64_walk_fuse __attribute__((section(".data"))) = 0;
-#else
-int mvs64_walk_fuse __attribute__((section(".data"))) = 1;
-#endif
-
-static void sprite_walk_default(void) {
-#if defined(N64) && defined(MVS64_SPRBATCH)
-	if (mvs64_batch_enable) {
-		int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
-		sprite_walk_consume(sprwalk_recs, nrec);
-		return;
-	}
-#endif
-	if (mvs64_walk_fuse) {
-		sprite_walk_produce(NULL, SPRWALK_MAX_RECS);
-		return;
-	}
-	int nrec = sprite_walk_produce(sprwalk_recs, SPRWALK_MAX_RECS);
-	sprite_walk_consume(sprwalk_recs, nrec);
 }
 
 static void render_sprites(void) {
 	render_begin_sprites();
-#if defined(N64) && defined(MVS64_WALK_RSP)
-	if (!walk_kicked_this_frame) {
-		sprite_walk_default();
-		render_end_sprites();
-		return;
-	}
-	// OPT-IN (default OFF). The walk runs on the RSP (cmd_sprite_walk,
-	// rsp_video.S); the CPU only consumes the record list. Bit-exact
-	// (MVS64_WALKDBG dual-compute, 11.4k frames, 0 mismatches). The old
-	// walk+audio deadlock was the rspq lost-wakeup race, fixed closed-loop
-	// in the vendored libdragon (patches/libdragon-rspq-closed-loop-flush.
-	// patch, 2026-08-07). The kick happened at video_render entry so the
-	// RSP walked during render_begin; here we only collect (sentinel
-	// trailer poll — no full-queue rspq_wait).
-	int nrec = sprite_walk_collect_rsp(sprwalk_recs, SPRWALK_MAX_RECS);
-	#ifdef MVS64_WALKDBG
-	// Dual-compute gate: the C walk is authoritative; compare record lists
-	// per frame and log any divergence (see rsp_audio's VERIFY pattern).
-	{
-		static SprWalkRec recs_c[SPRWALK_MAX_RECS];
-		static uint32_t walkdbg_frames;
-		int rsp_ovfl = sprwalk_rsp_ovfl;
-		int nc = sprite_walk_produce(recs_c, SPRWALK_MAX_RECS);
-		if (nc != nrec || memcmp(recs_c, sprwalk_recs, nc * sizeof(SprWalkRec)) != 0
-		    || rsp_ovfl != sprwalk_overflow) {
-			debugf("[WALKDBG] MISMATCH frame=%lu nrec=%d nc=%d ovfl=%d/%d\n",
-				(unsigned long)walkdbg_frames, nrec, nc, rsp_ovfl, sprwalk_overflow);
-			for (int i=0; i<nc && i<nrec; i++) {
-				if (recs_c[i].w0 != sprwalk_recs[i].w0 || recs_c[i].w1 != sprwalk_recs[i].w1) {
-					debugf("[WALKDBG] first diff @%d: rsp %08lx/%08lx vs c %08lx/%08lx\n", i,
-						(unsigned long)sprwalk_recs[i].w0, (unsigned long)sprwalk_recs[i].w1,
-						(unsigned long)recs_c[i].w0, (unsigned long)recs_c[i].w1);
-					break;
-				}
-			}
-		}
-		if (++walkdbg_frames % 600 == 0)
-			debugf("[WALKDBG] %lu frames checked OK\n", (unsigned long)walkdbg_frames);
-		sprite_walk_consume(recs_c, nc);
-	}
-	#else
-	sprite_walk_consume(sprwalk_recs, nrec);
-	#endif
-#else
-	sprite_walk_default();
-#endif
+	sprite_walk();
 	render_end_sprites();
 }
 
-
-
 void video_render(void) {
-#ifdef MVS64_NORENDER
-	// Diagnostic: skip all sprite/fix drawing (RSP/RDP) to isolate whether the
-	// ~frame-537 crash is in the N64 render path. Frames still flip (blank screen).
-	return;
-#endif
-#if defined(N64) && defined(MVS64_WALK_RSP)
-	// Kick the RSP sprite walk FIRST: VRAM is stable for the whole render
-	// (the 68k is not running), so the walk overlaps render_begin's CPU
-	// work and render_sprites only has to collect the finished list.
-	walk_kicked_this_frame = mvs64_walk_enable;
-	if (walk_kicked_this_frame) {
-		uint8_t aa_k;
-		bool aa_en_k = lspc_get_auto_animation(&aa_k);
-		sprite_walk_kick_rsp(sprwalk_recs, SPRWALK_MAX_RECS, aa_k, aa_en_k);
-	}
-#endif
 #ifdef DRAW_PERF_COARSE
 	uint32_t t0 = TICKS_READ();
 	render_begin();

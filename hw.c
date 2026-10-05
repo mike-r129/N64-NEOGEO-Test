@@ -102,25 +102,12 @@ uint32_t read_pbrom(uint32_t addr, int sz) {
 	return *rom;
 }
 
-#ifdef N64
-// I/O read trace ring buffer (boot-divergence debugging): last 1024 (68kPC,addr,val).
-volatile uint32_t io_trace[1024][3];
-volatile uint32_t io_trace_idx;
-#endif
-
 static uint32_t read_hwio_impl(uint32_t addr, int sz)  {
 	if (sz == 4) {
 		// NOTE: order is important
 		uint32_t val = read_hwio_impl(addr+0, 2) << 16;
 		return val | read_hwio_impl(addr+2, 2);
 	}
-
-	// Idle skip for RTC Wait Pulse in BIOS boot
-	#if 0
-	if (addr == 0x320001 && emu_pc() == 0xC11DA2) {
-		m68k_consume_timeslice();
-	}
-	#endif
 
 	// debugf("[HWIO] read%d: %06x (68K PC:%x)\n", sz*8, (unsigned int)addr, m68k_get_reg(NULL, M68K_REG_PC));
 	// debugf("[HWIO] read%d: %06x (68K PC:%x EPC:%lx)\n", sz*8, (unsigned int)addr, m68k_get_reg(NULL, M68K_REG_PC), C0_READ_EPC());
@@ -358,13 +345,6 @@ void hw_init(void) {
 	inst_cache_hit_invalidate(mips_tlb_vector, 16);
 
 	enable_interrupts();
-
-	#if 0
-	// Self-tests just to make sure we're not getting things wrong
-	assert(memcmp((void*)0x200000, P_ROM+0x100000, 1024*1024) == 0);
-	assert(memcmp((void*)0xC00000, BIOS, 128*1024) == 0);
-	assert(memcmp((void*)0x000000+1, P_ROM+1, 1024*1024-1) == 0);
-	#endif
 
 	#endif
 

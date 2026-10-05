@@ -540,7 +540,7 @@ int main(int argc, char *argv[]) {
 const char* game_ini[65536] = {
 	[GAME_MSLUG]    = "idle_skip=0x1FE2\n",
 	[GAME_SAMSHO]   = "idle_skip=0xF7E\n",
-	// [GAME_SAMSHO2] = "idle_skip=0x????\n",  // TODO: set after profiling samsho2's idle loop (PLAN.md WS6-T4)
+	// [GAME_SAMSHO2] = "idle_skip=0x????\n",  // TODO: set after profiling samsho2's idle loop (docs/archive/PLAN.md WS6-T4)
 	[GAME_AOF]      = "idle_skip=0x6790\n",
 	[GAME_AOF3]     = "idle_skip=0x15D2\n",
 	[GAME_PBOBBLEN] = "idle_skip=0xE76\n",
