@@ -202,7 +202,10 @@ void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1) {
 // loop. Each record is drawn the moment it is produced (no record list: that
 // was a cached write+readback of ~5KB/frame modal, up to 32KB dense, i.e. a
 // streaming sweep through the 8KB dcache, PLAN-DRAW-RDP §9 law 1).
-static void sprite_walk(void) {
+// Kept out of line: inlined into video_render (which GCC does once the walk
+// has a single caller) the per-tile loop shares registers with the frame
+// timers there, and the sprite pass measured ~0.2 ms slower in ares.
+static __attribute__((noinline)) void sprite_walk(void) {
 	int sx = 0, sy = 0, sh = 0, sw = 0, vshrink = 0;
 	bool repeat_tiles = false;
 	int nrec = 0;
