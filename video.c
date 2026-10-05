@@ -60,22 +60,8 @@ uint32_t perf_dr_empty;   /* sprite tiles skipped as known-empty */
 uint32_t perf_dr_wwait;   /* RSP sprite walk: CPU time blocked in rspq_wait */
 uint32_t perf_walk_spr;   /* sprites that reach the tile loop (past all culls) */
 uint32_t perf_walk_iter;  /* tile-loop iterations, visible or not */
-// PLAN-DRAW-RDP Phase 0 decision counters ([PERF3] in emu.c):
-uint32_t perf_dr_recs;    /* records seen by consume (incl. empty-skipped) */
-uint32_t perf_dr_adjrep;  /* drawn records whose tnum == previous drawn */
-uint32_t perf_dr_maxrun;  /* longest consecutive same-tnum drawn run */
-uint32_t perf_dr_uniqx;   /* ~unique tnums (gen-stamped hash, collisions
-                             undercount uniques slightly) */
-uint32_t perf_dr_psw;     /* palette switches between consecutive draws */
-uint32_t perf_dr_modal;   /* drawn records matching the COPY-mode predicate
-                             (sw==16 && sh==16 && no flip) */
-uint32_t perf_dr_miss;    /* sprite-cache misses (PI DMA loads) */
+uint32_t perf_dr_miss;    /* sprite-cache misses (PI DMA loads, [PERF3]) */
 uint32_t perf_dr_missticks; /* ticks spent in the miss/DMA path */
-// Uniq table: 2048 gen-stamped entries accessed UNCACHED — heavy frames
-// touch most slots, and an 8KB cached resident table would evict the whole
-// dcache (PLAN-DRAW-RDP §9 law 1). Diagnostic builds only.
-static uint32_t perf_uniq_tab[2048] __attribute__((aligned(16)));
-static uint32_t perf_uniq_gen;
 #define DRAW_PERF 1
 #endif
 #if defined(N64) && (defined(MVS64_PERFCOUNT) || defined(MVS64_PERFOSD))
@@ -176,7 +162,6 @@ static void render_fix(void) {
 }
 
 
-static inline void sprite_consume_begin(void);
 // Forced inline: as a call (GCC kept it out of line) every drawn tile paid
 // ~35 instructions of spills/reloads and prologue, and re-read the CDT
 // context and the knobs from memory. Callers read the knobs once into
@@ -222,7 +207,6 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	bool aa_enabled = lspc_get_auto_animation(&aa);
 
 	sprwalk_overflow = 0;
-	if (!recs) sprite_consume_begin();
 	// Per-render CDT context, local so the walk keeps it in registers: the
 	// copy's address never escapes the inlined consume path (cx0's does,
 	// into crom_resolve_ctx, which made GCC reload it after every store).
@@ -385,14 +369,6 @@ static int sprite_walk_produce(SprWalkRec *recs, int maxrecs) {
 	return nrec;
 }
 
-#ifdef DRAW_PERF
-// Phase 0 run/repeat/palette stats over the DRAWN stream (post empty-skip:
-// that is the stream Phase 1's memo and Phase 3's mode runs would see).
-// Reset per consume pass (sprite_consume_begin); gen bump ages the uniq
-// table without clearing it.
-static uint32_t p0_last_tnum, p0_last_pal, p0_run;
-#endif
-
 #ifdef N64
 // CROM direct-table knob (runtime twin; .data-pinned like mvs64_walk_fuse).
 #ifdef MVS64_CDT_OFF
@@ -402,42 +378,12 @@ int mvs64_cdt_enable __attribute__((section(".data"))) = 1;
 #endif
 #endif
 
-static inline void sprite_consume_begin(void) {
-#ifdef DRAW_PERF
-	p0_last_tnum = ~0u; p0_last_pal = ~0u; p0_run = 0;
-	perf_uniq_gen++;
-#endif
-}
-
-#ifdef DRAW_PERF
-static inline void sprite_consume_p0(uint32_t tnum, uint32_t w0, uint32_t w1) {
-		volatile uint32_t *p0_uniq =
-			(volatile uint32_t *)UncachedAddr(perf_uniq_tab);
-		uint32_t pal = (w0 >> 20) & 0xFF;
-		uint32_t sw = ((w1 >> 24) & 0xF) + 1, sh = ((w1 >> 28) & 0xF) + 1;
-		if (tnum == p0_last_tnum) {
-			perf_dr_adjrep++;
-			if (++p0_run > perf_dr_maxrun) perf_dr_maxrun = p0_run;
-		} else
-			p0_run = 0;
-		if (pal != p0_last_pal) perf_dr_psw++;
-		if (sw == 16 && sh == 16 && !(w0 & (3u << 28))) perf_dr_modal++;
-		p0_last_tnum = tnum; p0_last_pal = pal;
-		uint32_t h = (tnum * 2654435761u) >> 21;
-		uint32_t key = (perf_uniq_gen << 20) | tnum;
-		if (p0_uniq[h] != key) { perf_dr_uniqx++; p0_uniq[h] = key; }
-}
-#endif
-
 // Consume one record: identical tail of the historical loop — empty-tile
 // skip, then draw_sprite (cache side effects unchanged).
 static inline __attribute__((always_inline))
 void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int cdt, int two) {
 	uint32_t tnum = w0 & 0xFFFFF;
 
-#ifdef DRAW_PERF
-	perf_dr_recs++;
-#endif
 #ifdef N64
 	if (cdt) {
 		// Fused empty-test + resolve through the CROM direct table
@@ -468,9 +414,6 @@ void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int 
 			}
 		}
 #endif
-#ifdef DRAW_PERF
-		sprite_consume_p0(tnum, w0, w1);
-#endif
 		if (two) {
 #ifdef DRAW_PERF_COARSE
 			uint32_t _r0 = TICKS_READ();
@@ -500,9 +443,6 @@ void sprite_consume_one(const CromResolveCtx *cx, uint32_t w0, uint32_t w1, int 
 		return;
 	}
 
-#ifdef DRAW_PERF
-	sprite_consume_p0(tnum, w0, w1);
-#endif
 	draw_sprite(tnum, (w0 >> 20) & 0xFF,
 	            w1 & 0xFFF, (w1 >> 12) & 0xFFF,
 	            ((w1 >> 24) & 0xF) + 1, ((w1 >> 28) & 0xF) + 1,
@@ -519,7 +459,6 @@ static void sprite_walk_consume(const SprWalkRec *recs, int nrec) {
 		return;
 	}
 #endif
-	sprite_consume_begin();
 	CromResolveCtx cx0;
 	crom_resolve_ctx(&cx0);
 	const CromResolveCtx cx = cx0;
@@ -621,11 +560,6 @@ static void render_sprites(void) {
 
 
 void video_render(void) {
-#ifdef MVS64_NORENDER
-	// Diagnostic: skip all sprite/fix drawing (RSP/RDP) to isolate whether the
-	// ~frame-537 crash is in the N64 render path. Frames still flip (blank screen).
-	return;
-#endif
 #if defined(N64) && defined(MVS64_WALK_RSP)
 	// Kick the RSP sprite walk FIRST: VRAM is stable for the whole render
 	// (the 68k is not running), so the walk overlaps render_begin's CPU
