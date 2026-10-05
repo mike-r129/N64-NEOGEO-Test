@@ -69,7 +69,6 @@ int  YM2610Write(int addr, u8 value);
 u8   YM2610Read(int addr);
 int  YM2610TimerOver(int channel);
 
-void YM2610Update(int *p);
 void YM2610Update_stream(int length);
 
 #if defined(N64) && defined(MVS64_RSPWP)
@@ -87,13 +86,6 @@ void YM2610_wp_finish_async(void);
 void YM2610_wp_mark_emitted(void);
 #endif
 
-#ifdef SOUND_TEST
-void YM2610Update_SoundTest(int p);
-#endif
 
-#ifdef SAVE_STATE
-STATE_SAVE( ym2610 );
-STATE_LOAD( ym2610 );
-#endif
 
 #endif /* _YM2610_H_ */
