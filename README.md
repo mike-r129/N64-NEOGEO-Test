@@ -95,7 +95,6 @@ per-frame state hash used to check bit-exactness. Template notes are in
 | Feature | Enable with | What it does | Result |
 | --- | --- | --- | --- |
 | Predecoded dispatch | `PD_ON=1` | Scaffold that dispatches through pre-decoded records per guest address instead of the opcode table | 5.5-5.9 fps slower: the record stream thrashes the 8 KB data cache. Closed |
-| Full fast-path wave 3 | `EXTRA_DEFINES=-DM64K_W3_FULL` | 14 more inline 68000 instruction forms | 2.9-3.9 fps slower: the extra code overflows the 16 KB instruction cache |
 | RSP sprite walk | `EXTRA_DEFINES=-DMVS64_WALK_RSP` | The RSP walks the sprite tables and builds the visible-tile list the CPU draws from | Bit-exact over 11,400 frames, but about 1.3 fps slower in typical scenes |
 | Batched sprite draw | `EXTRA_DEFINES=-DMVS64_SPRBATCH` | One RSP command per 64 sprite tiles instead of one per tile | Pixel-identical, but 0.8-1.6 fps slower |
 | Synchronous RSP FM | `WP_OFF=1 RSPFM=1` | FM synthesis on the RSP one chunk at a time, with the CPU waiting on each chunk | Bit-exact, but slower: 26.3 → 21.8 fps with two channels on the RSP, 12.6 with all four. The default whole-pump offload replaced it |

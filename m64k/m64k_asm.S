@@ -1652,32 +1652,6 @@ subq_f_byte:                           # subq.b #,Dn (4 cycles)
 #endif
 
 OP(addi):
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-    # ADDI.w #,Dn fast path (wave 3, M64K_W3_FULL only). Charge: immediate table, EA-reg
-    # eadst column = 8. Full ADD flags including X (add_f_word idiom).
-    andi t0, opcode, 0x38
-    bnez t0, addi_slow
-    andi t0, opcode, 0xC0
-    xori t0, 0x40
-    bnez t0, addi_slow
-    andi t2, opcode, 7
-    sll t2, 2
-    add t2, ctx
-    addi dptr, m_pc, -2                # decode_imm parity (see ANDI note)
-    lhu t0, 0(m_pc)                    # immediate word (code stream)
-    addiu m_pc, 2
-    lhu t1, M64K_OFF_DREGS+2(t2)
-    daddu result, t0, t1
-    dsll flag_zc, result, 16
-    dsrl flag_x, flag_zc, 32
-    sll t0, 16
-    sll t1, 16
-    daddu flag_nv, t0, t1
-    sh result, M64K_OFF_DREGS+2(t2)
-    use_cycles 8
-    dispatch_next
-addi_slow:
-#endif
     lax rmw_op, op_add_rmwimpl
     jal_and_j decode_imm, rmw_eadst
 op_subi:  # (same cacheline)
@@ -1755,11 +1729,7 @@ OP(add):
     andi t0, opcode, 0x138             # EA mode Dn, direction <ea>+Dm -> Dm
     bnez t0, add_slow
     andi t0, opcode, 0xC0
-#ifdef M64K_W3_FULL
-    beq t0, 0xC0, adda_f_w             # opmode 011 = ADDA.w (Dn source here)
-#else
     beq t0, 0xC0, add_slow             # opmode 011 = ADDA.w
-#endif
     andi t1, opcode, 7                 # source Dn
     sll t1, 2
     add t1, ctx
@@ -1806,25 +1776,6 @@ add_f_byte:                            # add.b Dn,Dm (4 cycles)
     sb result, M64K_OFF_DREGS+3(t2)
     use_cycles 4
     dispatch_next
-#ifdef M64K_W3_FULL
-adda_f_w:                              # adda.w Dn,An (wave 3; 8 cycles, no flags)
-    # Reached from the OP(add) prologue with EA mode already known to be Dn
-    # (0x138 clear) and opmode 011. Source word sign-extends, full 32-bit add
-    # into An. Charge is the generic op_adda 16-bit path's flat 8.
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lh t0, M64K_OFF_DREGS+2(t1)
-    srl t2, opcode, 7
-    andi t2, 0x7<<2
-    add t2, ctx
-    addi dptr, t2, 32                  # decode_dptr+op_adda parity (An slot)
-    lw t3, M64K_OFF_AREGS(t2)
-    addu t3, t0
-    sw t3, M64K_OFF_AREGS(t2)
-    use_cycles 8
-    dispatch_next
-#endif
 add_slow:
 #else
 OP(add):
@@ -2034,60 +1985,6 @@ OP(cmp):
     beq t0, 0b011 << 6, op_cmpa16
     beq t0, 0b111 << 6, op_cmpa32
     bge t0, 0b100 << 6, op_eor
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-    # CMP fast paths (wave 3, M64K_W3_FULL only): .w (d16,An),Dn and .b Dn,Dn — the two hot
-    # in-match CMP forms. Flags are the op_cmp_rmwimpl idiom with the
-    # bitsize folded (no X, no writeback). Charges: logical table — EA-mem
-    # .w = 4 + ea_101's 8 = 12 (all before the read, matching rmw16_easrc's
-    # use_cycles_table-first order); EA-reg .b = 4.
-    andi t1, opcode, 0x38
-    beqz t1, cmp_f_chk_dn
-    xori t2, t1, 0x28
-    bnez t2, cmp_slow
-    xori t2, t0, 0x40
-    bnez t2, cmp_slow                  # only .w for the (d16,An) source
-    andi t1, opcode, 7                 # ---- cmp.w (d16,An),Dn (12 cycles) ----
-    sll t1, 2
-    add t1, ctx
-    lw eaptr32, M64K_OFF_AREGS(t1)
-    lh t2, 0(m_pc)
-    addu eaptr32, t2
-    check_addr_bail eaptr32, cmp_slow
-    addiu m_pc, 2
-    map_m68k eaptr, eaptr32
-    use_cycles 12
-    lhu_m68k t0, eaptr
-    srl t2, opcode, 7
-    andi t2, 0x7<<2
-    add t2, ctx
-    move dptr, t2                      # decode_dptr parity (see ANDI note)
-    lhu t1, M64K_OFF_DREGS+2(t2)
-    dsubu result, t1, t0
-    dsll flag_zc, result, 16
-    sll t0, 16
-    sll t1, 16
-    dsubu flag_nv, t1, t0
-    dispatch_next
-cmp_f_chk_dn:
-    bnez t0, cmp_slow                  # only .b for the Dn source
-    andi t1, opcode, 7                 # ---- cmp.b Dn,Dm (4 cycles) ----
-    sll t1, 2
-    add t1, ctx
-    lbu t0, M64K_OFF_DREGS+3(t1)
-    srl t2, opcode, 7
-    andi t2, 0x7<<2
-    add t2, ctx
-    move dptr, t2                      # decode_dptr parity (see ANDI note)
-    lbu t1, M64K_OFF_DREGS+3(t2)
-    dsubu result, t1, t0
-    dsll flag_zc, result, 24
-    sll t0, 24
-    sll t1, 24
-    dsubu flag_nv, t1, t0
-    use_cycles 4
-    dispatch_next
-cmp_slow:
-#endif
     use_cycles_opmask (1<<7)|(7<<3), 1<<7, -2     # cmp.l with EA=Dn takes 2 cycle less
     use_cycles_opmask 0b11111111, 0b10111100, -2  # cmp.l #<data>,Dn takes 2 cycle less
     lax rmw_op, op_cmp_rmwimpl
@@ -2258,33 +2155,6 @@ OP(group_logical):
 OP(andi):
     andi t0, opcode, 0b111111
     beq t0, 0b111100, op_andi_sr
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-    # ANDI.w #,Dn fast path (wave 3, M64K_W3_FULL only). Charge: immediate table, EA-reg
-    # eadst column = 8. Flags are op_and_rmwimpl with bitsize folded
-    # (N/Z from result, V=C=0, X unchanged).
-    andi t0, opcode, 0x38
-    bnez t0, andi_slow
-    andi t0, opcode, 0xC0
-    xori t0, 0x40
-    bnez t0, andi_slow
-    addi dptr, m_pc, -2                # dptr as decode_imm leaves it: successor
-                                       # ops (shifts/singleops) dummy-read a
-                                       # stale dptr, so it must stay a valid
-                                       # EVEN host pointer (see wave-3 notes)
-    lhu t0, 0(m_pc)                    # immediate word (code stream)
-    addiu m_pc, 2
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lhu t2, M64K_OFF_DREGS+2(t1)
-    and result, t0, t2
-    sh result, M64K_OFF_DREGS+2(t1)
-    sll flag_nv, result, 16
-    zx64 flag_zc, flag_nv
-    use_cycles 8
-    dispatch_next
-andi_slow:
-#endif
     lax rmw_op, op_and_rmwimpl
     jal_and_j decode_imm, rmw_eadst
 OP(ori):
@@ -2665,75 +2535,6 @@ op_roxm_finish:
     j main_loop
 
 OP(clr):
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-    # CLR.b/.w (d16,An) and (An) fast paths (wave 3, M64K_W3_FULL only). The 68000's dummy
-    # read-before-write is kept (rmw*_eadst parity: MMIO pages observe the
-    # same read-then-write access pattern, loads land in t0 for the TLB trap
-    # decoder). Charges match the generic split: EA charge (8 for d16, 4
-    # for (An)) before the read, singleop-table eadst column (8) before the
-    # write. .l and every other EA stay generic.
-    andi t0, opcode, 0xC0
-    beq t0, 0x80, clr_slow             # .l stays generic
-    beq t0, 0xC0, clr_slow             # 0x42C0 form stays generic
-    andi t1, opcode, 0x38
-    xori t2, t1, 0x28
-    beqz t2, clr_f_d16
-    xori t2, t1, 0x10
-    beqz t2, clr_f_an
-    j clr_slow
-clr_f_d16:                             # ---- clr.b/.w (d16,An) (16 cycles) ----
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lw eaptr32, M64K_OFF_AREGS(t1)
-    lh t2, 0(m_pc)
-    addu eaptr32, t2
-    #if M64K_CONFIG_ADDRERR
-    beqz t0, 1f                        # byte accesses cannot fault
-    check_addr_bail eaptr32, clr_slow
-1:
-    #endif
-    addiu m_pc, 2
-    map_m68k eaptr, eaptr32
-    use_cycles 8
-    beqz t0, clr_f_byte
-    lhu_m68k t0, eaptr                 # dummy read (rmw16_eadst parity)
-    li result, 0
-    li flag_nv, 0
-    li flag_zc, 0
-    use_cycles 8
-    sh_m68k result, eaptr
-    dispatch_next
-clr_f_an:                              # ---- clr.b/.w (An) (12 cycles) ----
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lw eaptr32, M64K_OFF_AREGS(t1)
-    #if M64K_CONFIG_ADDRERR
-    beqz t0, 1f
-    check_addr_bail eaptr32, clr_slow
-1:
-    #endif
-    map_m68k eaptr, eaptr32
-    use_cycles 4
-    beqz t0, clr_f_byte
-    lhu_m68k t0, eaptr                 # dummy read (rmw16_eadst parity)
-    li result, 0
-    li flag_nv, 0
-    li flag_zc, 0
-    use_cycles 8
-    sh_m68k result, eaptr
-    dispatch_next
-clr_f_byte:
-    lbu_m68k t0, eaptr                 # dummy read (rmw8_eadst parity)
-    li result, 0
-    li flag_nv, 0
-    li flag_zc, 0
-    use_cycles 8
-    sb_m68k result, eaptr
-    dispatch_next
-clr_slow:
-#endif
     set_rmw_cyctable rmw_cyctable_singleop
     lax rmw_op, op_clr_rmwimpl
     j rmw_eadst                   # run rmw cycle (note: clr does a dummy read on 68000)
@@ -2833,15 +2634,8 @@ cyc_move_penalty:
 # ADDRERR bail is needed; the A7 byte quirk (+2) keeps A7 on the generic path.
 OP(moveb):
     andi t0, opcode, 0x1C0             # destination mode field
-#ifdef M64K_W3_FULL
-    bnez t0, moveb_fdst_mem
-#else
     bnez t0, moveb_slow
-#endif
     andi t0, opcode, 0x38
-#ifdef M64K_W3_FULL
-    beqz t0, moveb_f_dn_dn
-#endif
     xori t1, t0, 0x28
     beqz t1, moveb_f_d16
     xori t1, t0, 0x18
@@ -2865,45 +2659,6 @@ OP(moveb):
     sll flag_nv, t0, 24
     dispatch_next
 
-#ifdef M64K_W3_FULL
-moveb_f_dn_dn:                         # ---- move.b Dn,Dm  (wave 3; 4 cycles) ----
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lbu t0, M64K_OFF_DREGS+3(t1)
-    srl t1, opcode, 7
-    andi t1, 0x7<<2
-    add t1, ctx
-    sb t0, M64K_OFF_DREGS+3(t1)
-    move flag_zc, t0
-    sll flag_nv, t0, 24
-    use_cycles 4
-    dispatch_next
-
-moveb_fdst_mem:
-    andi t1, opcode, 0x38              # source must be Dn
-    bnez t1, moveb_slow
-    xori t1, t0, 0x140                 # destination (d16,An)?
-    bnez t1, moveb_slow
-    # ---- move.b Dn,(d16,An)  (wave 3; 12 cycles) ----
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lbu result, M64K_OFF_DREGS+3(t1)
-    srl t1, opcode, 7
-    andi t1, 0x7<<2
-    add t1, ctx
-    lw eaptr32, M64K_OFF_AREGS(t1)
-    lh t2, 0(m_pc)
-    addiu m_pc, 2
-    addu eaptr32, t2
-    map_m68k eaptr, eaptr32
-    move flag_zc, result
-    sll flag_nv, result, 24
-    use_cycles 12
-    sb_m68k result, eaptr
-    dispatch_next
-#endif
 
 moveb_f_d16:                           # ---- move.b (d16,An),Dm  (12 cycles) ----
     andi t1, opcode, 7
@@ -3273,10 +3028,6 @@ OP(movel):
     srl t1, opcode, 6                  # destination mode
     andi t1, 7
     beqz t1, movel_f_dst_dn
-#ifdef M64K_W3_FULL
-    xori t2, t1, 5
-    beqz t2, movel_f_dst_d16
-#endif
     xori t2, t1, 1
     bnez t2, movel_slow
     srl t1, opcode, 7                  # ---- movea.l Dn/An,Am: no flags ----
@@ -3285,24 +3036,6 @@ OP(movel):
     sw t0, M64K_OFF_AREGS(t1)
     use_cycles 12
     dispatch_next
-#ifdef M64K_W3_FULL
-movel_f_dst_d16:                       # ---- move.l Dn/An,(d16,An)  (wave 3; 20 cycles) ----
-    srl t1, opcode, 7
-    andi t1, 0x7<<2
-    add t1, ctx
-    lw eaptr32, M64K_OFF_AREGS(t1)
-    lh t2, 0(m_pc)
-    addu eaptr32, t2
-    check_addr_bail eaptr32, movel_slow
-    addiu m_pc, 2
-    map_m68k eaptr, eaptr32
-    move result, t0
-    move flag_nv, t0                   # sign-extended: N in bits 31 and 63, V=0
-    zx64 flag_zc, flag_nv
-    use_cycles 20
-    sw_m68k result, eaptr
-    dispatch_next
-#endif
 movel_f_dst_dn:                        # ---- move.l Dn/An,Dm ----
     srl t1, opcode, 7
     andi t1, 0x7<<2
@@ -3726,24 +3459,6 @@ OP(pea):
 OP(lea):
     andi t0, opcode, 1<<6
     beqz t0, op_chk
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-    # LEA (xxx).L,An fast path (wave 3, M64K_W3_FULL only): low byte 0xF9 = mode 111 reg 001
-    # with bits 7:6 = 11. Charge is the generic path's (ea7_001's flat 12;
-    # OP(lea) itself charges nothing at accuracy 0). No flags.
-    andi t0, opcode, 0xFF
-    xori t0, 0xF9
-    bnez t0, lea_slow
-    lwl t0, 0(m_pc)
-    lwr t0, 3(m_pc)
-    addiu m_pc, 4
-    srl t1, opcode, 7
-    andi t1, 0x7<<2
-    add t1, ctx
-    sw t0, M64K_OFF_AREGS(t1)
-    use_cycles 12
-    dispatch_next
-lea_slow:
-#endif
     #if M64K_CONFIG_TIMING_ACCURACY >= 1
     jal cyc_leapea_penalty
     #endif
@@ -3957,38 +3672,6 @@ idle_skip:
     j main_loop
 
 OP(jsr):
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-# JSR (xxx).L fast path (wave 3, M64K_W3_FULL only: measured icache-negative
-# in the full-wave build - see PLAN-OPTIMIZATION.md 2026-08-06). Generic charge order: 8 (entry) + 12
-# (ea7_001) before the stack push, then +2 (jmp_exec_cycles) before the
-# target map — replicated as 20/2 below. The odd-SP check bails BEFORE any
-# mutation: the generic replay then decrements SP once and raises
-# write_address_error exactly like an all-generic run (push32 stores the
-# decremented SP before its own check). Spin-compare list skipped as in
-# rts_fast. Odd targets raise via the original pc_address_error machinery.
-    andi t0, opcode, 0x3F
-    xori t0, 0x39
-    bnez t0, jsr_slow
-    lw_ctx t1, M64K_OFF_AREGS+7*4
-    addiu t2, t1, -4
-    check_addr_bail t2, jsr_slow
-    lwl eaptr32, 0(m_pc)               # absolute 32-bit target (code stream)
-    lwr eaptr32, 3(m_pc)
-    addiu m_pc, 4
-    use_cycles 20
-    lw t0, pc_diff
-    addu result, t0, m_pc              # return address (68k space)
-    sw_ctx t2, M64K_OFF_AREGS+7*4
-    map_m68k t0, t2
-    sw_m68k result, t0
-    use_cycles 2
-    map_m68k m_pc, eaptr32
-    subu t0, eaptr32, m_pc
-    sw t0, pc_diff
-    check_addr_error eaptr32, pc_address_error
-    dispatch_next
-jsr_slow:
-#endif
     use_cycles 8
     jal decode_ea
 jsr_exec:
@@ -4030,35 +3713,6 @@ ALIGN(rts_fast):
     dispatch_next
 #endif
 
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-# BSR.w fast path (wave 3, M64K_W3_FULL only), reached from bcc_cctable entry 1 (t3 already
-# holds the signed 8-bit displacement loaded by the Bcc fast dispatch). The
-# short form and any odd new-SP bail to the generic op_bsr, which re-reads
-# everything from scratch (no state mutated here first). Charges mirror the
-# generic order: 16 (bsr_exec) before the stack push, +2 (jmp_exec_cycles)
-# before the target map. Spin-compare list skipped as in rts_fast.
-bsr_fast:
-    bnez t3, op_bsr                    # 8-bit form stays generic
-    lw_ctx t1, M64K_OFF_AREGS+7*4
-    addiu t2, t1, -4
-    check_addr_bail t2, op_bsr
-    lh t3, 0(m_pc)                     # 16-bit displacement
-    lw t0, pc_diff
-    addu eaptr32, t0, m_pc             # target = PC of ext word + disp
-    addu eaptr32, t3
-    addiu m_pc, 2
-    use_cycles 16
-    addu result, t0, m_pc              # return address (68k space, after ext)
-    sw_ctx t2, M64K_OFF_AREGS+7*4
-    map_m68k t0, t2
-    sw_m68k result, t0
-    use_cycles 2
-    map_m68k m_pc, eaptr32
-    subu t0, eaptr32, m_pc
-    sw t0, pc_diff
-    check_addr_error eaptr32, pc_address_error
-    dispatch_next
-#endif
 
 OP(bsr):
     lb t3, -1(m_pc)                    # fetch signed 8-bit displacement (from opcode)
@@ -4717,11 +4371,7 @@ opcctable:
 # Bcc fast-path dispatch: one entry per condition code (opcode bits 11:8),
 # sense baked in. Cond 0 (BRA) is always taken; cond 1 is BSR.
 bcc_cctable:
-#ifdef M64K_W3_FULL
-    .long   bcc_taken, bsr_fast, bcct_hi, bcct_ls
-#else
     .long   bcc_taken, op_bsr,   bcct_hi, bcct_ls
-#endif
     .long   bcct_cc,   bcct_cs, bcct_ne, bcct_eq
     .long   bcct_vc,   bcct_vs, bcct_pl, bcct_mi
     .long   bcct_ge,   bcct_lt, bcct_gt, bcct_le
@@ -4851,38 +4501,6 @@ OP(trapv):
 OP(bitsr):  # bit operation using a register as index
     jal_and_j decode_dptr, op_bits_start
 op_bitsi:   # bit operation using immediate value as index
-#if defined(M64K_FASTPATHS) && defined(M64K_W3_FULL)
-    # BTST #imm,(d16,An) fast path (wave 3, M64K_W3_FULL only). Generic charge order: 4
-    # (op_bitsi) + 8 (ea_101) before the byte read, then bits_impl's 8 and
-    # op_btst_e's -4 after — replicated as 12 / +4. Only Z is affected
-    # (set to the tested bit's value); byte reads cannot fault.
-    andi t0, opcode, 0xC0
-    bnez t0, bitsi_slow                # BTST only (bchg/bclr/bset generic)
-    andi t0, opcode, 0x38
-    xori t0, 0x28
-    bnez t0, bitsi_slow                # only (d16,An)
-    addi dptr, m_pc, -2                # op_bitsi parity (see ANDI note)
-    lbu t3, 1(m_pc)                    # bit index (low byte of first ext word)
-    andi t1, opcode, 7
-    sll t1, 2
-    add t1, ctx
-    lw eaptr32, M64K_OFF_AREGS(t1)
-    lh t2, 2(m_pc)                     # d16 (second ext word)
-    addiu m_pc, 4
-    addu eaptr32, t2
-    map_m68k eaptr, eaptr32
-    use_cycles 12
-    lbu_m68k t0, eaptr
-    use_cycles 4
-    andi t3, 7
-    srlv t0, t0, t3
-    andi t0, 1
-    dsrl flag_zc, 32                   # keep C, clear the Z field...
-    dsll flag_zc, 32
-    or flag_zc, t0                     # ...then set !Z = tested bit
-    dispatch_next
-bitsi_slow:
-#endif
     use_cycles 4
     addi dptr, m_pc, -2
     addiu m_pc, 2

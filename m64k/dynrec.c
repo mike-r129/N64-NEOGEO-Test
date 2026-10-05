@@ -689,7 +689,7 @@ static int emit_insn(uint16_t op, uint32_t pc, emit_t *e, int *cmax)
         return 4;
     }
 
-    // ADDI.w #imm,Dn  [wave-3 W3_FULL body, 8 cycles, 2 words]: full ADD
+    // ADDI.w #imm,Dn  [wave-3 W3_FULL body (c11ed5b), 8 cycles, 2 words]: full ADD
     // flags including X (add_f_word idiom: flag_zc = 64-bit sum<<16 with
     // bit32 = carry, flag_x = that carry, flag_nv = sum of operands<<16).
     if ((op & 0xFFF8) == 0x0640) {
