@@ -94,17 +94,6 @@ CFLAGS += $(EXTRA_DEFINES)
 ifndef ADPCM_CPU
 CFLAGS += -DMVS64_RSPADPCM
 endif
-# Synchronous FM offload experiment (rsp_fm.S + ym2610.c rspfm_* glue):
-# make ... WP_OFF=1 RSPFM=1. The port is bit-exact (300s dual-compute gate,
-# 35840 chunks, 0 mismatches) but measured NET-NEGATIVE when collected per
-# chunk: the CPU idles for the RSP compute time ([RSPWAIT] fm~2.4ms/chunk,
-# q=0), and a 2-channel CPU/RSP split still loses ~4fps to per-chunk glue.
-# The whole-pump offload below (default ON) replaced it. Whole-pump reuses
-# this machinery and defines MVS64_RSPFM itself, so RSPFM=1 without
-# WP_OFF=1 changes nothing.
-ifdef RSPFM
-CFLAGS += -DMVS64_RSPFM
-endif
 # Whole-pump audio batching (WHOLEPUMP-DESIGN.md): deferred per-chunk FM AND
 # ADPCM on the RSP with RSP-resident dynamic state, cross-pump output
 # deferral in plat_audio_pump. Default ON since full WP-M2 (2026-07-08):
@@ -113,7 +102,9 @@ endif
 # density buckets; snd 150-310% -> 51-64%). Bit-exactness gate green (300s,
 # 40960 chunks, 0 mismatches FM+ADPCM, 0 hatches). Disable with WP_OFF=1;
 # add EXTRA_DEFINES=-DMVS64_RSPWP_VERIFY for the dual-compute gate
-# ([RSPWP] counters).
+# ([RSPWP] counters). MVS64_RSPFM is the FM-on-RSP machinery (rsp_fm.S,
+# ym2610.c rspfm_*) the whole pump drives; the synchronous per-chunk FM
+# offload it was built for measured net-negative and was removed.
 ifndef WP_OFF
 CFLAGS += -DMVS64_RSPFM -DMVS64_RSPWP
 endif
