@@ -1,9 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
-#ifdef MVS64_OPHIST
-#include <malloc.h>   // mallinfo, for the one-time [HEAP] report
-#endif
 #ifndef N64
 #include <stdlib.h>
 #endif
@@ -897,14 +894,6 @@ int main(int argc, char *argv[]) {
 		// the interval's executed instructions, then reset. Offline
 		// analysis: analyze-ophist.py (parent dir).
 		if ((g_frame % 300) == 299) {
-			// One-time: free-RDRAM report, to size the predecode table.
-			static bool mi_done = false;
-			if (!mi_done) {
-				struct mallinfo mi = mallinfo();
-				framef("[HEAP] used=%u free=%u\n",
-					(unsigned)mi.uordblks, (unsigned)mi.fordblks);
-				mi_done = true;
-			}
 			uint64_t total = 0;
 			for (int i = 0; i < 65536; i++) total += m64k_ophist_tab[i];
 			uint32_t thresh = (uint32_t)(total / 2000);

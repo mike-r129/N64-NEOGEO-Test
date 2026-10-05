@@ -2017,15 +2017,6 @@ op_mul_finish:
     j main_loop
     #else
     use_cycles 38
-#if 0
-    j 3f                           # accurate algorihtm for timing
-    .set noreorder
-1:  use_cycles 2                   # add 2 cycles if LSB is 1
-    and t0, t1                     # clear last set bit
-3:  bnez t0, 1b                    # loop if more bits are set
-     addi t1, t0, -1
-    .set noreorder
-#else
     sll t1, t0, 1                  # optimized popcount algorithm
     andi t0, 0x5555<<1             # from Bit Twiddling Hacks
     sub t0, t1, t0                 # also tweaked to count twice the population
@@ -2040,7 +2031,6 @@ op_mul_finish:
     add t0, t1
     andi t0, 0xFF
     sub m_cycles, t0
-#endif
     j main_loop
     #endif
 
@@ -3898,17 +3888,6 @@ dbcc_dec:
     # the normal interpreter, so flags, PC and register state at every
     # observable boundary are bit-exact. Restricted to DBF (cc can never
     # become true mid-loop; other DBcc react to flags the body changes).
-#if defined(M64K_DYNSTAT) && defined(M64K_BOSTAT_SEEN)
-    # COSTS REAL TIME: this fires on EVERY taken non-expiring DBF (8.8M per
-    # 600-frame window through the BIOS RAM test). It slowed the build
-    # enough that the autoinput harness never reached a fight — content is
-    # wall-speed-sensitive here. Opt-in only; the rejection counters below
-    # are on the rare paths and are always safe to leave enabled.
-    lw t8, blockop_seen
-    addiu t8, 1
-    sw t8, blockop_seen
-    sw t3, blockop_t3val               # loop-shape delta actually seen
-#endif
     bne t3, -6, BO_REJ_SHAPE           # 1-word body + 2-word DBF only
     andi t2, opcode, 0x0F00
     bne t2, 0x0100, dbcc_no_blockop    # DBF only
@@ -3925,9 +3904,7 @@ dbcc_dec:
     beq t1, 0x3098, blockop_movew_port # move.w (As)+,(Ad)
     beq t1, 0x30C0, blockop_fill_w     # move.w Dn,(Ad)+
     beq t1, 0x20C0, blockop_fill_l     # move.l Dn,(Ad)+
-#ifndef MVS64_COPYL_NODISPATCH
     beq t1, 0x20D8, blockop_copy_l     # move.l (As)+,(Ad)+
-#endif
     beq t1, 0x3080, blockop_fillw_port # move.w Dn,(Ad)
 #if defined(M64K_DYNSTAT) || defined(MVS64_BOSTAT)
 bo_rej_dst:
@@ -3951,11 +3928,6 @@ bo_rej_span:
     sw t8, blockop_rej_span
     j dbcc_no_blockop
 bo_rej_shape:
-#ifdef M64K_BOSTAT_SEEN
-    lw t8, blockop_rej_shape           # hot: same cost caveat as blockop_seen
-    addiu t8, 1
-    sw t8, blockop_rej_shape
-#endif
     j dbcc_no_blockop
 #endif
 dbcc_no_blockop:
