@@ -228,7 +228,6 @@ void plat_init(int audiofreq, int fps) {
     // that refills through the callback: self-sustaining forever.
     audio_write_begin();
     audio_write_end();
-    (void)fps;
 }
 
 // --- Audio (libdragon Audio Interface) -------------------------------------
@@ -646,15 +645,15 @@ static surface_t *fbcrc_disp;
 #endif
 
 #if defined(MVS64_DPCOSD) || defined(MVS64_SNDOSD) || defined(MVS64_PERFOSD)
-// PLAN-DRAW-RDP Phase 3 hardware instrument: ares/paraLLEl-RDP does not
-// model the DPC counters (they read 0 there), so the Phase 3 perf verdict
-// comes from a real console. This build draws the RDP numbers on screen:
+// On-screen text for the hardware overlays (ares/paraLLEl-RDP does not model
+// the DPC counters, so RDP numbers come from a real console). dpcosd_text
+// draws a 4x6 bitmap font at 2x into a 16-bit buffer: DPCOSD and SNDOSD draw
+// onto the finished frame through the uncached segment (detach_wait first);
+// PERFOSD draws into its own texture (see below). The DPCOSD lines:
 //   F ff.f   emulated fps (wall-clock, 30-frame window)
 //   P pp.pp  RDP PIPE_BUSY ms per frame (60fps budget = 16.7ms)
 //   T tt.tt  RDP TMEM_BUSY ms per frame (texture-load serialization)
 //   B bb     PIPE_BUSY as % of DP_CLOCK (RDP duty cycle)
-// Glyphs: 4x6 bitmap font drawn 2x through the uncached segment onto the
-// finished frame (detach_wait first), top-left corner.
 static const uint8_t dpcosd_font[32][6] = {
 	{0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, // 0 1
 	{0x6,0x9,0x1,0x2,0x4,0xF}, {0xE,0x1,0x6,0x1,0x1,0xE}, // 2 3

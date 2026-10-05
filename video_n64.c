@@ -179,8 +179,8 @@ static void render_begin(void) {
 	// palette (dirty lines can reach RDRAM before the RSP DMAs them), which
 	// would show a palette one frame early on fades. Only the small default
 	// rspq buffer used to hide this, by forcing the CPU to wait. pal_snap is
-	// rewritten only here, after display_get proved the previous frame's
-	// commands complete (2 display buffers).
+	// rewritten only here, after plat_beginframe's fence (frames_done) proved
+	// the previous frame's RSP/RDP work complete.
 	extern uint8_t mvs64_palette_dirty;
 	static uint16_t pal_snap[4096] __attribute__((aligned(16)));
 	if (mvs64_palette_dirty) {
