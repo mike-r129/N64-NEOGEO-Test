@@ -47,3 +47,6 @@ disgame
 samsho2-n64-*.z64
 mvs64-samsho2-*.z64
 m64k/filesystem/
+
+# Claude Code local state (agent worktrees, settings)
+.claude/
