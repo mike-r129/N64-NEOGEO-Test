@@ -93,11 +93,8 @@ static void trace_drain(void) {
 }
 #endif
 
-// Last register selected on YM port A (control-A write). Only the SNDTRACE
-// event log reads it now (the stuck-voice guard that also did is gone); the
-// store stays unconditional because removing it moves the sound code.
-static uint8_t ym_addr_a;
 #ifdef MVS64_SNDTRACE
+static uint8_t ym_addr_a;                // last register selected on YM port A
 static uint8_t ym_addr_b;                // last register selected on YM port B
 #endif
 
@@ -326,7 +323,9 @@ static void z80_out(z80 *z, uint16_t port, uint8_t val) {
 	z80_wrote = 1;                                        // taints idle-skip window
 	switch (port & 0xff) {
 	case 0x04: YM2610Write(0, val);
+#ifdef MVS64_SNDTRACE
 		ym_addr_a = val;                                 // register select (bank A)
+#endif
 		break;                                           // control A
 	case 0x05: YM2610Write(1, val);
 #ifdef MVS64_SNDTRACE
