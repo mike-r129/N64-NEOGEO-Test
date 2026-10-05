@@ -1,5 +1,46 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+## 🧹 2026-10-04 (night) — CLEANUP (branch cleanup): dead code out, layout pinned
+
+35 commits, ~16.7k lines removed (most of it dead experiments, the July
+Musashi profile files and the never-built genhle). Method: every commit
+rebuilt release + PERFOSD and compared section sizes and every symbol
+address against the pre-cleanup build; most were byte-identical except
+assert line numbers. Two Fable review passes over the risky commits found
+no behaviour change.
+
+| Group | What went | Gate |
+| --- | --- | --- |
+| 68k | M64K_W3_FULL (testsuite now tests the game's fast-path set), M64K_PREDECODE, BOSTAT_SEEN, COPYL_NODISPATCH, #if 0 | layout identical; testsuite 125/126 |
+| Video C | RSP walk + batch glue, CPU RDP fallback, NORENDER, Phase-0 counters, PERFOSD K line | layout identical |
+| Sound | sync FM-on-RSP path, YM2610Update/SOUND_TEST/SAVE_STATE, FASTBOOT, Z80WARM, sound_noop.c, twins Z80_RMAP_OFF/Z80STEP_CALL/WP_REVIVE_OFF/AUDIO_OS/Z80_OS | layout identical |
+| Diagnostics | DPCOSD, RDPDBG; PERFOSD/FBCRC moved to platform_n64_osd.c, per-frame telemetry to emu_diag.c | release identical; DET FBCRC 2,940 f; TRCRC 3,295 f after boot |
+| Pin | hw_n64.S .text held at 0x980 by .org (68k interpreter stays at 0x80000e00) | release identical; oversize = assembler error |
+| Layout batch | draw-path twin knobs fixed (cdt, cdt_inline/unc, spr2w, spr64, flush, fuse, cullfast, fixfast), walk/batch ucode (IMEM 0xd74 -> 0x88c), wp_dirty, stage_bulk twin, ym_addr_a, evict_gen, game.ini parse; .bss -96 KB | DET FBCRC 6,430 f (6,218 f on the final tree); RSPWP_VERIFY 44,032 chunks 0 bad; review clean |
+
+Layout-batch timing (ares PERFOSD+AUTOINPUT, 243 matched fight windows,
+ms/frame; ares is deterministic, repeat runs are identical): R 2.05 ->
+1.97, V 3.44 -> 3.33, S 4.42 -> 4.32, M 8.49 -> 8.53, whole frame flat.
+The first cut was R +0.12: with one caller left GCC inlined the walk into
+video_render, so the walk is now noinline (55779b7).
+
+LAWS:
+- **ares runs are deterministic** (same ROM, same AUTOINPUT: identical
+  PERFOSD streams), so a single matched pair is a valid A/B in ares.
+- **Watch inlining when a function loses callers.** Removing the twin
+  paths left sprite_walk with one caller and GCC inlined it into
+  video_render, which cost the per-tile loop ~0.2 ms; noinline fixed it.
+- **The Q/E split moves with scheduling.** Q rose +0.15 while the walk part
+  of R fell by more: compare R (or V) totals across code changes, not Q.
+- **hw_n64.S is size-pinned.** Growing it is an assembler error by design;
+  bump HW_N64_TEXT_SIZE only together with a PERFOSD re-measure.
+- Left alone on purpose: the dynarec (frozen, off by default), ROTA_OFF
+  (hardware verdict still pending), the 2-buffer display twin (baseline for
+  the FBCRC_PIPE gate), the audio pump in platform_n64.c (hardware-validated,
+  intertwined with plat_init), play_buffer (32 KB, unused by N64 whole-pump
+  builds but still the WP_OFF/PC target), rsp_fm.S's parked cmd_fm_run entry
+  and start stamp (shared with the whole-pump body).
+
 ## 📊 2026-10-04 (later) — ROUND 4 (branch perf-round4): SPRITE PATH + THE 68K LAYOUT CLIFF
 
 Hardware heavy fights went from 36.7 fps (N 1018 tiles: M 11.0, S 6.1,
