@@ -9,6 +9,12 @@
 > other games and readied to offer upstream. This repo is kept as the
 > samsho2-specific record (history, measurements, and the release27 build) and
 > no longer receives new development. Please use the fork for current work.
+>
+> The three libdragon rspq fixes found here (the lost-wakeup window in
+> `rspq_flush_internal`, the highpri wedge from a stale `SIG_HIGHPRI_REQUESTED`,
+> and application-sized lowpri buffers) live on in
+> [mike-r129/libdragon](https://github.com/mike-r129/libdragon), a fork of
+> upstream libdragon, as PRs #1-#3. The files in `patches/` are the originals.
 
 This is a fork of [MVS64](https://github.com/rasky/mvs64), Giovanni Bajo's
 NeoGeo emulator for the N64. It targets one game, Samurai Shodown II
