@@ -7,6 +7,9 @@
 > fork. Entries below are the samsho2 record up to release27. The libdragon rspq
 > fixes found during this work are carried in
 > [mike-r129/libdragon](https://github.com/mike-r129/libdragon) (PRs #1-#3).
+> This log also predates
+> [mike-r129/N64-Z80](https://github.com/mike-r129/N64-Z80), the hand-written
+> MIPS assembly Z80 core, so all Z80 figures here are for the C core.
 
 ## 🧹 2026-10-04 (night) — CLEANUP (branch cleanup): dead code out, layout pinned
 
