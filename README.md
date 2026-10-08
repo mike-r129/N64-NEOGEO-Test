@@ -1,5 +1,21 @@
 # Samurai Shodown II on Nintendo 64
 
+> **This project is now maintained in the [mvs64 fork](https://github.com/mike-r129/mvs64).**
+> This repo is the original bulk of the performance work, which specifically
+> targeted Samurai Shodown II: sound, RSP audio, the 68000 fast paths and the
+> draw path were built and measured here against samsho2 alone. Once samsho2
+> was stable, the changes were prepared for the fork of
+> [MVS64](https://github.com/rasky/mvs64), where they are being generalized for
+> other games and readied to offer upstream. This repo is kept as the
+> samsho2-specific record (history, measurements, and the release27 build) and
+> no longer receives new development. Please use the fork for current work.
+>
+> The three libdragon rspq fixes found here (the lost-wakeup window in
+> `rspq_flush_internal`, the highpri wedge from a stale `SIG_HIGHPRI_REQUESTED`,
+> and application-sized lowpri buffers) live on in
+> [mike-r129/libdragon](https://github.com/mike-r129/libdragon), a fork of
+> upstream libdragon, as PRs #1-#3. The files in `patches/` are the originals.
+
 This is a fork of [MVS64](https://github.com/rasky/mvs64), Giovanni Bajo's
 NeoGeo emulator for the N64. It targets one game, Samurai Shodown II
 (`samsho2`, NGH-063), played on a real console from a flash cart with full
@@ -16,16 +32,50 @@ RSP, and tunes the 68000 core and the renderer for samsho2.
   tile cache gets 4,096 slots (512 KB); without it, 1,280.
 - **Framerate:** not a locked 60 fps. On a real console, fights usually run
   around 50 fps; the heaviest fight scenes measured so far drop to about 42
-  (41.9 fps with ~785 sprite tiles on screen). In ares the scripted fight
-  windows have a median of 51.8 fps.
+  (41.9 fps with ~785 sprite tiles on screen). See
+  [Performance](#performance) below.
+- **Current build:** release27 (2026-10-05), the first build after the
+  cleanup. Hardware testing so far shows no problems.
 - **Long sessions:** the failures seen in long hardware sessions (sound dying
   after 17.9 minutes, sound lost mid-round, an RSP crash after 30+ minutes)
-  are fixed, and hardware play sessions since 2026-08-30 have run without
-  sound loss.
+  are fixed. Hardware sessions since then, including a full-day soak on
+  2026-10-03, have run without sound loss or crashes.
 - **Other games:** only samsho2 is tested. Games that upstream MVS64 booted may
   still build, but they have not been tested with sound or the performance
   work. The 68000 idle-skip list is tuned for samsho2, so other games also lose
-  that speedup until their own wait loops are added.
+  that speedup until their own wait loops are added. Making this work general
+  for other games, and offering it back to upstream MVS64, happens in a
+  separate fork ([mike-r129/mvs64](https://github.com/mike-r129/mvs64)), where
+  this work is now maintained; this repo stays focused on samsho2.
+
+## Performance
+
+In-fight framerate across the project. ares figures are medians over
+scripted fight windows; hardware figures are read from the performance
+overlay on a real N64.
+
+| Date | Milestone | In-fight fps |
+| --- | --- | --- |
+| 2026-07-02 | First build with full sound (Z80 + YM2610 all on the CPU) | 8.5 (ares) |
+| 2026-07-02 | Smaller YM2610 tables, channel-major FM synthesis | 17.5 (ares) |
+| 2026-07-06 | 68000 idle-skip fixed (it had never fired) | 21.4 (ares) |
+| 2026-07-08 | FM and ADPCM synthesis moved to the RSP; audio pump reordered | 35.6 (ares) |
+| 2026-09-23 | Z80 spin fast-forward, Z80 page map, C-ROM direct table | 45.9 (ares, all content) |
+| 2026-10-03 | rspq buffer sizing, draw-path cuts, Z80 and 68000 trims | 51.8 (ares) |
+| 2026-10-04 | Triple buffering, 2-word sprite command, 4,096-slot tile cache, cache-layout pinning | heaviest fights 36.7 -> 41.9 (hardware) |
+
+Where a heavy hardware fight frame goes now (41.9 fps, 785 tiles, ms per
+frame): 68000 9.8, sound 5.7, drawing on the CPU 5.4, waiting for a display
+buffer 2.4. The RDP is busy 16.9 ms of the frame, close to the CPU's own
+total, so the remaining gains have to come from both sides. The largest open
+lever on the CPU is the 68000 dynarec, which is correct but needs wider
+template coverage before it pays off; on the RDP, the time per sprite tile
+is far above its fill cost and not yet explained.
+[PLAN-OPTIMIZATION.md](PLAN-OPTIMIZATION.md) has every measurement.
+
+The 2026-10-04 cleanup removed about 16,700 lines of dead experiments and
+diagnostics. Each step was checked for identical memory layout or identical
+pixels, and the release build kept its speed.
 
 ## What this fork adds
 

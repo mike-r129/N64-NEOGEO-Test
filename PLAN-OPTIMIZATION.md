@@ -1,5 +1,13 @@
 # PLAN-OPTIMIZATION.md — mvs64 / samsho2 N64 Framerate Plan
 
+> **Status: this repo is no longer the live home of this work.** It is now
+> maintained in the [mvs64 fork](https://github.com/mike-r129/mvs64). This log
+> covers the initial bulk of the performance work, which targeted samsho2
+> specifically; once samsho2 was stable, the changes were prepared for the
+> fork. Entries below are the samsho2 record up to release27. The libdragon rspq
+> fixes found during this work are carried in
+> [mike-r129/libdragon](https://github.com/mike-r129/libdragon) (PRs #1-#3).
+
 ## 🧹 2026-10-04 (night) — CLEANUP (branch cleanup): dead code out, layout pinned
 
 35 commits, ~16.7k lines removed (most of it dead experiments, the July
