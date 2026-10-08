@@ -1,5 +1,15 @@
 # Samurai Shodown II on Nintendo 64
 
+> **This project is now maintained in the [mvs64 fork](https://github.com/mike-r129/mvs64).**
+> This repo is the original bulk of the performance work, which specifically
+> targeted Samurai Shodown II: sound, RSP audio, the 68000 fast paths and the
+> draw path were built and measured here against samsho2 alone. Once samsho2
+> was stable, the changes were prepared for the fork of
+> [MVS64](https://github.com/rasky/mvs64), where they are being generalized for
+> other games and readied to offer upstream. This repo is kept as the
+> samsho2-specific record (history, measurements, and the release27 build) and
+> no longer receives new development. Please use the fork for current work.
+
 This is a fork of [MVS64](https://github.com/rasky/mvs64), Giovanni Bajo's
 NeoGeo emulator for the N64. It targets one game, Samurai Shodown II
 (`samsho2`, NGH-063), played on a real console from a flash cart with full
@@ -29,8 +39,8 @@ RSP, and tunes the 68000 core and the renderer for samsho2.
   work. The 68000 idle-skip list is tuned for samsho2, so other games also lose
   that speedup until their own wait loops are added. Making this work general
   for other games, and offering it back to upstream MVS64, happens in a
-  separate fork ([mike-r129/mvs64](https://github.com/mike-r129/mvs64)), so
-  this repo stays focused on samsho2.
+  separate fork ([mike-r129/mvs64](https://github.com/mike-r129/mvs64)), where
+  this work is now maintained; this repo stays focused on samsho2.
 
 ## Performance
 
