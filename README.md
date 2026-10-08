@@ -10,6 +10,12 @@
 > samsho2-specific record (history, measurements, and the release27 build) and
 > no longer receives new development. Please use the fork for current work.
 >
+> This work also predates
+> [mike-r129/N64-Z80](https://github.com/mike-r129/N64-Z80), a hand-written
+> MIPS assembly Z80 interpreter for the VR4300. The Z80 here is the C core
+> (superzazu/z80), so the more efficient assembly core, and the extra
+> performance it brings, is not part of this repo.
+>
 > The three libdragon rspq fixes found here (the lost-wakeup window in
 > `rspq_flush_internal`, the highpri wedge from a stale `SIG_HIGHPRI_REQUESTED`,
 > and application-sized lowpri buffers) live on in
